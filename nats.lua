@@ -71,13 +71,13 @@ local function load_methods(proto, commands)
 		client[cmd] = fn
 	end
 	
-	-- Assign Jetstream Table
-	client.js = nats.js
-
 	-- assing client properties and methods from client_proto
 	for i, v in pairs(proto) do
 		client[i] = v
 	end
+	
+	-- Assign Jetstream Table
+	client.js = nats.js
 
 	return client
 end
