@@ -2,6 +2,8 @@ local nats = {
 	_VERSION	 = 'lua-nats 0.0.4',
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
+	command = {},
+	js = { consumer = {} },
 }
 
 
@@ -57,6 +59,7 @@ local function merge_defaults(parameters)
 end
 
 local function load_methods(proto, commands)
+	local commands = commands or {}
 	-- inherit client metatable from client_proto metatable
 	local client = setmetatable({}, getmetatable(proto))
 
@@ -67,6 +70,9 @@ local function load_methods(proto, commands)
 		end
 		client[cmd] = fn
 	end
+	
+	-- Assign Jetstream Table
+	client.js = nats.js
 
 	-- assing client properties and methods from client_proto
 	for i, v in pairs(proto) do
@@ -289,24 +295,18 @@ function nats.connect(...)
 		parameters = { host = host, port = port, timeout = tonumber(timeout) }
 	end
 
-	local commands = nats.commands or {}
-	if type(commands) ~= 'table' then
-		nats.error('invalid type for the commands table')
-	end
-
 	local socket = create_connection(merge_defaults(parameters))
-	local client = create_client(client_prototype, socket, commands)
+	local client = create_client(client_prototype, socket, nats.commands)
 
 	return client
 end
 
 function nats.command(cmd, opts)
-	return command(cmd, opts)
+	return nats.commands[cmd](opts)
 end
 
 -- ### Command methods ###
-nats.command = {}
-local command = nats.command
+local command = nats.commands
 function command.connect(client)
 	local config = {
 		lang	 = client.lang,
@@ -401,7 +401,6 @@ function command.wait(client, quantity)
 end
 
 -- Adding JetStream related command methods
-nats.js = { consumer = {} }
 local js = nats.js
 function js.create(client, name, subjects)
 	request.raw(client, 'JS.STREAM.CREATE ' .. name .. ' ' .. cjson.encode({ subjects = subjects }) .. '\r\n')
