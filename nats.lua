@@ -1,5 +1,5 @@
 local nats = {
-	_VERSION	 = 'lua-nats 0.0.3',
+	_VERSION	 = 'lua-nats 0.0.4',
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
 }
@@ -7,14 +7,14 @@ local nats = {
 
 -- ### Library requirements ###
 
---local cjson  = require('cjson')
+local cjson  = require('cjson')
 local uuid   = require('uuid')
 
 
 -- ### Local properties ###
 
 local unpack = _G.unpack or table.unpack
-local network, request, response, command, jetstream = {}, {}, {}, {}, {}
+local network, request, response = {}, {}, {}
 
 local client_prototype = {
 	user		  = nil,
@@ -305,7 +305,8 @@ function nats.command(cmd, opts)
 end
 
 -- ### Command methods ###
-nats.command = command
+nats.command = {}
+local command = nats.command
 function command.connect(client)
 	local config = {
 		lang	 = client.lang,
@@ -347,7 +348,7 @@ end
 
 function command.request(client, subject, payload, callback)
 	local inbox = create_inbox()
-	unique_id = client:subscribe(inbox, function(message, reply)
+	local unique_id = client:subscribe(inbox, function(message, reply)
 		client:unsubscribe(unique_id)
 		callback(message, reply)
 	end)
@@ -400,7 +401,8 @@ function command.wait(client, quantity)
 end
 
 -- Adding JetStream related command methods
-nats.js = js
+nats.js = { consumer = {} }
+local js = nats.js
 function js.create(client, name, subjects)
 	request.raw(client, 'JS.STREAM.CREATE ' .. name .. ' ' .. cjson.encode({ subjects = subjects }) .. '\r\n')
 	local data = response.read(client)
@@ -417,7 +419,7 @@ function js.delete(client, name)
 	end
 end
 
-function js.create_consumer(client, streamName, durableName, config)
+function js.consumer.create(client, streamName, durableName, config)
 	request.raw(client, 'JS.STREAM.CONSUMER.DURABLE.CREATE ' .. streamName .. ' ' .. durableName .. ' ' .. cjson.encode(config) .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
@@ -425,7 +427,7 @@ function js.create_consumer(client, streamName, durableName, config)
 	end
 end
 
-function js.deleteConsumer(client, streamName, durableName)
+function js.consumer.delete(client, streamName, durableName)
 	request.raw(client, 'JS.STREAM.CONSUMER.DURABLE.DELETE ' .. streamName .. ' ' .. durableName .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
@@ -433,7 +435,7 @@ function js.deleteConsumer(client, streamName, durableName)
 	end
 end
 
-function js.publishToStream(client, streamName, payload)
+function js.publish(client, streamName, payload)
 	request.raw(client, 'JS.STREAM.PUBLISH ' .. streamName .. ' ' .. payload .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
@@ -441,7 +443,7 @@ function js.publishToStream(client, streamName, payload)
 	end
 end
 
-function js.getStreamInfo(client, streamName)
+function js.info(client, streamName)
 	request.raw(client, 'JS.STREAM.INFO ' .. streamName .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
@@ -450,7 +452,7 @@ function js.getStreamInfo(client, streamName)
 	return cjson.decode(data.content)
 end
 
-function js.getConsumerInfo(client, streamName, consumerName)
+function js.consumer.info(client, streamName, consumerName)
 	request.raw(client, 'JS.STREAM.CONSUMER.INFO ' .. streamName .. ' ' .. consumerName .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
@@ -459,7 +461,7 @@ function js.getConsumerInfo(client, streamName, consumerName)
 	return cjson.decode(data.content)
 end
 
-function js.getNextMessage(client, streamName, consumerName)
+function js.nextmsg(client, streamName, consumerName)
 	request.raw(client, 'JS.STREAM.CONSUMER.MSG.NEXT ' .. streamName .. ' ' .. consumerName .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'MSG' then
@@ -468,7 +470,7 @@ function js.getNextMessage(client, streamName, consumerName)
 	return data.content -- you may want to parse this depending on your message format
 end
 
-function js.acknowledgeMessage(client, subject)
+function js.ackmsg(client, subject)
 	request.raw(client, 'PUB ' .. subject .. ' +ACK\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
@@ -476,7 +478,7 @@ function js.acknowledgeMessage(client, subject)
 	end
 end
 
-function js.listStreams(client)
+function js.streams(client)
 	request.raw(client, 'JS.STREAM.LIST\r\n')
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
@@ -485,7 +487,7 @@ function js.listStreams(client)
 	return cjson.decode(data.content)
 end
 
-function js.listConsumers(client, streamName)
+function js.consumers(client, streamName)
 	request.raw(client, 'JS.STREAM.CONSUMER.LIST ' .. streamName .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
@@ -494,7 +496,7 @@ function js.listConsumers(client, streamName)
 	return cjson.decode(data.content)
 end
 
-function js.updateStream(client, streamName, configuration)
+function js.update(client, streamName, configuration)
 	local configJson = cjson.encode(configuration)
 	request.raw(client, 'JS.STREAM.UPDATE ' .. streamName .. ' ' .. configJson .. '\r\n')
 	local data = response.read(client)
@@ -504,7 +506,7 @@ function js.updateStream(client, streamName, configuration)
 	return cjson.decode(data.content)
 end
 
-function js.updateConsumer(client, streamName, consumerName, configuration)
+function js.consumer.update(client, streamName, consumerName, configuration)
 	local configJson = cjson.encode(configuration)
 	request.raw(client, 'JS.STREAM.CONSUMER.UPDATE ' .. streamName .. ' ' .. consumerName .. ' ' .. configJson .. '\r\n')
 	local data = response.read(client)
@@ -514,7 +516,7 @@ function js.updateConsumer(client, streamName, consumerName, configuration)
 	return cjson.decode(data.content)
 end
 
-function js.getMessageBySequence(client, streamName, sequence)
+function js.seqmsg(client, streamName, sequence)
 	request.raw(client, 'JS.STREAM.MSG.GET ' .. streamName .. ' ' .. sequence .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'MSG' then
