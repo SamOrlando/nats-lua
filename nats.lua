@@ -1,7 +1,7 @@
 local nats = {
 	_VERSION	 = 'lua-nats 0.0.3',
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
-	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto - modified by sam orlando',
+	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
 }
 
 
@@ -14,7 +14,7 @@ local uuid   = require('uuid')
 -- ### Local properties ###
 
 local unpack = _G.unpack or table.unpack
-local network, request, response, command = {}, {}, {}, {}
+local network, request, response, command, jetstream = {}, {}, {}, {}, {}
 
 local client_prototype = {
 	user		  = nil,
@@ -305,7 +305,7 @@ function nats.command(cmd, opts)
 end
 
 -- ### Command methods ###
-
+nats.command = command
 function command.connect(client)
 	local config = {
 		lang	 = client.lang,
@@ -399,73 +399,128 @@ function command.wait(client, quantity)
 	until quantity > 0 and count >= quantity
 end
 
--- Commands defined in this table do not take the precedence over
--- methods defined in the client prototype table.
-
-nats.commands = {
-	connect	 = command.connect,
-	ping		= command.ping,
-	pong		= command.pong,
-	request	 = command.request,
-	subscribe   = command.subscribe,
-	unsubscribe = command.unsubscribe,
-	publish	 = command.publish,
-	wait		= command.wait,
-}
-
-
-local jetstream = {}
--- JetStream management commands
-function jetstream.create_stream(client, stream_name, subjects)
-  local payload = cjson.encode({
-    name = stream_name,
-    subjects = subjects
-  })
-
-  client:publish('$JS.API.STREAM.CREATE.' .. stream_name, payload)
-  local response = client:wait(1)
-  return response
+-- Adding JetStream related command methods
+nats.js = js
+function js.create(client, name, subjects)
+	request.raw(client, 'JS.STREAM.CREATE ' .. name .. ' ' .. cjson.encode({ subjects = subjects }) .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to create stream: ' .. (data.content or 'unknown error'))
+	end
 end
 
-function jetstream.publish(client, stream_name, subject, data)
-  client:publish('$JS.API.STREAM.PUBLISH.' .. stream_name, cjson.encode({
-    subject = subject,
-    data = data
-  }))
-  local response = client:wait(1)
-  return response
+function js.delete(client, name)
+	request.raw(client, 'JS.STREAM.DELETE ' .. name .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to delete stream: ' .. (data.content or 'unknown error'))
+	end
 end
 
-function jetstream.create_consumer(client, stream_name, consumer_name, durable_name)
-  local payload = cjson.encode({
-    stream_name = stream_name,
-    config = {
-      durable_name = durable_name
-    }
-  })
-
-  client:publish('$JS.API.CONSUMER.CREATE.' .. stream_name .. '.' .. consumer_name, payload)
-  local response = client:wait(1)
-  return response
+function js.create_consumer(client, streamName, durableName, config)
+	request.raw(client, 'JS.STREAM.CONSUMER.DURABLE.CREATE ' .. streamName .. ' ' .. durableName .. ' ' .. cjson.encode(config) .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to create consumer: ' .. (data.content or 'unknown error'))
+	end
 end
 
-function jetstream.subscribe(client, stream_name, consumer_name, callback)
-  local inbox = create_inbox()
-  local unique_id = client:subscribe(inbox, callback)
-  client:publish('$JS.API.CONSUMER.MSG.NEXT.' .. stream_name .. '.' .. consumer_name, '', inbox)
-  return unique_id
+function js.deleteConsumer(client, streamName, durableName)
+	request.raw(client, 'JS.STREAM.CONSUMER.DURABLE.DELETE ' .. streamName .. ' ' .. durableName .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to delete consumer: ' .. (data.content or 'unknown error'))
+	end
 end
 
-function jetstream.ack(client, subject, sequence)
-  client:publish(subject .. ' ' .. sequence, '+ACK')
+function js.publishToStream(client, streamName, payload)
+	request.raw(client, 'JS.STREAM.PUBLISH ' .. streamName .. ' ' .. payload .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to publish message: ' .. (data.content or 'unknown error'))
+	end
 end
 
-nats.jetstream = {
-  create_stream = jetstream.create_stream,
-  publish = jetstream.publish,
-  create_consumer = jetstream.create_consumer,
-  subscribe = jetstream.subscribe,
-  ack = jetstream.ack
-}
+function js.getStreamInfo(client, streamName)
+	request.raw(client, 'JS.STREAM.INFO ' .. streamName .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'INFO' then
+		client.error('failed to get stream info: ' .. (data.content or 'unknown error'))
+	end
+	return cjson.decode(data.content)
+end
+
+function js.getConsumerInfo(client, streamName, consumerName)
+	request.raw(client, 'JS.STREAM.CONSUMER.INFO ' .. streamName .. ' ' .. consumerName .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'INFO' then
+		client.error('failed to get consumer info: ' .. (data.content or 'unknown error'))
+	end
+	return cjson.decode(data.content)
+end
+
+function js.getNextMessage(client, streamName, consumerName)
+	request.raw(client, 'JS.STREAM.CONSUMER.MSG.NEXT ' .. streamName .. ' ' .. consumerName .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'MSG' then
+		client.error('failed to get next message: ' .. (data.content or 'unknown error'))
+	end
+	return data.content -- you may want to parse this depending on your message format
+end
+
+function js.acknowledgeMessage(client, subject)
+	request.raw(client, 'PUB ' .. subject .. ' +ACK\r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
+	end
+end
+
+function js.listStreams(client)
+	request.raw(client, 'JS.STREAM.LIST\r\n')
+	local data = response.read(client)
+	if data.action ~= 'INFO' then
+		client.error('failed to list streams: ' .. (data.content or 'unknown error'))
+	end
+	return cjson.decode(data.content)
+end
+
+function js.listConsumers(client, streamName)
+	request.raw(client, 'JS.STREAM.CONSUMER.LIST ' .. streamName .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'INFO' then
+		client.error('failed to list consumers: ' .. (data.content or 'unknown error'))
+	end
+	return cjson.decode(data.content)
+end
+
+function js.updateStream(client, streamName, configuration)
+	local configJson = cjson.encode(configuration)
+	request.raw(client, 'JS.STREAM.UPDATE ' .. streamName .. ' ' .. configJson .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'INFO' then
+		client.error('failed to update stream: ' .. (data.content or 'unknown error'))
+	end
+	return cjson.decode(data.content)
+end
+
+function js.updateConsumer(client, streamName, consumerName, configuration)
+	local configJson = cjson.encode(configuration)
+	request.raw(client, 'JS.STREAM.CONSUMER.UPDATE ' .. streamName .. ' ' .. consumerName .. ' ' .. configJson .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'INFO' then
+		client.error('failed to update consumer: ' .. (data.content or 'unknown error'))
+	end
+	return cjson.decode(data.content)
+end
+
+function js.getMessageBySequence(client, streamName, sequence)
+	request.raw(client, 'JS.STREAM.MSG.GET ' .. streamName .. ' ' .. sequence .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'MSG' then
+		client.error('failed to get message by sequence: ' .. (data.content or 'unknown error'))
+	end
+	return data.content -- you may want to parse this depending on your message format
+end
 
 return nats
