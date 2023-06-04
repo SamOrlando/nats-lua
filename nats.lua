@@ -403,7 +403,7 @@ end
 -- Adding JetStream related command methods
 local js = nats.js
 function js.create(client, name, subjects)
-	request.raw(client, 'JS.STREAM.CREATE ' .. name .. ' ' .. cjson.encode({ subjects = subjects }) .. '\r\n')
+	request.raw(client, '$JS.STREAM.CREATE ' .. name .. ' ' .. cjson.encode({ subjects = subjects }) .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
 		client.error('failed to create stream: ' .. (data.content or 'unknown error'))
@@ -411,7 +411,7 @@ function js.create(client, name, subjects)
 end
 
 function js.delete(client, name)
-	request.raw(client, 'JS.STREAM.DELETE ' .. name .. '\r\n')
+	request.raw(client, '$JS.STREAM.DELETE ' .. name .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
 		client.error('failed to delete stream: ' .. (data.content or 'unknown error'))
@@ -419,7 +419,7 @@ function js.delete(client, name)
 end
 
 function js.consumer.create(client, streamName, durableName, config)
-	request.raw(client, 'JS.STREAM.CONSUMER.DURABLE.CREATE ' .. streamName .. ' ' .. durableName .. ' ' .. cjson.encode(config) .. '\r\n')
+	request.raw(client, '$JS.STREAM.CONSUMER.DURABLE.CREATE ' .. streamName .. ' ' .. durableName .. ' ' .. cjson.encode(config) .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
 		client.error('failed to create consumer: ' .. (data.content or 'unknown error'))
@@ -427,7 +427,7 @@ function js.consumer.create(client, streamName, durableName, config)
 end
 
 function js.consumer.delete(client, streamName, durableName)
-	request.raw(client, 'JS.STREAM.CONSUMER.DURABLE.DELETE ' .. streamName .. ' ' .. durableName .. '\r\n')
+	request.raw(client, '$JS.STREAM.CONSUMER.DURABLE.DELETE ' .. streamName .. ' ' .. durableName .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
 		client.error('failed to delete consumer: ' .. (data.content or 'unknown error'))
@@ -435,7 +435,7 @@ function js.consumer.delete(client, streamName, durableName)
 end
 
 function js.publish(client, streamName, payload)
-	request.raw(client, 'JS.STREAM.PUBLISH ' .. streamName .. ' ' .. payload .. '\r\n')
+	request.raw(client, '$JS.STREAM.PUBLISH ' .. streamName .. ' ' .. payload .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
 		client.error('failed to publish message: ' .. (data.content or 'unknown error'))
@@ -443,7 +443,7 @@ function js.publish(client, streamName, payload)
 end
 
 function js.info(client, streamName)
-	request.raw(client, 'JS.STREAM.INFO ' .. streamName .. '\r\n')
+	request.raw(client, '$JS.STREAM.INFO ' .. streamName .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
 		client.error('failed to get stream info: ' .. (data.content or 'unknown error'))
@@ -452,7 +452,7 @@ function js.info(client, streamName)
 end
 
 function js.consumer.info(client, streamName, consumerName)
-	request.raw(client, 'JS.STREAM.CONSUMER.INFO ' .. streamName .. ' ' .. consumerName .. '\r\n')
+	request.raw(client, '$JS.STREAM.CONSUMER.INFO ' .. streamName .. ' ' .. consumerName .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
 		client.error('failed to get consumer info: ' .. (data.content or 'unknown error'))
@@ -461,7 +461,7 @@ function js.consumer.info(client, streamName, consumerName)
 end
 
 function js.nextmsg(client, streamName, consumerName)
-	request.raw(client, 'JS.STREAM.CONSUMER.MSG.NEXT ' .. streamName .. ' ' .. consumerName .. '\r\n')
+	request.raw(client, '$JS.STREAM.CONSUMER.MSG.NEXT ' .. streamName .. ' ' .. consumerName .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'MSG' then
 		client.error('failed to get next message: ' .. (data.content or 'unknown error'))
@@ -478,7 +478,7 @@ function js.ackmsg(client, subject)
 end
 
 function js.streams(client)
-	request.raw(client, 'JS.STREAM.LIST\r\n')
+	request.raw(client, '$JS.STREAM.LIST\r\n')
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
 		client.error('failed to list streams: ' .. (data.content or 'unknown error'))
@@ -487,7 +487,7 @@ function js.streams(client)
 end
 
 function js.consumers(client, streamName)
-	request.raw(client, 'JS.STREAM.CONSUMER.LIST ' .. streamName .. '\r\n')
+	request.raw(client, '$JS.STREAM.CONSUMER.LIST ' .. streamName .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
 		client.error('failed to list consumers: ' .. (data.content or 'unknown error'))
@@ -497,7 +497,7 @@ end
 
 function js.update(client, streamName, configuration)
 	local configJson = cjson.encode(configuration)
-	request.raw(client, 'JS.STREAM.UPDATE ' .. streamName .. ' ' .. configJson .. '\r\n')
+	request.raw(client, '$JS.STREAM.UPDATE ' .. streamName .. ' ' .. configJson .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
 		client.error('failed to update stream: ' .. (data.content or 'unknown error'))
@@ -507,7 +507,7 @@ end
 
 function js.consumer.update(client, streamName, consumerName, configuration)
 	local configJson = cjson.encode(configuration)
-	request.raw(client, 'JS.STREAM.CONSUMER.UPDATE ' .. streamName .. ' ' .. consumerName .. ' ' .. configJson .. '\r\n')
+	request.raw(client, '$JS.STREAM.CONSUMER.UPDATE ' .. streamName .. ' ' .. consumerName .. ' ' .. configJson .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
 		client.error('failed to update consumer: ' .. (data.content or 'unknown error'))
@@ -516,7 +516,7 @@ function js.consumer.update(client, streamName, consumerName, configuration)
 end
 
 function js.seqmsg(client, streamName, sequence)
-	request.raw(client, 'JS.STREAM.MSG.GET ' .. streamName .. ' ' .. sequence .. '\r\n')
+	request.raw(client, '$JS.STREAM.MSG.GET ' .. streamName .. ' ' .. sequence .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'MSG' then
 		client.error('failed to get message by sequence: ' .. (data.content or 'unknown error'))
