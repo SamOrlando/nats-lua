@@ -2,7 +2,7 @@ local nats = {
 	_VERSION	 = 'lua-nats 0.0.4',
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
-	command = {},
+	commands = {},
 	js = { consumer = {} },
 }
 
