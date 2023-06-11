@@ -3,7 +3,7 @@ local nats = {
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
 	commands = {},
-	js = { consumer = {} },
+	js = { consumer = {}, template = {} },
 }
 
 
@@ -469,8 +469,16 @@ function js.nextmsg(client, streamName, consumerName)
 	return data.content -- you may want to parse this depending on your message format
 end
 
-function js.ackmsg(client, subject)
-	request.raw(client, 'PUB ' .. subject .. ' +ACK\r\n')
+function js.consumer.ack(client, streamName, consumerName, messageSequence, deliverySequence, domain)
+	request.raw(client, 'PUB $JS.ACK.' .. streamName .. '.' .. consumerName .. '.' .. messageSequence .. '.' .. deliverySequence .. '.' .. domain .. ' \r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
+	end
+end
+
+function js.ack(client, replySubject)
+	request.raw(client, 'PUB ' .. replySubject .. ' \r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
 		client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
@@ -515,13 +523,55 @@ function js.consumer.update(client, streamName, consumerName, configuration)
 	return cjson.decode(data.content)
 end
 
-function js.seqmsg(client, streamName, sequence)
-	request.raw(client, 'PUB $JS.API.STREAM.MSG.GET ' .. streamName .. ' ' .. sequence .. '\r\n')
+function js.replay(client, streamName, messageSequence)
+	request.raw(client, 'PUB $JS.API.STREAM.MSG.GET ' .. streamName .. ' \r\n' .. messageSequence .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'MSG' then
-		client.error('failed to get message by sequence: ' .. (data.content or 'unknown error'))
+		client.error('failed to replay message: ' .. (data.content or 'unknown error'))
 	end
 	return data.content -- you may want to parse this depending on your message format
+end
+
+function js.purge(client, streamName)
+	request.raw(client, 'PUB $JS.API.STREAM.PURGE ' .. streamName .. ' \r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to purge stream: ' .. (data.content or 'unknown error'))
+	end
+end
+
+function js.template.create(client, templateName, config)
+	request.raw(client, 'PUB $JS.API.STREAM.TEMPLATE.CREATE ' .. templateName .. ' \r\n' .. cjson.encode(config) .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to create stream template: ' .. (data.content or 'unknown error'))
+	end
+end
+
+function js.template.delete(client, templateName)
+	request.raw(client, 'PUB $JS.API.STREAM.TEMPLATE.DELETE ' .. templateName .. ' \r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to delete stream template: ' .. (data.content or 'unknown error'))
+	end
+end
+
+function js.template.info(client, templateName)
+	request.raw(client, 'PUB $JS.API.STREAM.TEMPLATE.INFO ' .. templateName .. ' \r\n')
+	local data = response.read(client)
+	if data.action ~= 'INFO' then
+		client.error('failed to get stream template info: ' .. (data.content or 'unknown error'))
+	end
+	return cjson.decode(data.content)
+end
+
+function js.templates(client)
+	request.raw(client, 'PUB $JS.API.STREAM.TEMPLATE.LIST \r\n')
+	local data = response.read(client)
+	if data.action ~= 'INFO' then
+		client.error('failed to list stream templates: ' .. (data.content or 'unknown error'))
+	end
+	return cjson.decode(data.content)
 end
 
 return nats
