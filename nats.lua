@@ -3,7 +3,7 @@ local nats = {
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
 	commands = {},
-	js = { consumer = {}, template = {} },
+	js = { consumer = {}, template = {}, snapshot = {} },
 }
 
 
@@ -402,6 +402,15 @@ end
 
 -- Adding JetStream related command methods
 local js = nats.js
+function js.api_info(client)
+	request.raw(client, 'PUB $JS.API.INFO \r\n')
+	local data = response.read(client)
+	if data.action ~= 'INFO' then
+		client.error('failed to get JetStream info: ' .. (data.content or 'unknown error'))
+	end
+	return cjson.decode(data.content)
+end
+
 function js.create(client, stream_name, subjects)
 	request.raw(client, 'PUB $JS.API.STREAM.CREATE.' .. stream_name .. ' \r\n' .. cjson.encode({ name = stream_name, subjects = subjects }) .. '\r\n')
 	local data = response.read(client)
@@ -573,5 +582,39 @@ function js.templates(client)
 	end
 	return cjson.decode(data.content)
 end
+
+function js.snapshot.create(client, stream_name, snap_name, config)
+	local snap_name = snap_name or create_inbox() -- create_inbox is a function that generates a unique subject name
+	local configJson = cjson.encode(config)
+	request.raw(client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream_name .. ' ' .. snap_name .. ' \r\n' .. configJson .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to create stream snap_name: ' .. (data.content or 'unknown error'))
+	end
+	return snap_name
+end
+
+function js.snapshot.restore(client, stream_name, snap_name)
+	local unique_id = client:subscribe(create_inbox(), function(message)
+		-- handle any responses from the server
+	end)
+	request.raw(client, 'PUB $JS.API.STREAM.RESTORE.' .. stream_name .. ' ' .. unique_id .. ' ' .. #snap_name .. '\r\n' .. snap_name .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'OK' then
+		client.error('failed to restore stream: ' .. (data.content or 'unknown error'))
+	end
+	command.unsubscribe(client, unique_id) -- unsubscribe from the delivery subject
+end
+
+function js.snapshot.read(client, snap_name)
+	local snapshot = {}
+	local unique_id = client:subscribe(snap_name, function(message)
+		table.insert(snapshot, message)
+	end)
+	command.wait(client) -- wait for all snapshot chunks to be received
+	command.unsubscribe(client, unique_id) -- unsubscribe from the delivery subject
+	return table.concat(snapshot) -- concatenate the chunks to form the complete snapshot
+end
+
 
 return nats
