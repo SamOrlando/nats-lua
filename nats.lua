@@ -452,10 +452,11 @@ function js.publish(client, stream_name, payload)
 end
 
 function js.info(client, stream_name)
-	request.raw(client, 'PUB $JS.API.STREAM.INFO.' .. stream_name .. ' \r\n')
+	if stream_name then request.raw(client, 'PUB $JS.API.STREAM.INFO.' .. stream_name .. ' \r\n')
+	else request.raw(client, 'PUB $JS.API.INFO \r\n') end
 	local data = response.read(client)
 	if data.action ~= 'INFO' then
-		client.error('failed to get stream info: ' .. (data.content or 'unknown error'))
+		client.error('failed to get stream api info: ' .. (data.content or 'unknown error'))
 	end
 	return cjson.decode(data.content)
 end
@@ -469,7 +470,7 @@ function js.consumer.info(client, stream_name, consumer_name)
 	return cjson.decode(data.content)
 end
 
-function js.nextmsg(client, stream_name, consumer_name)
+function js.consumer.nextmsg(client, stream_name, consumer_name)
 	request.raw(client, 'PUB $JS.API.CONSUMER.MSG.NEXT.' .. stream_name .. '.' .. consumer_name .. ' \r\n')
 	local data = response.read(client)
 	if data.action ~= 'MSG' then
@@ -477,6 +478,7 @@ function js.nextmsg(client, stream_name, consumer_name)
 	end
 	return data.content -- you may want to parse this depending on your message format
 end
+js.nextmsg = js.consumer.nextmsg
 
 function js.consumer.ack(client, stream_name, consumer_name, msg_sequence, delivery_sequence, domain)
 	request.raw(client, 'PUB $JS.ACK.' .. stream_name .. '.' .. consumer_name .. '.' .. msg_sequence .. '.' .. delivery_sequence .. '.' .. domain .. ' \r\n')
@@ -583,38 +585,37 @@ function js.templates(client)
 	return cjson.decode(data.content)
 end
 
-function js.snapshot.create(client, stream_name, snap_name, config)
-	local snap_name = snap_name or create_inbox() -- create_inbox is a function that generates a unique subject name
+function js.snapshot.create(client, stream_name, config)
+	local reply = create_inbox() -- create_inbox is a function that generates a unique subject name
 	local configJson = cjson.encode(config)
-	request.raw(client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream_name .. ' ' .. snap_name .. ' \r\n' .. configJson .. '\r\n')
+	request.raw(client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream_name .. ' ' .. reply .. ' \r\n' .. configJson .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
-		client.error('failed to create stream snap_name: ' .. (data.content or 'unknown error'))
+		client.error('failed to create stream snapshot: ' .. (data.content or 'unknown error'))
 	end
-	return snap_name
+	return reply
 end
 
-function js.snapshot.restore(client, stream_name, snap_name)
-	local unique_id = client:subscribe(create_inbox(), function(message)
+function js.snapshot.restore(client, stream_name, snap_data)
+	local reply = client:subscribe(create_inbox(), function(message)
 		-- handle any responses from the server
 	end)
-	request.raw(client, 'PUB $JS.API.STREAM.RESTORE.' .. stream_name .. ' ' .. unique_id .. ' ' .. #snap_name .. '\r\n' .. snap_name .. '\r\n')
+	request.raw(client, 'PUB $JS.API.STREAM.RESTORE.' .. stream_name .. ' ' .. reply .. ' ' .. #snap_data .. '\r\n' .. snap_data .. '\r\n')
 	local data = response.read(client)
 	if data.action ~= 'OK' then
 		client.error('failed to restore stream: ' .. (data.content or 'unknown error'))
 	end
-	command.unsubscribe(client, unique_id) -- unsubscribe from the delivery subject
+	command.unsubscribe(client, reply) -- unsubscribe from the delivery subject
 end
 
-function js.snapshot.read(client, snap_name)
+function js.snapshot.read(client, delievery_subject)
 	local snapshot = {}
-	local unique_id = client:subscribe(snap_name, function(message)
+	local unique_id = client:subscribe(delievery_subject, function(message)
 		table.insert(snapshot, message)
 	end)
 	command.wait(client) -- wait for all snapshot chunks to be received
 	command.unsubscribe(client, unique_id) -- unsubscribe from the delivery subject
 	return table.concat(snapshot) -- concatenate the chunks to form the complete snapshot
 end
-
 
 return nats
