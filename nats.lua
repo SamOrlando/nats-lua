@@ -78,6 +78,10 @@ local function load_methods(proto, commands)
 	
 	-- Assign Jetstream Table
 	client.js = nats.js
+	-- Assign KV table
+	client.kv = nats.kv
+	-- Assign Object Store table
+	client.obj = nats.obj
 
 	return client
 end
@@ -621,9 +625,74 @@ end
 
 -- Adding KV JS functionality
 local kv = nats.kv
+	-- // Get returns the latest value for the key.
+	-- Get(key string) (entry KeyValueEntry, err error)
+	-- // GetRevision returns a specific revision value for the key.
+	-- GetRevision(key string, revision uint64) (entry KeyValueEntry, err error)
+	-- // Put will place the new value for the key into the store.
+	-- Put(key string, value []byte) (revision uint64, err error)
+	-- // PutString will place the string for the key into the store.
+	-- PutString(key string, value string) (revision uint64, err error)
+	-- // Create will add the key/value pair iff it does not exist.
+	-- Create(key string, value []byte) (revision uint64, err error)
+	-- // Update will update the value iff the latest revision matches.
+	-- Update(key string, value []byte, last uint64) (revision uint64, err error)
+	-- // Delete will place a delete marker and leave all revisions.
+	-- Delete(key string, opts ...DeleteOpt) error
+	-- // Purge will place a delete marker and remove all previous revisions.
+	-- Purge(key string, opts ...DeleteOpt) error
+	-- // Watch for any updates to keys that match the keys argument which could include wildcards.
+	-- // Watch will send a nil entry when it has received all initial values.
+	-- Watch(keys string, opts ...WatchOpt) (KeyWatcher, error)
+	-- // WatchAll will invoke the callback for all updates.
+	-- WatchAll(opts ...WatchOpt) (KeyWatcher, error)
+	-- // Keys will return all keys.
+	-- Keys(opts ...WatchOpt) ([]string, error)
+	-- // History will return all historical values for the key.
+	-- History(key string, opts ...WatchOpt) ([]KeyValueEntry, error)
+	-- // Bucket returns the current bucket name.
+	-- Bucket() string
+	-- // PurgeDeletes will remove all current delete markers.
+	-- PurgeDeletes(opts ...PurgeOpt) error
+	-- // Status retrieves the status and configuration of a bucket
+	-- Status() (KeyValueStatus, error)
 
 -- Adding KV JS functionality
 local objs = nats.objs
+	-- // Put will place the contents from the reader into a new object.
+	-- Put(obj *ObjectMeta, reader io.Reader, opts ...ObjectOpt) (*ObjectInfo, error)
+	-- // Get will pull the named object from the object store.
+	-- Get(name string, opts ...GetObjectOpt) (ObjectResult, error)
+	-- // PutBytes is convenience function to put a byte slice into this object store.
+	-- PutBytes(name string, data []byte, opts ...ObjectOpt) (*ObjectInfo, error)
+	-- // GetBytes is a convenience function to pull an object from this object store and return it as a byte slice.
+	-- GetBytes(name string, opts ...GetObjectOpt) ([]byte, error)
+	-- // PutString is convenience function to put a string into this object store.
+	-- PutString(name string, data string, opts ...ObjectOpt) (*ObjectInfo, error)
+	-- // GetString is a convenience function to pull an object from this object store and return it as a string.
+	-- GetString(name string, opts ...GetObjectOpt) (string, error)
+	-- // PutFile is convenience function to put a file into this object store.
+	-- PutFile(file string, opts ...ObjectOpt) (*ObjectInfo, error)
+	-- // GetFile is a convenience function to pull an object from this object store and place it in a file.
+	-- GetFile(name, file string, opts ...GetObjectOpt) error
+	-- // GetInfo will retrieve the current information for the object.
+	-- GetInfo(name string, opts ...GetObjectInfoOpt) (*ObjectInfo, error)
+	-- // UpdateMeta will update the metadata for the object.
+	-- UpdateMeta(name string, meta *ObjectMeta) error
+	-- // Delete will delete the named object.
+	-- Delete(name string) error
+	-- // AddLink will add a link to another object.
+	-- AddLink(name string, obj *ObjectInfo) (*ObjectInfo, error)
+	-- // AddBucketLink will add a link to another object store.
+	-- AddBucketLink(name string, bucket ObjectStore) (*ObjectInfo, error)
+	-- // Seal will seal the object store, no further modifications will be allowed.
+	-- Seal() error
+	-- // Watch for changes in the underlying store and receive meta information updates.
+	-- Watch(opts ...WatchOpt) (ObjectWatcher, error)
+	-- // List will list all the objects in this store.
+	-- List(opts ...ListObjectsOpt) ([]*ObjectInfo, error)
+	-- // Status retrieves run-time status about the backing store of the bucket.
+	-- Status() (ObjectStoreStatus, error)
 
 return nats
 
