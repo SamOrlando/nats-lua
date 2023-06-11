@@ -3,7 +3,7 @@ local nats = {
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
 	commands = {},
-	js = { consumer = {}, template = {}, snapshot = {} },
+	js = { consumer = {}, template = {}, snapshot = {}, kv = {}, objs = {}},
 }
 
 
@@ -534,6 +534,15 @@ function js.replay(client, stream_name, msg_sequence)
 	return data.content -- you may want to parse this depending on your message format
 end
 
+function js.remove(client, stream_name, msg_sequence)
+	request.raw(client, 'PUB $JS.API.STREAM.MSG.DELETE.' .. stream_name .. ' \r\n' .. msg_sequence .. '\r\n')
+	local data = response.read(client)
+	if data.action ~= 'MSG' then
+		client.error('failed to delete stream message: ' .. (data.content or 'unknown error'))
+	end
+	return data.content -- you may want to parse this depending on your message format
+end
+
 function js.purge(client, stream_name)
 	request.raw(client, 'PUB $JS.API.STREAM.PURGE.' .. stream_name .. ' \r\n')
 	local data = response.read(client)
@@ -587,6 +596,7 @@ function js.snapshot.create(client, stream_name, config)
 	return reply
 end
 
+--$JS.SNAPSHOT.RESTORE.<stream>.<msg id> future?
 function js.snapshot.restore(client, stream_name, snap_data)
 	local reply = client:subscribe(create_inbox(), function(message)
 		-- handle any responses from the server
@@ -609,4 +619,28 @@ function js.snapshot.read(client, delievery_subject)
 	return table.concat(snapshot) -- concatenate the chunks to form the complete snapshot
 end
 
+-- Adding KV JS functionality
+local kv = nats.kv
+
+-- Adding KV JS functionality
+local objs = nats.objs
+
 return nats
+
+-- $JS.EVENT.METRIC.CONSUMER_ACK.<stream>.<consumer>
+-- $JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>
+-- $JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.<stream>.<consumer>
+-- $JS.EVENT.ADVISORY.STREAM.CREATED.<stream>
+-- $JS.EVENT.ADVISORY.STREAM.DELETED.<stream>
+-- $JS.EVENT.ADVISORY.STREAM.UPDATED.<stream>
+-- $JS.EVENT.ADVISORY.CONSUMER.CREATED.<stream>.<consumer>
+-- $JS.EVENT.ADVISORY.CONSUMER.DELETED.<stream>.<consumer>
+-- $JS.EVENT.ADVISORY.STREAM.SNAPSHOT_CREATE.<stream>
+-- $JS.EVENT.ADVISORY.STREAM.SNAPSHOT_COMPLETE.<stream>
+-- $JS.EVENT.ADVISORY.STREAM.RESTORE_CREATE.<stream>
+-- $JS.EVENT.ADVISORY.STREAM.RESTORE_COMPLETE.<stream>
+-- $JS.EVENT.ADVISORY.STREAM.LEADER_ELECTED.<stream>
+-- $JS.EVENT.ADVISORY.STREAM.QUORUM_LOST.<stream>
+-- $JS.EVENT.ADVISORY.CONSUMER.LEADER_ELECTED.<stream>.<consumer>
+-- $JS.EVENT.ADVISORY.CONSUMER.QUORUM_LOST.<stream>.<consumer>
+-- $JS.EVENT.ADVISORY.API
