@@ -1,3 +1,36 @@
+This is a Lua client library for NATS, a simple, high performance open source messaging system for cloud native applications, IoT messaging, and microservices architectures. The library provides an interface for connecting to a NATS server, sending requests, and handling responses. 
+
+The library includes the following features:
+
+- Connection to a NATS server with optional authentication.
+- Subscription to subjects with optional queue groups.
+- Publishing of messages to subjects.
+- Unsubscription from subjects.
+- Ping and Pong operations for connection keep-alive.
+- Raw command sending and receiving.
+- Server information retrieval.
+- Error handling.
+- Support for JetStream, a full-featured, distributed persistence engine built into NATS.
+
+The JetStream related commands include:
+
+- Stream creation and deletion.
+- Consumer creation and deletion.
+- Message publishing.
+- Stream and consumer information retrieval.
+- Retrieving the next message from a consumer.
+- Acknowledging receipt of a message from a consumer.
+- Listing all streams and consumers.
+- Updating the configuration of a stream or consumer.
+- Replaying a message from a stream.
+- Purging all messages from a stream.
+- Stream template creation, deletion, and information retrieval.
+- Listing all stream templates.
+- Creating, restoring, and reading a snapshot of a stream.
+
+The library uses LuaSocket for network communication and Lua CJSON for JSON encoding and decoding. It also uses the UUID library for generating unique identifiers. The library is compatible with Lua 5.1 and later.
+
+
 Local Functions
 
     create_inbox(): Returns a properly formatted inbox subject.
