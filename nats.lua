@@ -402,15 +402,6 @@ end
 
 -- Adding JetStream related command methods
 local js = nats.js
-function js.api_info(client)
-	request.raw(client, 'PUB $JS.API.INFO \r\n')
-	local data = response.read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to get JetStream info: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
 function js.create(client, stream_name, subjects)
 	request.raw(client, 'PUB $JS.API.STREAM.CREATE.' .. stream_name .. ' \r\n' .. cjson.encode({ name = stream_name, subjects = subjects }) .. '\r\n')
 	local data = response.read(client)
