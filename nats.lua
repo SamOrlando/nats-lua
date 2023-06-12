@@ -33,9 +33,7 @@ local uuid   = require('uuid')
 
 -- ### Local properties / vars ###
 local unpack = _G.unpack or table.unpack
-local network = nats.network
-local response = nats.response
-local request = nats.request
+local network, response, request = nats.network, nats.response, nats.request
 local client_metatable = nats.client_metatable
 
 local defaults = {
@@ -78,7 +76,6 @@ end
 
 
 -- ### Network methods ###
-
 function network.write(client, buffer)
 	if client.trace then print('->> '..buffer:sub(1,-3)) end
 	local _, err = client.network.socket:send(buffer)
@@ -104,7 +101,6 @@ end
 local network_read = network.read
 
 -- ### Response methods ###
--- Client response reader
 function response.read(client)
 	local payload = network_read(client)
 	local slices  = {}
@@ -220,12 +216,11 @@ local function create_connection(parameters)
 end
 
 -- ### Nats library methods ###
-
 function nats.error(message, level)
 	error(message, (level or 1) + 1)
 end
 
-function nats.connect(...)
+function nats.client(...)
 	local args, parameters = {...}, nil
 
 	if #args == 1 then parameters = args[1]
