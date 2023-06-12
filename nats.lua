@@ -88,6 +88,7 @@ function network.write(client, buffer)
 		client.error(err)
 	end
 end
+local network_write = network.write
 
 function network.read(client, len)
 	if len == nil then len = '*l' end
@@ -100,11 +101,12 @@ function network.read(client, len)
 		client.error('connection error: ' .. err)
 	end
 end
+local network_read = network.read
 
 -- ### Response methods ###
 -- Client response reader
 function response.read(client)
-	local payload = client.network.read(client)
+	local payload = network_read(client)
 	local slices  = {}
 	local data	= {}
 
@@ -127,10 +129,10 @@ function response.read(client)
 		data.unique_id = slices[3]
 		-- ask for line ending chars and remove them
 		if #slices == 4 then
-			data.content   = client.network.read(client,  slices[4]+2):sub(1, -3)
+			data.content   = network_read(client,  slices[4]+2):sub(1, -3)
 		else
 			data.reply	 = slices[4]
-			data.content   = client.network.read(client,  slices[5]+2):sub(1, -3)
+			data.content   = network_read(client,  slices[5]+2):sub(1, -3)
 		end
 
 	-- INFO
@@ -154,6 +156,7 @@ function response.read(client)
 
 	return data
 end
+local response_read = response.read
 
 
 -- ### Request methods ###
@@ -162,13 +165,14 @@ function request.raw(client, buffer)
 	local bufferType = type(buffer)
 
 	if bufferType == 'table' then
-		client.network.write(client, table.concat(buffer))
+		network_write(client, table.concat(buffer))
 	elseif bufferType == 'string' then
-		client.network.write(client, buffer)
+		network_write(client, buffer)
 	else
 		client.error('argument error: ' .. bufferType)
 	end
 end
+local request_raw = request.raw
 
 
 -- ### Socket connection methods ###
@@ -234,11 +238,9 @@ function nats.connect(...)
 	return create_client(socket)
 end
 
-function nats.command(cmd, opts) return nats.commands[cmd](opts) end
-
 -- Create a properly formatted inbox subject.
 function nats.create_inbox() return '_INBOX.' .. uuid() end
-local create_inbox = nats.create_inbox
+local create_inbox = nats.create_inbox -- vroom
 
 -- ### NATS Client Methods ###
 function cm.connect(client)
@@ -254,20 +256,20 @@ function cm.connect(client)
 		config.pass = client.pass
 	end
 
-	request.raw(client, 'CONNECT '..cjson.encode(config)..'\r\n')
+	request_raw(client, 'CONNECT '..cjson.encode(config)..'\r\n')
 
 	-- gather the server information
-	local data = response.read(client)
+	local data = response_read(client)
 	if data.action == 'INFO' then
 		client.information = cjson.decode(data.content)
 	end
 end
 
 function cm.ping(client)
-	request.raw(client, 'PING\r\n')
+	request_raw(client, 'PING\r\n')
 
 	-- wait for the server pong
-	local data = response.read(client)
+	local data = response_read(client)
 	if data.action == 'PONG' then
 		return true
 	else
@@ -276,7 +278,7 @@ function cm.ping(client)
 
 end
 
-function cm.pong(client) request.raw(client, 'PONG\r\n') end
+function cm.pong(client) request_raw(client, 'PONG\r\n') end
 
 function cm.request(client, subject, payload, callback)
 	local inbox = create_inbox()
@@ -290,21 +292,21 @@ end
 
 function cm.subscribe(client, subject, callback, queue)
 	local unique_id = uuid()
-	if queue then request.raw(client, 'SUB '..subject..' '..queue..' '..unique_id..'\r\n')
-	else request.raw(client, 'SUB '..subject..' '..unique_id..'\r\n') end
+	if queue then request_raw(client, 'SUB '..subject..' '..queue..' '..unique_id..'\r\n')
+	else request_raw(client, 'SUB '..subject..' '..unique_id..'\r\n') end
 	client.subscriptions[unique_id] = callback
 
 	return unique_id
 end
 
 function cm.unsubscribe(client, unique_id)
-	request.raw(client, 'UNSUB '..unique_id..'\r\n')
+	request_raw(client, 'UNSUB '..unique_id..'\r\n')
 	client.subscriptions[unique_id] = nil
 end
 
 function cm.publish(client, subject, payload, reply)
 	reply = reply and ' ' .. reply or ''
-	request.raw(client, {
+	request_raw(client, {
 		'PUB '..subject..reply..' '..#payload..'\r\n',
 		payload..'\r\n',
 	})
@@ -315,7 +317,7 @@ function cm.wait(client, quantity)
 
 	local count = 0
 	repeat
-		local data = response.read(client)
+		local data = response_read(client)
 
 		if data.action == 'PING' then
 			cm.pong(client)
@@ -327,36 +329,26 @@ function cm.wait(client, quantity)
 	until quantity > 0 and count >= quantity
 end
 
-cm.raw_cmd = function(client, buffer)
-	request.raw(client, buffer .. '\r\n')
-	return response.read(client)
+function cm.request_raw(client, buffer)
+	request_raw(client, buffer .. '\r\n')
+	return response_read(client)
 end
 
-cm.set_auth = function(client, user, pass)
+function cm.set_auth(client, user, pass)
 	client.user = user
 	client.pass = pass
 end
 
-cm.enable_trace = function(client)
-	client.trace = true
-end
+function cm.enable_trace(client) client.trace = true end
 
-cm.set_verbose = function(client, verbose)
-	client.verbose = verbose
-end
+function cm.set_verbose(client, verbose) client.verbose = verbose end
 
-cm.set_pedantic = function(client, pedantic)
-	client.pedantic = pedantic
-end
+function cm.set_pedantic(client, pedantic) client.pedantic = pedantic end
 
-cm.count_subscriptions = function(client)
-	return #client.subscriptions
-end
+function cm.count_subscriptions(client) return #client.subscriptions end
 
-cm.get_server_info = function(client)
-	return client.information
-end
+function cm.server_info(client)	return client.information end
 
-cm.shutdown = function(client)
-	client.network.socket:shutdown()
-end
+function cm.shutdown(client) client.network.socket:shutdown() end
+
+return nats
