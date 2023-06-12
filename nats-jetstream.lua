@@ -77,11 +77,12 @@ function js.delete(stream) -- we will need two of them for cm and js
 	local data = response_read(stream.client)
 	if data.action ~= 'OK' then
 		stream.client.error('failed to delete stream: ' .. (data.content or 'unknown error'))
-		return
+		return false
 	end
 	-- delete client objects stream listing and the object
 	stream.client.streams[stream_name] = nil
 	stream = nil
+	return true
 end
 
 function con.create(stream, consumer_name, config)
@@ -89,6 +90,7 @@ function con.create(stream, consumer_name, config)
 	local data = response_read(stream.client)
 	if data.action ~= 'OK' then
 		client.error('failed to create consumer: ' .. (data.content or 'unknown error'))
+		return
 	end
 
 	-- create and set consumer object
@@ -111,11 +113,13 @@ function con.delete(consumer)
 	local data = response_read(consumer.client)
 	if data.action ~= 'OK' then
 		consumer.client.error('failed to delete consumer: ' .. (data.content or 'unknown error'))
+		return false
 	end
 	
 	-- delete references
 	consumer.stream[consumer_name] = nil
 	consumer = nil
+	return true
 end
 
 function js.publish(stream, payload)
@@ -123,7 +127,9 @@ function js.publish(stream, payload)
 	local data = response_read(stream.client)
 	if data.action ~= 'OK' then
 		stream.client.error('failed to publish message: ' .. (data.content or 'unknown error'))
+		return false
 	end
+	return true
 end
 
 function js.info(stream)
@@ -131,6 +137,7 @@ function js.info(stream)
 	local data = response_read(stream.client)
 	if data.action ~= 'INFO' then
 		stream.client.error('failed to get stream api info: ' .. (data.content or 'unknown error'))
+		return
 	end
 	return cjson.decode(data.content)
 end
@@ -140,6 +147,7 @@ function con.info(consumer)
 	local data = response_read(consumer.client)
 	if data.action ~= 'INFO' then
 		consumer.client.error('failed to get consumer info: ' .. (data.content or 'unknown error'))
+		return
 	end
 	return cjson.decode(data.content)
 end
@@ -149,6 +157,7 @@ function con.nextmsg(consumer)
 	local data = response_read(consumer.client)
 	if data.action ~= 'MSG' then
 		consumer.client.error('failed to get next message: ' .. (data.content or 'unknown error'))
+		return
 	end
 	return data.content -- you may want to parse this depending on your message format
 end
@@ -158,7 +167,9 @@ function con.ack(consumer, msg_sequence, delivery_sequence, domain)
 	local data = response_read(consumer.client)
 	if data.action ~= 'OK' then
 		con.client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
+		return false
 	end
+	return true
 end
 
 function js.ack(stream, reply)
@@ -166,7 +177,9 @@ function js.ack(stream, reply)
 	local data = response_read(client)
 	if data.action ~= 'OK' then
 		stream.client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
+		return false
 	end
+	return true
 end
 
 function cm.stream_list(client)
@@ -174,6 +187,7 @@ function cm.stream_list(client)
 	local data = response_read(client)
 	if data.action ~= 'INFO' then
 		client.error('failed to list streams: ' .. (data.content or 'unknown error'))
+		return
 	end
 	return cjson.decode(data.content)
 end
@@ -183,6 +197,7 @@ function js.consumer_list(stream)
 	local data = response_read(stream.client)
 	if data.action ~= 'INFO' then
 		stream.client.error('failed to list consumers: ' .. (data.content or 'unknown error'))
+		return
 	end
 	return cjson.decode(data.content)
 end
@@ -193,6 +208,7 @@ function js.update(stream, configuration)
 	local data = response_read(client)
 	if data.action ~= 'INFO' then
 		stream.client.error('failed to update stream: ' .. (data.content or 'unknown error'))
+		return
 	end
 	return cjson.decode(data.content)
 end
@@ -203,6 +219,7 @@ function con.update(consumer, configuration)
 	local data = response_read(consumer.client)
 	if data.action ~= 'INFO' then
 		consumer.client.error('failed to update consumer: ' .. (data.content or 'unknown error'))
+		return
 	end
 	return cjson.decode(data.content)
 end
@@ -212,6 +229,7 @@ function js.replay(stream, msg_sequence)
 	local data = response_read(stream.client)
 	if data.action ~= 'MSG' then
 		stream.client.error('failed to replay message: ' .. (data.content or 'unknown error'))
+		return
 	end
 	return data.content -- you may want to parse this depending on your message format
 end
@@ -221,6 +239,7 @@ function js.remove(stream, msg_sequence)
 	local data = response_read(stream.client)
 	if data.action ~= 'MSG' then
 		stream.client.error('failed to delete stream message: ' .. (data.content or 'unknown error'))
+		return
 	end
 	return data.content -- you may want to parse this depending on your message format
 end
@@ -230,40 +249,45 @@ function js.purge(stream)
 	local data = response_read(stream.client)
 	if data.action ~= 'OK' then
 		stream.client.error('failed to purge stream: ' .. (data.content or 'unknown error'))
+		return
 	end
 end
 
 function js.snapshot.create(stream, config)
-	local reply = create_inbox() -- create_inbox is a function that generates a unique subject name
+	local delievery_subject = create_inbox() -- create_inbox is a function that generates a unique subject name
 	local configJson = cjson.encode(config)
-	request_raw(client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream_name .. ' ' .. reply .. ' \r\n' .. configJson .. '\r\n')
-	local data = response_read(client)
+	request_raw(stream.client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream.name .. ' ' .. delievery_subject .. ' \r\n' .. configJson .. '\r\n')
+	local data = response_read(stream.client)
 	if data.action ~= 'OK' then
-		client.error('failed to create stream snapshot: ' .. (data.content or 'unknown error'))
+		stream.client.error('failed to create stream snapshot: ' .. (data.content or 'unknown error'))
+		return
 	end
-	return reply
+	return delievery_subject
 end
 
 --$JS.SNAPSHOT.RESTORE.<stream>.<msg id> future?
-function js.snapshot.restore(client, stream_name, snap_data)
-	local reply = client:subscribe(create_inbox(), function(message)
+function js.snapshot.restore(stream, snap_data)
+	local reply = stream.client:subscribe(create_inbox(), function(message)
 		-- handle any responses from the server
 	end)
-	request_raw(client, 'PUB $JS.API.STREAM.RESTORE.' .. stream_name .. ' ' .. reply .. ' ' .. #snap_data .. '\r\n' .. snap_data .. '\r\n')
-	local data = response_read(client)
+	request_raw(stream.client, 'PUB $JS.API.STREAM.RESTORE.' .. stream.name .. ' ' .. #snap_data .. '\r\n' .. snap_data .. '\r\n')
+	local data = response_read(stream.client)
 	if data.action ~= 'OK' then
-		client.error('failed to restore stream: ' .. (data.content or 'unknown error'))
+		stream.client.error('failed to restore stream: ' .. (data.content or 'unknown error'))
+		stream.client:unsubscribe(reply)
+		return false
 	end
-	command.unsubscribe(client, reply) -- unsubscribe from the delivery subject
+	stream.client:unsubscribe(reply) -- unsubscribe from the delivery subject
+	return true
 end
 
-function js.snapshot.read(client, delievery_subject)
+function js.snapshot.read(stream, delievery_subject)
 	local snapshot = {}
-	local unique_id = client:subscribe(delievery_subject, function(message)
+	local unique_id = stream.client:subscribe(delievery_subject, function(message)
 		table.insert(snapshot, message)
 	end)
-	command.wait(client) -- wait for all snapshot chunks to be received
-	command.unsubscribe(client, unique_id) -- unsubscribe from the delivery subject
+	stream.client:wait() -- wait for all snapshot chunks to be received
+	stream.client:unsubscribe(unique_id) -- unsubscribe from the delivery subject
 	return table.concat(snapshot) -- concatenate the chunks to form the complete snapshot
 end
 
