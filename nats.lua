@@ -3,24 +3,18 @@ local nats = {
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
 	methods = {}, -- method metatable for nats core client object
+	network = {},
+	request = {},
+	response = {},
 }
 
+nats.client_metatable = {
+	methods = {},
+	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
+	__call = function(self, ...) return	end,
+}
 
--- ### Library requirements ###
-
-local cjson  = require('cjson')
-local uuid   = require('uuid')
-
-
--- ### Local properties ###
-
-local unpack = _G.unpack or table.unpack
--- hack it till we get it
-local network, request, response = {}, {}, {}
-nats.response = response -- hack it till we get it
-nats.request = request
-
-local client_prototype = {
+nats.client_prototype = {
 	user		  = nil,
 	pass		  = nil,
 	lang		  = 'lua',
@@ -33,13 +27,23 @@ local client_prototype = {
 	information   = {},
 }
 
+-- ### Library requirements ###
+local cjson  = require('cjson')
+local uuid   = require('uuid')
+
+-- ### Local properties / vars ###
+local unpack = _G.unpack or table.unpack
+local network = nats.network
+local response = nats.response
+local request = nats.request
+local client_metatable = nats.client_metatable
+
 local defaults = {
 	host		= '127.0.0.1',
 	port		= 4222,
 	tcp_nodelay = true,
 	path		= nil,
 }
-
 
 -- ### Local methods ###
 local function merge_defaults(parameters)
@@ -49,13 +53,6 @@ local function merge_defaults(parameters)
 	end
 	return parameters
 end
-
-nats.client_metatable = {
-	methods = {},
-	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
-	__call = function(self, ...) return	end,
-}
-local cm = nats.client_metatable.methods
 
 local function create_client(socket)
 	local client = setmetatable({}, client_metatable))
@@ -105,7 +102,6 @@ function network.read(client, len)
 end
 
 -- ### Response methods ###
-
 -- Client response reader
 function response.read(client)
 	local payload = client.network.read(client)
@@ -161,7 +157,6 @@ end
 
 
 -- ### Request methods ###
-
 -- Client request sender (RAW)
 function request.raw(client, buffer)
 	local bufferType = type(buffer)
@@ -177,7 +172,6 @@ end
 
 
 -- ### Socket connection methods ###
-
 local function connect_tcp(socket, parameters)
 	local host, port = parameters.host, tonumber(parameters.port)
 	if parameters.timeout then
@@ -230,24 +224,19 @@ end
 function nats.connect(...)
 	local args, parameters = {...}, nil
 
-	if #args == 1 then
-		parameters = args[1]
+	if #args == 1 then parameters = args[1]
 	elseif #args > 1 then
 		local host, port, timeout = unpack(args)
 		parameters = { host = host, port = port, timeout = tonumber(timeout) }
 	end
 
 	local socket = create_connection(merge_defaults(parameters))
-	local client = create_client(client_prototype, socket, nats.methods)
-
-	return client
+	return create_client(socket)
 end
 
-function nats.command(cmd, opts)
-	return nats.commands[cmd](opts)
-end
+function nats.command(cmd, opts) return nats.commands[cmd](opts) end
 
--- ### Create a properly formatted inbox subject.
+-- Create a properly formatted inbox subject.
 function nats.create_inbox() return '_INBOX.' .. uuid() end
 local create_inbox = nats.create_inbox
 
@@ -336,4 +325,38 @@ function cm.wait(client, quantity)
 			client.subscriptions[data.unique_id](data.content, data.reply, data.subject, data.unique_id)
 		end
 	until quantity > 0 and count >= quantity
+end
+
+cm.raw_cmd = function(client, buffer)
+	request.raw(client, buffer .. '\r\n')
+	return response.read(client)
+end
+
+cm.set_auth = function(client, user, pass)
+	client.user = user
+	client.pass = pass
+end
+
+cm.enable_trace = function(client)
+	client.trace = true
+end
+
+cm.set_verbose = function(client, verbose)
+	client.verbose = verbose
+end
+
+cm.set_pedantic = function(client, pedantic)
+	client.pedantic = pedantic
+end
+
+cm.count_subscriptions = function(client)
+	return #client.subscriptions
+end
+
+cm.get_server_info = function(client)
+	return client.information
+end
+
+cm.shutdown = function(client)
+	client.network.socket:shutdown()
 end
