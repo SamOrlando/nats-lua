@@ -404,6 +404,11 @@ function command.wait(client, quantity)
 	until quantity > 0 and count >= quantity
 end
 
+-- future:	break into nats-js.lua module away from core
+-- 			review local functions
+-- nats.jetstream(client, stream_name, subjects)
+--	return: jetstream object/metatable
+
 -- Adding JetStream related command methods
 local js = nats.js
 function js.create(client, stream_name, subjects)
