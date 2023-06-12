@@ -95,7 +95,7 @@ function con.create(stream, consumer_name, config)
 
 	-- create and set consumer object
 	local consumer = setmetatable({}, consumer_metatable)
-	consumer.name = stream_name
+	consumer.name = consumer_name
 	consumer.client = client
 	consumer.stream = stream
 	consumer.config = config
@@ -117,7 +117,7 @@ function con.delete(consumer)
 	end
 	
 	-- delete references
-	consumer.stream[consumer_name] = nil
+	consumer.stream[consumer.name] = nil
 	consumer = nil
 	return true
 end
@@ -249,8 +249,9 @@ function js.purge(stream)
 	local data = response_read(stream.client)
 	if data.action ~= 'OK' then
 		stream.client.error('failed to purge stream: ' .. (data.content or 'unknown error'))
-		return
+		return false
 	end
+	return true
 end
 
 function js.snapshot.create(stream, config)
