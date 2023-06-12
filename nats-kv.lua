@@ -1,0 +1,33 @@
+-- Adding KV JS functionality
+local kv = nats.jetstream.kv
+	-- // Get returns the latest value for the key.
+	-- Get(key string) (entry KeyValueEntry, err error)
+	-- // GetRevision returns a specific revision value for the key.
+	-- GetRevision(key string, revision uint64) (entry KeyValueEntry, err error)
+	-- // Put will place the new value for the key into the store.
+	-- Put(key string, value []byte) (revision uint64, err error)
+	-- // PutString will place the string for the key into the store.
+	-- PutString(key string, value string) (revision uint64, err error)
+	-- // Create will add the key/value pair iff it does not exist.
+	-- Create(key string, value []byte) (revision uint64, err error)
+	-- // Update will update the value iff the latest revision matches.
+	-- Update(key string, value []byte, last uint64) (revision uint64, err error)
+	-- // Delete will place a delete marker and leave all revisions.
+	-- Delete(key string, opts ...DeleteOpt) error
+	-- // Purge will place a delete marker and remove all previous revisions.
+	-- Purge(key string, opts ...DeleteOpt) error
+	-- // Watch for any updates to keys that match the keys argument which could include wildcards.
+	-- // Watch will send a nil entry when it has received all initial values.
+	-- Watch(keys string, opts ...WatchOpt) (KeyWatcher, error)
+	-- // WatchAll will invoke the callback for all updates.
+	-- WatchAll(opts ...WatchOpt) (KeyWatcher, error)
+	-- // Keys will return all keys.
+	-- Keys(opts ...WatchOpt) ([]string, error)
+	-- // History will return all historical values for the key.
+	-- History(key string, opts ...WatchOpt) ([]KeyValueEntry, error)
+	-- // Bucket returns the current bucket name.
+	-- Bucket() string
+	-- // PurgeDeletes will remove all current delete markers.
+	-- PurgeDeletes(opts ...PurgeOpt) error
+	-- // Status retrieves the status and configuration of a bucket
+	-- Status() (KeyValueStatus, error)

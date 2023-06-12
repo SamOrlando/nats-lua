@@ -80,7 +80,7 @@ function js.delete(stream) -- we will need two of them for cm and js
 		return false
 	end
 	-- delete client objects stream listing and the object
-	stream.client.streams[stream_name] = nil
+	stream.client.streams[stream.name] = nil
 	stream = nil
 	return true
 end
