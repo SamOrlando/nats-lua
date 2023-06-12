@@ -2,8 +2,7 @@ local nats = {
 	_VERSION	 = 'lua-nats 0.0.4',
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
-	commands = {},
-	js = { consumer = {}, template = {}, snapshot = {}, kv = {}, objs = {}},
+	methods = {}, -- method metatable for nats core client object
 }
 
 
@@ -16,7 +15,10 @@ local uuid   = require('uuid')
 -- ### Local properties ###
 
 local unpack = _G.unpack or table.unpack
+-- hack it till we get it
 local network, request, response = {}, {}, {}
+nats.response = response -- hack it till we get it
+nats.request = request
 
 local client_prototype = {
 	user		  = nil,
@@ -38,73 +40,45 @@ local defaults = {
 	path		= nil,
 }
 
--- ### Create a properly formatted inbox subject.
-
-local function create_inbox()
-	return '_INBOX.' .. uuid()
-end
 
 -- ### Local methods ###
-
 local function merge_defaults(parameters)
-	if parameters == nil then
-		parameters = {}
-	end
+	parameters = parameters or {}
 	for k, v in pairs(defaults) do
-		if parameters[k] == nil then
-			parameters[k] = defaults[k]
-		end
+		parameters[k] = parameters[k] or defaults[k]
 	end
 	return parameters
 end
 
-local function load_methods(proto, commands)
-	local commands = commands or {}
-	-- inherit client metatable from client_proto metatable
-	local client = setmetatable({}, getmetatable(proto))
+nats.client_metatable = {
+	methods = {},
+	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
+	__call = function(self, ...) return	end,
+}
+local cm = nats.client_metatable.methods
 
-	-- Assign commands functions to the client
-	for cmd, fn in pairs(commands) do
-		if type(fn) ~= 'function' then
-			nats.error('invalid type for command ' .. cmd .. '(must be a function)')
-		end
-		client[cmd] = fn
-	end
+local function create_client(socket)
+	local client = setmetatable({}, client_metatable))
+	for k, v in pairs(client_prototype) do client[k] = v end
 	
-	-- assing client properties and methods from client_proto
-	for i, v in pairs(proto) do
-		client[i] = v
-	end
-	
-	-- Assign Jetstream Table
-	client.js = nats.js
-	-- Assign KV table
-	client.kv = nats.kv
-	-- Assign Object Store table
-	client.obj = nats.obj
-
-	return client
-end
-
-local function create_client(client_proto, client_socket, commands)
-	local client = load_methods(client_proto, commands)
 	-- assign client error handler
 	client.error = nats.error
 	-- assign client network methods
 	client.network = {
-		socket = client_socket,
+		socket = socket,
 		read   = network.read,
 		write  = network.write,
 		lread  = nil,
 		lwrite = nil,
 	}
-	-- assign client requests methods
-	client.requests = {
-		multibulk = request.raw,
-	}
+	-- -- assign client requests methods
+	-- client.requests = {
+		-- multibulk = request.raw,
+	-- }
 	uuid.seed()
 	return client
 end
+
 
 -- ### Network methods ###
 
@@ -202,42 +176,6 @@ function request.raw(client, buffer)
 end
 
 
--- ### Client prototype methods ###
-
-client_prototype.raw_cmd = function(client, buffer)
-	request.raw(client, buffer .. '\r\n')
-	return response.read(client)
-end
-
-client_prototype.set_auth = function(client, user, pass)
-	client.user = user
-	client.pass = pass
-end
-
-client_prototype.enable_trace = function(client)
-	client.trace = true
-end
-
-client_prototype.set_verbose = function(client, verbose)
-	client.verbose = verbose
-end
-
-client_prototype.set_pedantic = function(client, pedantic)
-	client.pedantic = pedantic
-end
-
-client_prototype.count_subscriptions = function(client)
-	return #client.subscriptions
-end
-
-client_prototype.get_server_info = function(client)
-	return client.information
-end
-
-client_prototype.shutdown = function(client)
-	client.network.socket:shutdown()
-end
-
 -- ### Socket connection methods ###
 
 local function connect_tcp(socket, parameters)
@@ -300,7 +238,7 @@ function nats.connect(...)
 	end
 
 	local socket = create_connection(merge_defaults(parameters))
-	local client = create_client(client_prototype, socket, nats.commands)
+	local client = create_client(client_prototype, socket, nats.methods)
 
 	return client
 end
@@ -309,9 +247,12 @@ function nats.command(cmd, opts)
 	return nats.commands[cmd](opts)
 end
 
--- ### Command methods ###
-local command = nats.commands
-function command.connect(client)
+-- ### Create a properly formatted inbox subject.
+function nats.create_inbox() return '_INBOX.' .. uuid() end
+local create_inbox = nats.create_inbox
+
+-- ### NATS Client Methods ###
+function cm.connect(client)
 	local config = {
 		lang	 = client.lang,
 		version  = client.version,
@@ -333,7 +274,7 @@ function command.connect(client)
 	end
 end
 
-function command.ping(client)
+function cm.ping(client)
 	request.raw(client, 'PING\r\n')
 
 	-- wait for the server pong
@@ -346,11 +287,9 @@ function command.ping(client)
 
 end
 
-function command.pong(client)
-	request.raw(client, 'PONG\r\n')
-end
+function cm.pong(client) request.raw(client, 'PONG\r\n') end
 
-function command.request(client, subject, payload, callback)
+function cm.request(client, subject, payload, callback)
 	local inbox = create_inbox()
 	local unique_id = client:subscribe(inbox, function(message, reply)
 		client:unsubscribe(unique_id)
@@ -360,7 +299,7 @@ function command.request(client, subject, payload, callback)
 	return unique_id, inbox
 end
 
-function command.subscribe(client, subject, callback, queue)
+function cm.subscribe(client, subject, callback, queue)
 	local unique_id = uuid()
 	if queue then request.raw(client, 'SUB '..subject..' '..queue..' '..unique_id..'\r\n')
 	else request.raw(client, 'SUB '..subject..' '..unique_id..'\r\n') end
@@ -369,25 +308,20 @@ function command.subscribe(client, subject, callback, queue)
 	return unique_id
 end
 
-function command.unsubscribe(client, unique_id)
+function cm.unsubscribe(client, unique_id)
 	request.raw(client, 'UNSUB '..unique_id..'\r\n')
 	client.subscriptions[unique_id] = nil
 end
 
-function command.publish(client, subject, payload, reply)
-	if reply ~= nil then
-		reply = ' '..reply
-	else
-		reply = ''
-	end
-
+function cm.publish(client, subject, payload, reply)
+	reply = reply and ' ' .. reply or ''
 	request.raw(client, {
 		'PUB '..subject..reply..' '..#payload..'\r\n',
 		payload..'\r\n',
 	})
 end
 
-function command.wait(client, quantity)
+function cm.wait(client, quantity)
 	quantity = quantity or 0
 
 	local count = 0
@@ -395,7 +329,7 @@ function command.wait(client, quantity)
 		local data = response.read(client)
 
 		if data.action == 'PING' then
-			command.pong(client)
+			cm.pong(client)
 
 		elseif data.action == 'MSG' then
 			count = count + 1
@@ -403,318 +337,3 @@ function command.wait(client, quantity)
 		end
 	until quantity > 0 and count >= quantity
 end
-
--- future:	break into nats-js.lua module away from core
--- 			review local functions
--- nats.jetstream(client, stream_name, subjects)
---	return: jetstream object/metatable
-
--- Adding JetStream related command methods
-local js = nats.js
-function js.create(client, stream_name, subjects)
-	request.raw(client, 'PUB $JS.API.STREAM.CREATE.' .. stream_name .. ' \r\n' .. cjson.encode({ name = stream_name, subjects = subjects }) .. '\r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to create stream: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.delete(client, stream_name)
-	request.raw(client, 'PUB $JS.API.STREAM.DELETE.' .. stream_name .. ' \r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to delete stream: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.consumer.create(client, stream_name, consumer_name, config)
-	request.raw(client, 'PUB $JS.API.CONSUMER.CREATE.' .. stream_name .. '.' .. consumer_name .. ' \r\n' .. cjson.encode(config) .. '\r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to create consumer: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.consumer.delete(client, stream_name, consumer_name)
-	request.raw(client, 'PUB $JS.API.CONSUMER.DELETE.' .. stream_name .. '.' .. consumer_name .. ' \r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to delete consumer: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.publish(client, stream_name, payload)
-	request.raw(client, 'PUB ' .. stream_name .. ' \r\n' .. payload .. '\r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to publish message: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.info(client, stream_name)
-	if stream_name then request.raw(client, 'PUB $JS.API.STREAM.INFO.' .. stream_name .. ' \r\n')
-	else request.raw(client, 'PUB $JS.API.INFO \r\n') end
-	local data = response.read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to get stream api info: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
-function js.consumer.info(client, stream_name, consumer_name)
-	request.raw(client, 'PUB $JS.API.CONSUMER.INFO.' .. stream_name .. '.' .. consumer_name .. ' \r\n')
-	local data = response.read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to get consumer info: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
-function js.consumer.nextmsg(client, stream_name, consumer_name)
-	request.raw(client, 'PUB $JS.API.CONSUMER.MSG.NEXT.' .. stream_name .. '.' .. consumer_name .. ' \r\n')
-	local data = response.read(client)
-	if data.action ~= 'MSG' then
-		client.error('failed to get next message: ' .. (data.content or 'unknown error'))
-	end
-	return data.content -- you may want to parse this depending on your message format
-end
-js.nextmsg = js.consumer.nextmsg
-
-function js.consumer.ack(client, stream_name, consumer_name, msg_sequence, delivery_sequence, domain)
-	request.raw(client, 'PUB $JS.ACK.' .. stream_name .. '.' .. consumer_name .. '.' .. msg_sequence .. '.' .. delivery_sequence .. '.' .. domain .. ' \r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.ack(client, reply)
-	request.raw(client, 'PUB ' .. reply .. ' \r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.streams(client)
-	request.raw(client, 'PUB $JS.API.STREAM.LIST\r\n')
-	local data = response.read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to list streams: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
-function js.consumers(client, stream_name)
-	request.raw(client, 'PUB $JS.API.CONSUMER.LIST.' .. stream_name .. ' \r\n')
-	local data = response.read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to list consumers: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
-function js.update(client, stream_name, configuration)
-	local configJson = cjson.encode(configuration)
-	request.raw(client, 'PUB $JS.API.STREAM.UPDATE.' .. stream_name .. ' \r\n' .. configJson .. '\r\n')
-	local data = response.read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to update stream: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
-function js.consumer.update(client, stream_name, consumer_name, configuration)
-	local configJson = cjson.encode(configuration)
-	request.raw(client, 'PUB $JS.API.CONSUMER.UPDATE.' .. stream_name .. '.' .. consumer_name .. ' \r\n' .. configJson .. '\r\n')
-	local data = response.read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to update consumer: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
-function js.replay(client, stream_name, msg_sequence)
-	request.raw(client, 'PUB $JS.API.STREAM.MSG.GET.' .. stream_name .. ' \r\n' .. msg_sequence .. '\r\n')
-	local data = response.read(client)
-	if data.action ~= 'MSG' then
-		client.error('failed to replay message: ' .. (data.content or 'unknown error'))
-	end
-	return data.content -- you may want to parse this depending on your message format
-end
-
-function js.remove(client, stream_name, msg_sequence)
-	request.raw(client, 'PUB $JS.API.STREAM.MSG.DELETE.' .. stream_name .. ' \r\n' .. msg_sequence .. '\r\n')
-	local data = response.read(client)
-	if data.action ~= 'MSG' then
-		client.error('failed to delete stream message: ' .. (data.content or 'unknown error'))
-	end
-	return data.content -- you may want to parse this depending on your message format
-end
-
-function js.purge(client, stream_name)
-	request.raw(client, 'PUB $JS.API.STREAM.PURGE.' .. stream_name .. ' \r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to purge stream: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.template.create(client, template_name, config)
-	request.raw(client, 'PUB $JS.API.STREAM.TEMPLATE.CREATE.' .. template_name .. ' \r\n' .. cjson.encode(config) .. '\r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to create stream template: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.template.delete(client, template_name)
-	request.raw(client, 'PUB $JS.API.STREAM.TEMPLATE.DELETE.' .. template_name .. ' \r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to delete stream template: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.template.info(client, template_name)
-	request.raw(client, 'PUB $JS.API.STREAM.TEMPLATE.INFO.' .. template_name .. ' \r\n')
-	local data = response.read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to get stream template info: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
-function js.templates(client)
-	request.raw(client, 'PUB $JS.API.STREAM.TEMPLATE.LIST \r\n')
-	local data = response.read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to list stream templates: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
-function js.snapshot.create(client, stream_name, config)
-	local reply = create_inbox() -- create_inbox is a function that generates a unique subject name
-	local configJson = cjson.encode(config)
-	request.raw(client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream_name .. ' ' .. reply .. ' \r\n' .. configJson .. '\r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to create stream snapshot: ' .. (data.content or 'unknown error'))
-	end
-	return reply
-end
-
---$JS.SNAPSHOT.RESTORE.<stream>.<msg id> future?
-function js.snapshot.restore(client, stream_name, snap_data)
-	local reply = client:subscribe(create_inbox(), function(message)
-		-- handle any responses from the server
-	end)
-	request.raw(client, 'PUB $JS.API.STREAM.RESTORE.' .. stream_name .. ' ' .. reply .. ' ' .. #snap_data .. '\r\n' .. snap_data .. '\r\n')
-	local data = response.read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to restore stream: ' .. (data.content or 'unknown error'))
-	end
-	command.unsubscribe(client, reply) -- unsubscribe from the delivery subject
-end
-
-function js.snapshot.read(client, delievery_subject)
-	local snapshot = {}
-	local unique_id = client:subscribe(delievery_subject, function(message)
-		table.insert(snapshot, message)
-	end)
-	command.wait(client) -- wait for all snapshot chunks to be received
-	command.unsubscribe(client, unique_id) -- unsubscribe from the delivery subject
-	return table.concat(snapshot) -- concatenate the chunks to form the complete snapshot
-end
-
--- Adding KV JS functionality
-local kv = nats.kv
-	-- // Get returns the latest value for the key.
-	-- Get(key string) (entry KeyValueEntry, err error)
-	-- // GetRevision returns a specific revision value for the key.
-	-- GetRevision(key string, revision uint64) (entry KeyValueEntry, err error)
-	-- // Put will place the new value for the key into the store.
-	-- Put(key string, value []byte) (revision uint64, err error)
-	-- // PutString will place the string for the key into the store.
-	-- PutString(key string, value string) (revision uint64, err error)
-	-- // Create will add the key/value pair iff it does not exist.
-	-- Create(key string, value []byte) (revision uint64, err error)
-	-- // Update will update the value iff the latest revision matches.
-	-- Update(key string, value []byte, last uint64) (revision uint64, err error)
-	-- // Delete will place a delete marker and leave all revisions.
-	-- Delete(key string, opts ...DeleteOpt) error
-	-- // Purge will place a delete marker and remove all previous revisions.
-	-- Purge(key string, opts ...DeleteOpt) error
-	-- // Watch for any updates to keys that match the keys argument which could include wildcards.
-	-- // Watch will send a nil entry when it has received all initial values.
-	-- Watch(keys string, opts ...WatchOpt) (KeyWatcher, error)
-	-- // WatchAll will invoke the callback for all updates.
-	-- WatchAll(opts ...WatchOpt) (KeyWatcher, error)
-	-- // Keys will return all keys.
-	-- Keys(opts ...WatchOpt) ([]string, error)
-	-- // History will return all historical values for the key.
-	-- History(key string, opts ...WatchOpt) ([]KeyValueEntry, error)
-	-- // Bucket returns the current bucket name.
-	-- Bucket() string
-	-- // PurgeDeletes will remove all current delete markers.
-	-- PurgeDeletes(opts ...PurgeOpt) error
-	-- // Status retrieves the status and configuration of a bucket
-	-- Status() (KeyValueStatus, error)
-
--- Adding KV JS functionality
-local objs = nats.objs
-	-- // Put will place the contents from the reader into a new object.
-	-- Put(obj *ObjectMeta, reader io.Reader, opts ...ObjectOpt) (*ObjectInfo, error)
-	-- // Get will pull the named object from the object store.
-	-- Get(name string, opts ...GetObjectOpt) (ObjectResult, error)
-	-- // PutBytes is convenience function to put a byte slice into this object store.
-	-- PutBytes(name string, data []byte, opts ...ObjectOpt) (*ObjectInfo, error)
-	-- // GetBytes is a convenience function to pull an object from this object store and return it as a byte slice.
-	-- GetBytes(name string, opts ...GetObjectOpt) ([]byte, error)
-	-- // PutString is convenience function to put a string into this object store.
-	-- PutString(name string, data string, opts ...ObjectOpt) (*ObjectInfo, error)
-	-- // GetString is a convenience function to pull an object from this object store and return it as a string.
-	-- GetString(name string, opts ...GetObjectOpt) (string, error)
-	-- // PutFile is convenience function to put a file into this object store.
-	-- PutFile(file string, opts ...ObjectOpt) (*ObjectInfo, error)
-	-- // GetFile is a convenience function to pull an object from this object store and place it in a file.
-	-- GetFile(name, file string, opts ...GetObjectOpt) error
-	-- // GetInfo will retrieve the current information for the object.
-	-- GetInfo(name string, opts ...GetObjectInfoOpt) (*ObjectInfo, error)
-	-- // UpdateMeta will update the metadata for the object.
-	-- UpdateMeta(name string, meta *ObjectMeta) error
-	-- // Delete will delete the named object.
-	-- Delete(name string) error
-	-- // AddLink will add a link to another object.
-	-- AddLink(name string, obj *ObjectInfo) (*ObjectInfo, error)
-	-- // AddBucketLink will add a link to another object store.
-	-- AddBucketLink(name string, bucket ObjectStore) (*ObjectInfo, error)
-	-- // Seal will seal the object store, no further modifications will be allowed.
-	-- Seal() error
-	-- // Watch for changes in the underlying store and receive meta information updates.
-	-- Watch(opts ...WatchOpt) (ObjectWatcher, error)
-	-- // List will list all the objects in this store.
-	-- List(opts ...ListObjectsOpt) ([]*ObjectInfo, error)
-	-- // Status retrieves run-time status about the backing store of the bucket.
-	-- Status() (ObjectStoreStatus, error)
-
-return nats
-
--- $JS.EVENT.METRIC.CONSUMER_ACK.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.STREAM.CREATED.<stream>
--- $JS.EVENT.ADVISORY.STREAM.DELETED.<stream>
--- $JS.EVENT.ADVISORY.STREAM.UPDATED.<stream>
--- $JS.EVENT.ADVISORY.CONSUMER.CREATED.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.CONSUMER.DELETED.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.STREAM.SNAPSHOT_CREATE.<stream>
--- $JS.EVENT.ADVISORY.STREAM.SNAPSHOT_COMPLETE.<stream>
--- $JS.EVENT.ADVISORY.STREAM.RESTORE_CREATE.<stream>
--- $JS.EVENT.ADVISORY.STREAM.RESTORE_COMPLETE.<stream>
--- $JS.EVENT.ADVISORY.STREAM.LEADER_ELECTED.<stream>
--- $JS.EVENT.ADVISORY.STREAM.QUORUM_LOST.<stream>
--- $JS.EVENT.ADVISORY.CONSUMER.LEADER_ELECTED.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.CONSUMER.QUORUM_LOST.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.API
