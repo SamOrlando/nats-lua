@@ -11,6 +11,7 @@ local uuid   = require('uuid')
 local unpack = _G.unpack or table.unpack
 local request_raw = nats.request.raw
 local response_read = nats.response.read
+local create_inbox = nats.create_inbox
 
 local stream_prototype = {
 	name = nil,
@@ -102,7 +103,8 @@ function con.create(stream, consumer_name, config)
 	
 	return consumer
 end
--- js:consumer
+-- jetstream:consumer(consumer_name, config)
+js.consumer = con.create
 
 function con.delete(consumer)
 	request_raw(consumer.client, 'PUB $JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name .. ' \r\n')
@@ -151,11 +153,11 @@ function con.nextmsg(consumer)
 	return data.content -- you may want to parse this depending on your message format
 end
 
-function js.consumer.ack(stream, consumer_name, msg_sequence, delivery_sequence, domain)
-	request_raw(stream.client, 'PUB $JS.ACK.' .. stream.name .. '.' .. consumer_name .. '.' .. msg_sequence .. '.' .. delivery_sequence .. '.' .. domain .. ' \r\n')
-	local data = response_read(stream.client)
+function con.ack(consumer, msg_sequence, delivery_sequence, domain)
+	request_raw(consumer.client, 'PUB $JS.ACK.' .. consumer.stream.name .. '.' .. consumer.name .. '.' .. msg_sequence .. '.' .. delivery_sequence .. '.' .. domain .. ' \r\n')
+	local data = response_read(consumer.client)
 	if data.action ~= 'OK' then
-		client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
+		con.client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
 	end
 end
 
@@ -163,11 +165,11 @@ function js.ack(stream, reply)
 	request_raw(stream.client, 'PUB ' .. reply .. ' \r\n')
 	local data = response_read(client)
 	if data.action ~= 'OK' then
-		client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
+		stream.client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
 	end
 end
 
-function js.streams()
+function cm.stream_list(client)
 	request_raw(client, 'PUB $JS.API.STREAM.LIST\r\n')
 	local data = response_read(client)
 	if data.action ~= 'INFO' then
@@ -176,96 +178,62 @@ function js.streams()
 	return cjson.decode(data.content)
 end
 
-function js.consumers(client, stream_name)
-	request_raw(client, 'PUB $JS.API.CONSUMER.LIST.' .. stream_name .. ' \r\n')
-	local data = response_read(client)
+function js.consumer_list(stream)
+	request_raw(stream.client, 'PUB $JS.API.CONSUMER.LIST.' .. stream.name .. ' \r\n')
+	local data = response_read(stream.client)
 	if data.action ~= 'INFO' then
-		client.error('failed to list consumers: ' .. (data.content or 'unknown error'))
+		stream.client.error('failed to list consumers: ' .. (data.content or 'unknown error'))
 	end
 	return cjson.decode(data.content)
 end
 
-function js.update(client, stream_name, configuration)
+function js.update(stream, configuration)
 	local configJson = cjson.encode(configuration)
-	request_raw(client, 'PUB $JS.API.STREAM.UPDATE.' .. stream_name .. ' \r\n' .. configJson .. '\r\n')
+	request_raw(stream.client, 'PUB $JS.API.STREAM.UPDATE.' .. stream.name .. ' \r\n' .. configJson .. '\r\n')
 	local data = response_read(client)
 	if data.action ~= 'INFO' then
-		client.error('failed to update stream: ' .. (data.content or 'unknown error'))
+		stream.client.error('failed to update stream: ' .. (data.content or 'unknown error'))
 	end
 	return cjson.decode(data.content)
 end
 
-function js.consumer.update(client, stream_name, consumer_name, configuration)
+function con.update(consumer, configuration)
 	local configJson = cjson.encode(configuration)
-	request_raw(client, 'PUB $JS.API.CONSUMER.UPDATE.' .. stream_name .. '.' .. consumer_name .. ' \r\n' .. configJson .. '\r\n')
-	local data = response_read(client)
+	request_raw(consumer.client, 'PUB $JS.API.CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name .. ' \r\n' .. configJson .. '\r\n')
+	local data = response_read(consumer.client)
 	if data.action ~= 'INFO' then
-		client.error('failed to update consumer: ' .. (data.content or 'unknown error'))
+		consumer.client.error('failed to update consumer: ' .. (data.content or 'unknown error'))
 	end
 	return cjson.decode(data.content)
 end
 
-function js.replay(client, stream_name, msg_sequence)
-	request_raw(client, 'PUB $JS.API.STREAM.MSG.GET.' .. stream_name .. ' \r\n' .. msg_sequence .. '\r\n')
-	local data = response_read(client)
+function js.replay(stream, msg_sequence)
+	request_raw(stream.client, 'PUB $JS.API.STREAM.MSG.GET.' .. stream.name .. ' \r\n' .. msg_sequence .. '\r\n')
+	local data = response_read(stream.client)
 	if data.action ~= 'MSG' then
-		client.error('failed to replay message: ' .. (data.content or 'unknown error'))
+		stream.client.error('failed to replay message: ' .. (data.content or 'unknown error'))
 	end
 	return data.content -- you may want to parse this depending on your message format
 end
 
-function js.remove(client, stream_name, msg_sequence)
-	request_raw(client, 'PUB $JS.API.STREAM.MSG.DELETE.' .. stream_name .. ' \r\n' .. msg_sequence .. '\r\n')
-	local data = response_read(client)
+function js.remove(stream, msg_sequence)
+	request_raw(stream.client, 'PUB $JS.API.STREAM.MSG.DELETE.' .. stream.name .. ' \r\n' .. msg_sequence .. '\r\n')
+	local data = response_read(stream.client)
 	if data.action ~= 'MSG' then
-		client.error('failed to delete stream message: ' .. (data.content or 'unknown error'))
+		stream.client.error('failed to delete stream message: ' .. (data.content or 'unknown error'))
 	end
 	return data.content -- you may want to parse this depending on your message format
 end
 
-function js.purge(client, stream_name)
-	request_raw(client, 'PUB $JS.API.STREAM.PURGE.' .. stream_name .. ' \r\n')
-	local data = response_read(client)
+function js.purge(stream)
+	request_raw(stream.client, 'PUB $JS.API.STREAM.PURGE.' .. stream.name .. ' \r\n')
+	local data = response_read(stream.client)
 	if data.action ~= 'OK' then
-		client.error('failed to purge stream: ' .. (data.content or 'unknown error'))
+		stream.client.error('failed to purge stream: ' .. (data.content or 'unknown error'))
 	end
 end
 
-function js.template.create(client, template_name, config)
-	request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.CREATE.' .. template_name .. ' \r\n' .. cjson.encode(config) .. '\r\n')
-	local data = response_read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to create stream template: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.template.delete(client, template_name)
-	request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.DELETE.' .. template_name .. ' \r\n')
-	local data = response_read(client)
-	if data.action ~= 'OK' then
-		client.error('failed to delete stream template: ' .. (data.content or 'unknown error'))
-	end
-end
-
-function js.template.info(client, template_name)
-	request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.INFO.' .. template_name .. ' \r\n')
-	local data = response_read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to get stream template info: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
-function js.templates(client)
-	request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.LIST \r\n')
-	local data = response_read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to list stream templates: ' .. (data.content or 'unknown error'))
-	end
-	return cjson.decode(data.content)
-end
-
-function js.snapshot.create(client, stream_name, config)
+function js.snapshot.create(stream, config)
 	local reply = create_inbox() -- create_inbox is a function that generates a unique subject name
 	local configJson = cjson.encode(config)
 	request_raw(client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream_name .. ' ' .. reply .. ' \r\n' .. configJson .. '\r\n')
@@ -298,6 +266,40 @@ function js.snapshot.read(client, delievery_subject)
 	command.unsubscribe(client, unique_id) -- unsubscribe from the delivery subject
 	return table.concat(snapshot) -- concatenate the chunks to form the complete snapshot
 end
+
+-- function js.template.create(client, template_name, config)
+	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.CREATE.' .. template_name .. ' \r\n' .. cjson.encode(config) .. '\r\n')
+	-- local data = response_read(client)
+	-- if data.action ~= 'OK' then
+		-- client.error('failed to create stream template: ' .. (data.content or 'unknown error'))
+	-- end
+-- end
+
+-- function js.template.delete(client, template_name)
+	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.DELETE.' .. template_name .. ' \r\n')
+	-- local data = response_read(client)
+	-- if data.action ~= 'OK' then
+		-- client.error('failed to delete stream template: ' .. (data.content or 'unknown error'))
+	-- end
+-- end
+
+-- function js.template.info(client, template_name)
+	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.INFO.' .. template_name .. ' \r\n')
+	-- local data = response_read(client)
+	-- if data.action ~= 'INFO' then
+		-- client.error('failed to get stream template info: ' .. (data.content or 'unknown error'))
+	-- end
+	-- return cjson.decode(data.content)
+-- end
+
+-- function js.templates(client)
+	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.LIST \r\n')
+	-- local data = response_read(client)
+	-- if data.action ~= 'INFO' then
+		-- client.error('failed to list stream templates: ' .. (data.content or 'unknown error'))
+	-- end
+	-- return cjson.decode(data.content)
+-- end
 
 -- $JS.EVENT.METRIC.CONSUMER_ACK.<stream>.<consumer>
 -- $JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>
