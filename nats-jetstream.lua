@@ -1,7 +1,6 @@
 -- ### NATS-LUA Table
 local nats = nats or require('nats')
-nats.js = require('nats-jetstream')
-local js = nats.js
+nats.jetstream = {}
 
 -- ### Library requirements ###
 
@@ -13,19 +12,48 @@ local unpack = _G.unpack or table.unpack
 local request_raw = nats.request.raw
 local response_read = nats.response.read
 
+local stream_prototype = {
+	name = nil,
+	client = nil,
+	subjects = {},
+}
+
+local stream_metatable = {
+	methods = {},
+}
+nats.jetstream.stream_metatable = stream_metatable
+
+local consumer_prototype = {}
+
+local consumer_metatable = {
+	methods = {},
+}
+nats.jetstream.consumer_metatable = consumer_metatable
+
+local cm = nats.client_metatable.methods
+local js = stream_metatable.methods
+local con = consumer_metatable.methods
+
 function js.create(client, stream_name, subjects)
 	request_raw(client, 'PUB $JS.API.STREAM.CREATE.' .. stream_name .. ' \r\n' .. cjson.encode({ name = stream_name, subjects = subjects }) .. '\r\n')
 	local data = response_read(client)
 	if data.action ~= 'OK' then
 		client.error('failed to create stream: ' .. (data.content or 'unknown error'))
 	end
-end
 
-function js.delete(client, stream_name)
-	request_raw(client, 'PUB $JS.API.STREAM.DELETE.' .. stream_name .. ' \r\n')
-	local data = response_read(client)
+	local stream = setmetatable({}, stream_metatable)
+	stream.name = stream_name
+	stream.client = client
+	stream.subjects = subjects
+	return stream
+end
+cm.jetstream = js.create
+
+function js.delete(stream)
+	request_raw(stream.client, 'PUB $JS.API.STREAM.DELETE.' .. stream.name .. ' \r\n')
+	local data = response_read(stream.client)
 	if data.action ~= 'OK' then
-		client.error('failed to delete stream: ' .. (data.content or 'unknown error'))
+		stream.client.error('failed to delete stream: ' .. (data.content or 'unknown error'))
 	end
 end
 
