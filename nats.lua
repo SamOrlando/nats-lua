@@ -21,7 +21,7 @@ nats.client_prototype = {
 	version	   = '0.0.4',
 	verbose	   = false,
 	pedantic	  = false,
-	trace		 = false,
+	trace		 = false,  -- not my tick
 	reconnect	 = true,
 	subscriptions = {},
 	information   = {},
@@ -33,6 +33,9 @@ local uuid   = require('uuid')
 
 -- ### Local properties / vars ###
 local unpack = _G.unpack or table.unpack
+local type = type
+local os_time, os_date = os.time, os.date
+local floor = math.floor
 local network, response, request = nats.network, nats.response, nats.request
 local client_metatable = nats.client_metatable
 
@@ -52,9 +55,15 @@ local function merge_defaults(parameters)
 	return parameters
 end
 
+local function get_time()
+	local currentTime = os_time()
+	local cpuTime = os_clock()
+	return currentTime + (cpuTime - floor(cpuTime))
+end
+
 local function create_client(socket)
-	local client = setmetatable({}, client_metatable))
-	for k, v in pairs(client_prototype) do client[k] = v end
+	local client = setmetatable({}, client_metatable)
+	for k,v in pairs(client_prototype) do rawset(client, k, v) end
 	
 	-- assign client error handler
 	client.error = nats.error
@@ -66,10 +75,6 @@ local function create_client(socket)
 		lread  = nil,
 		lwrite = nil,
 	}
-	-- -- assign client requests methods
-	-- client.requests = {
-		-- multibulk = request.raw,
-	-- }
 	uuid.seed()
 	return client
 end
@@ -77,80 +82,60 @@ end
 
 -- ### Network methods ###
 function network.write(client, buffer)
-	if client.trace then print('->> '..buffer:sub(1,-3)) end
+	--if client.trace then print('->> '..buffer:sub(1,-3)) end
 	local _, err = client.network.socket:send(buffer)
-	if not err then
-		client.network.lwrite = buffer
-	else
-		client.error(err)
-	end
+	if not err then client.network.lwrite = buffer
+	else client.error(err) end
 end
 local network_write = network.write
 
 function network.read(client, len)
 	if len == nil then len = '*l' end
 	local line, err = client.network.socket:receive(len)
-	if client.trace then print('<<- '..line) end
+	--if client.trace then print('<<- '..line) end
 	if not err then
 		client.network.lread = line
 		return line
-	else
-		client.error('connection error: ' .. err)
-	end
+	else client.error('connection error: ' .. err) end
 end
 local network_read = network.read
 
 -- ### Response methods ###
+response.methods = {
+	INFO = function(s) return {action=s[1],content=s[2]} end,
+	PING = function(s) return {action=s[1]} end,
+	PONG = function(s) return {action=s[1]} end,
+	MSG = function(s, client)
+		local data = {
+			action = s[1],
+			subject = s[2],
+			sid = s[3]
+		}
+		-- ask for line ending chars and remove them
+		if #s == 4 then
+			data.content = network_read(client, s[4]+2):sub(1, -3)
+		else
+			data.reply = s[4]
+			data.content = network_read(client, s[5]+2):sub(1, -3)
+		end
+		return data
+	end,
+}
+local response_methods = response.methods
+-- need to add +OK and -ERR to table
+
 function response.read(client)
 	local payload = network_read(client)
 	local slices  = {}
 	local data	= {}
 
-	for slice in payload:gmatch('[^%s]+') do
-		table.insert(slices, slice)
-	end
+	for slice in payload:gmatch('[^%s]+') do table.insert(slices, slice) end
 
-	-- PING
-	if slices[1] == 'PING' then
-		data.action = 'PING'
-
-	-- PONG
-	elseif slices[1] == 'PONG' then
-		data.action = 'PONG'
-
-	-- MSG
-	elseif slices[1] == 'MSG' then
-		data.action	= 'MSG'
-		data.subject   = slices[2]
-		data.unique_id = slices[3]
-		-- ask for line ending chars and remove them
-		if #slices == 4 then
-			data.content   = network_read(client,  slices[4]+2):sub(1, -3)
-		else
-			data.reply	 = slices[4]
-			data.content   = network_read(client,  slices[5]+2):sub(1, -3)
-		end
-
-	-- INFO
-	elseif slices[1] == 'INFO' then
-		data.action  = 'INFO'
-		data.content = slices[2]
-
-	-- INFO
-	elseif slices[1] == '+OK' then
-		data.action  = 'OK'
-
-	-- INFO
-	elseif slices[1] == '-ERR' then
-		data.action  = 'ERROR'
-		-- data.content = slices[2]
-
-   -- unknown type of reply
+	if slices[1] and response_methods[slices[1]] then
+		return response_methods[slices[1]](slices, client)
 	else
-		data = client.error('unknown response: ' .. payload)
+		return {action = "-ERR", content = payload}
 	end
-
-	return data
 end
 local response_read = response.read
 
@@ -159,14 +144,9 @@ local response_read = response.read
 -- Client request sender (RAW)
 function request.raw(client, buffer)
 	local bufferType = type(buffer)
-
-	if bufferType == 'table' then
-		network_write(client, table.concat(buffer))
-	elseif bufferType == 'string' then
-		network_write(client, buffer)
-	else
-		client.error('argument error: ' .. bufferType)
-	end
+	if bufferType == 'string' then network_write(client, buffer)
+	elseif bufferType == 'table' then network_write(client, table.concat(buffer))
+	else client.error('argument error: ' .. bufferType) end
 end
 local request_raw = request.raw
 
@@ -174,14 +154,13 @@ local request_raw = request.raw
 -- ### Socket connection methods ###
 local function connect_tcp(socket, parameters)
 	local host, port = parameters.host, tonumber(parameters.port)
-	if parameters.timeout then
-		socket:settimeout(parameters.timeout, 't')
-	end
+	if parameters.timeout then socket:settimeout(parameters.timeout, 't') end
 
 	local ok, err = socket:connect(host, port)
 	if not ok then
 		nats.error('could not connect to '..host..':'..port..' ['..err..']')
 	end
+
 	socket:setoption('tcp-nodelay', parameters.tcp_nodelay)
 	return socket
 end
@@ -195,10 +174,7 @@ local function connect_unix(socket, parameters)
 end
 
 local function create_connection(parameters)
-	if parameters.socket then
-		return parameters.socket
-	end
-
+	if parameters.socket then return parameters.socket end
 	local perform_connection, socket
 
 	if parameters.scheme == 'unix' then
@@ -220,7 +196,7 @@ function nats.error(message, level)
 	error(message, (level or 1) + 1)
 end
 
-function nats.client(...)
+function nats.connect(...)
 	local args, parameters = {...}, nil
 
 	if #args == 1 then parameters = args[1]
@@ -263,40 +239,35 @@ end
 function cm.ping(client)
 	request_raw(client, 'PING\r\n')
 
-	-- wait for the server pong
 	local data = response_read(client)
-	if data.action == 'PONG' then
-		return true
-	else
-		return false
-	end
-
+	if data.action == 'PONG' then return true end
+	return false
 end
 
 function cm.pong(client) request_raw(client, 'PONG\r\n') end
 
 function cm.request(client, subject, payload, callback)
 	local inbox = create_inbox()
-	local unique_id = client:subscribe(inbox, function(message, reply)
-		client:unsubscribe(unique_id)
+	local sid = client:subscribe(inbox, function(message, reply)
+		client:unsubscribe(sid)
 		callback(message, reply)
 	end)
 	client:publish(subject, payload, inbox)
-	return unique_id, inbox
+	return sid, inbox
 end
 
 function cm.subscribe(client, subject, callback, queue)
-	local unique_id = uuid()
-	if queue then request_raw(client, 'SUB '..subject..' '..queue..' '..unique_id..'\r\n')
-	else request_raw(client, 'SUB '..subject..' '..unique_id..'\r\n') end
-	client.subscriptions[unique_id] = callback
+	local sid = uuid()
+	if queue then request_raw(client, 'SUB '..subject..' '..queue..' '..sid..'\r\n')
+	else request_raw(client, 'SUB '..subject..' '..sid..'\r\n') end
+	client.subscriptions[sid] = callback
 
-	return unique_id
+	return sid
 end
 
-function cm.unsubscribe(client, unique_id)
-	request_raw(client, 'UNSUB '..unique_id..'\r\n')
-	client.subscriptions[unique_id] = nil
+function cm.unsubscribe(client, sid)
+	request_raw(client, 'UNSUB '..sid..'\r\n')
+	client.subscriptions[sid] = nil
 end
 
 function cm.publish(client, subject, payload, reply)
@@ -307,21 +278,43 @@ function cm.publish(client, subject, payload, reply)
 	})
 end
 
-function cm.wait(client, quantity)
-	quantity = quantity or 0
-
+function cm.wait(client, opts)
+	local maxcount,timeout,sid
+	if opts then
+		local opts_type(opts)
+		if opts_type == "string" then sid = opts
+		elseif opts_type == "number" and opts > 0 then maxcount = opts
+		elseif opts_type == "table" then
+			sid = opts.sid
+			maxcount = opts.count
+			timeout = opts.timeout
+		end
+	end
+	
 	local count = 0
+	local start_time = get_time()
+	local data = nil 
 	repeat
-		local data = response_read(client)
-
-		if data.action == 'PING' then
-			cm.pong(client)
-
+		data = response_read(client)
+		if data.action == 'PING' then cm.pong(client)
 		elseif data.action == 'MSG' then
 			count = count + 1
-			client.subscriptions[data.unique_id](data.content, data.reply, data.subject, data.unique_id)
+			if sid and data.sid and sid == data.sid then return data.content, data.reply, data.subject, data.sid  end
+			client.subscriptions[data.sid](data.content, data.reply, data.subject, data.sid)
 		end
-	until quantity > 0 and count >= quantity
+		if timeout and get_time() > start_time + timeout then return
+		elseif maxcount and count > maxcount then return end
+	until false
+	return
+end
+
+function cm.get(client, subject, payload, timeout)
+	local inbox = create_inbox()
+	local data = nil
+	local sid = client:subscribe(inbox, function(message, reply)
+		client:unsubscribe(sid)
+	end)
+	return cm.wait(client, {sid=sid,timeout=3000,maxcount=30})
 end
 
 function cm.request_raw(client, buffer)
