@@ -3,9 +3,9 @@ local nats = {
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
 	methods = {}, -- method metatable for nats core client object
-	network = {},
-	request = {},
-	response = {},
+	network = {}, -- network functions
+	request = {}, -- request handling (to server)
+	response = {}, -- response handing (from server)
 }
 
 nats.client_metatable = {
@@ -23,8 +23,8 @@ nats.client_prototype = {
 	pedantic	  = false,
 	trace		 = false,  -- not my tick
 	reconnect	 = true,
-	subscriptions = {},
-	information   = {},
+	subscriptions = {}, -- k:sid v:func
+	information   = {}, -- server information from INFO in connect
 }
 
 -- ### Library requirements ###
@@ -120,9 +120,9 @@ response.methods = {
 		end
 		return data
 	end,
+	["+OK"] = function(s) return {action=s[1]} end,
 }
 local response_methods = response.methods
--- need to add +OK and -ERR to table
 
 function response.read(client)
 	local payload = network_read(client)
@@ -238,7 +238,6 @@ end
 
 function cm.ping(client)
 	request_raw(client, 'PING\r\n')
-
 	local data = response_read(client)
 	if data.action == 'PONG' then return true end
 	return false
@@ -256,12 +255,22 @@ function cm.request(client, subject, payload, callback)
 	return sid, inbox
 end
 
+function cm.get(client, subject, payload, timeout)
+	local inbox = create_inbox()
+	local data = nil
+	local sid = cm.subscribe(client, inbox, function(message, reply)
+		cm.unsubscribe(client, sid)
+	end)
+	cm.publish(client, subject, payload, inbox)
+	return response_read(client)
+end
+
 function cm.subscribe(client, subject, callback, queue)
 	local sid = uuid()
-	if queue then request_raw(client, 'SUB '..subject..' '..queue..' '..sid..'\r\n')
-	else request_raw(client, 'SUB '..subject..' '..sid..'\r\n') end
+	-- if queue then request_raw(client, 'SUB '..subject..' '..queue..' '..sid..'\r\n')
+	-- else request_raw(client, 'SUB '..subject..' '..sid..'\r\n') end
+	request_raw(client, 'SUB ' .. subject .. (queue and ' ' .. queue or '') .. ' ' .. sid .. '\r\n')
 	client.subscriptions[sid] = callback
-
 	return sid
 end
 
@@ -279,9 +288,9 @@ function cm.publish(client, subject, payload, reply)
 end
 
 function cm.wait(client, opts)
-	local maxcount,timeout,sid
+	local maxcount,timeout,sid,data
 	if opts then
-		local opts_type(opts)
+		local opts_type = type(opts)
 		if opts_type == "string" then sid = opts
 		elseif opts_type == "number" and opts > 0 then maxcount = opts
 		elseif opts_type == "table" then
@@ -290,31 +299,35 @@ function cm.wait(client, opts)
 			timeout = opts.timeout
 		end
 	end
-	
+		
 	local count = 0
-	local start_time = get_time()
-	local data = nil 
-	repeat
+	local end_time = timeout and (get_time() + timeout)
+	
+	while true do
 		data = response_read(client)
-		if data.action == 'PING' then cm.pong(client)
-		elseif data.action == 'MSG' then
+		if data.action == 'MSG' then
 			count = count + 1
-			if sid and data.sid and sid == data.sid then return data.content, data.reply, data.subject, data.sid  end
+			if sid and data.sid and sid == data.sid then return data end
 			client.subscriptions[data.sid](data.content, data.reply, data.subject, data.sid)
+		elseif data.action == 'PING' then cm.pong(client)
+		elseif data.action == 'INFO' then
+			-- client.information = cjson.decode(data.content) -- notsure if this will overwrite, so lets be safe...
+			for k,v in pairs(cjson.decode(data.content) or {}) do client.information[k] = v end
 		end
-		if timeout and get_time() > start_time + timeout then return
-		elseif maxcount and count > maxcount then return end
-	until false
+		if (timeout and get_time() > end_time) or (maxcount and count > maxcount) then return end
+	end
 	return
 end
 
 function cm.get(client, subject, payload, timeout)
 	local inbox = create_inbox()
 	local data = nil
-	local sid = client:subscribe(inbox, function(message, reply)
-		client:unsubscribe(sid)
+	local sid = cm.subscribe(client, inbox, function(message, reply)
+		cm.unsubscribe(client, sid)
 	end)
-	return cm.wait(client, {sid=sid,timeout=3000,maxcount=30})
+	cm.publish(client, subject, payload, inbox)
+	-- return response_read(client)
+	return cm.wait(client, sid)
 end
 
 function cm.request_raw(client, buffer)
