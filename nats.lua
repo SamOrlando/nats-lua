@@ -37,7 +37,7 @@ local type = type
 local os_time, os_date = os.time, os.date
 local floor = math.floor
 local network, response, request = nats.network, nats.response, nats.request
-local client_metatable = nats.client_metatable
+local client_prototype, client_metatable = nats.client_prototype, nats.client_metatable
 
 local defaults = {
 	host		= '127.0.0.1',
@@ -214,6 +214,7 @@ function nats.create_inbox() return '_INBOX.' .. uuid() end
 local create_inbox = nats.create_inbox -- vroom
 
 -- ### NATS Client Methods ###
+local cm = nats.client_metatable.methods
 function cm.connect(client)
 	local config = {
 		lang	 = client.lang,

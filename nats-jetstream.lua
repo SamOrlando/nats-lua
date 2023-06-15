@@ -254,6 +254,7 @@ function js.purge(stream)
 	return true
 end
 
+js.snapshot = {}
 function js.snapshot.create(stream, config)
 	local delievery_subject = create_inbox() -- create_inbox is a function that generates a unique subject name
 	local configJson = cjson.encode(config)
