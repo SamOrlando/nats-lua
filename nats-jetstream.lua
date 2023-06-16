@@ -7,11 +7,13 @@ nats.jetstream = {}
 local cjson  = require('cjson')
 local uuid   = require('uuid')
 
--- ### Local properties ###
+-- ### Local properties ### speed and neet laziness ftw
 local unpack = _G.unpack or table.unpack
 local request_raw = nats.request.raw
 local response_read = nats.response.read
 local create_inbox = nats.create_inbox
+local encode = cjson.encode
+local decode = cjson.decode
 
 local stream_prototype = {
 	name = nil,
@@ -22,6 +24,8 @@ local stream_prototype = {
 
 local stream_metatable = {
 	methods = {},
+	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
+	__call = function(self, ...) return	end,
 }
 nats.jetstream.stream_metatable = stream_metatable
 
@@ -34,6 +38,8 @@ local consumer_prototype = {
 
 local consumer_metatable = {
 	methods = {},
+	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
+	__call = function(self, ...) return	end,
 }
 nats.jetstream.consumer_metatable = consumer_metatable
 
@@ -48,10 +54,8 @@ function js.create(client, stream_name, subjects)
 	if subjects then
 		if type(subject) ~= "table" then subjects = {tostring(subjects)} end
 	end
-	
-	-- request creation and 
-	request_raw(client, 'PUB $JS.API.STREAM.CREATE.' .. stream_name .. ' \r\n' .. cjson.encode({ name = stream_name, subjects = subjects }) .. '\r\n')
-	local data = response_read(client)
+
+	local data = client:get('$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects }))
 	if data.action == '-ERR' then
 		client.error('failed to create stream: ' .. (data.content or 'unknown error'))
 		return
@@ -73,8 +77,7 @@ end
 cm.jetstream = js.create
 
 function js.delete(stream) -- we will need two of them for cm and js
-	request_raw(stream.client, 'PUB $JS.API.STREAM.DELETE.' .. stream.name .. ' \r\n')
-	local data = response_read(stream.client)
+	local data = stream.client:get('$JS.API.STREAM.DELETE.' .. stream.name)
 	if data.action == '-ERR' then
 		stream.client.error('failed to delete stream: ' .. (data.content or 'unknown error'))
 		return false
@@ -86,7 +89,7 @@ function js.delete(stream) -- we will need two of them for cm and js
 end
 
 function con.create(stream, consumer_name, config)
-	request_raw(stream.client, 'PUB $JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name .. ' \r\n' .. cjson.encode(config) .. '\r\n')
+	request_raw(stream.client, 'PUB $JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name .. ' \r\n' .. encode(config) .. '\r\n')
 	local data = response_read(stream.client)
 	if data.action == '-ERR' then
 		client.error('failed to create consumer: ' .. (data.content or 'unknown error'))
@@ -139,7 +142,7 @@ function js.info(stream)
 		stream.client.error('failed to get stream api info: ' .. (data.content or 'unknown error'))
 		return
 	end
-	return cjson.decode(data.content)
+	return decode(data.content)
 end
 
 function con.info(consumer)
@@ -149,7 +152,7 @@ function con.info(consumer)
 		consumer.client.error('failed to get consumer info: ' .. (data.content or 'unknown error'))
 		return
 	end
-	return cjson.decode(data.content)
+	return decode(data.content)
 end
 
 function con.nextmsg(consumer)
@@ -183,13 +186,12 @@ function js.ack(stream, reply)
 end
 
 function cm.stream_list(client)
-	request_raw(client, 'PUB $JS.API.STREAM.LIST\r\n')
-	local data = response_read(client)
-	if data.action ~= 'INFO' then
-		client.error('failed to list streams: ' .. (data.content or 'unknown error'))
-		return
+	local data = client:get("$JS.API.STREAM.LIST")
+	if data.action == '-ERR' then
+		stream.client.error('failed to get stream list: ' .. (data.content or 'unknown error'))
+		return false
 	end
-	return cjson.decode(data.content)
+	return data.content
 end
 
 function js.consumer_list(stream)
@@ -199,29 +201,29 @@ function js.consumer_list(stream)
 		stream.client.error('failed to list consumers: ' .. (data.content or 'unknown error'))
 		return
 	end
-	return cjson.decode(data.content)
+	return decode(data.content)
 end
 
 function js.update(stream, configuration)
-	local configJson = cjson.encode(configuration)
+	local configJson = encode(configuration)
 	request_raw(stream.client, 'PUB $JS.API.STREAM.UPDATE.' .. stream.name .. ' \r\n' .. configJson .. '\r\n')
 	local data = response_read(client)
 	if data.action ~= 'INFO' then
 		stream.client.error('failed to update stream: ' .. (data.content or 'unknown error'))
 		return
 	end
-	return cjson.decode(data.content)
+	return decode(data.content)
 end
 
 function con.update(consumer, configuration)
-	local configJson = cjson.encode(configuration)
+	local configJson = encode(configuration)
 	request_raw(consumer.client, 'PUB $JS.API.CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name .. ' \r\n' .. configJson .. '\r\n')
 	local data = response_read(consumer.client)
 	if data.action ~= 'INFO' then
 		consumer.client.error('failed to update consumer: ' .. (data.content or 'unknown error'))
 		return
 	end
-	return cjson.decode(data.content)
+	return decode(data.content)
 end
 
 function js.replay(stream, msg_sequence)
@@ -257,7 +259,7 @@ end
 js.snapshot = {}
 function js.snapshot.create(stream, config)
 	local delievery_subject = create_inbox() -- create_inbox is a function that generates a unique subject name
-	local configJson = cjson.encode(config)
+	local configJson = encode(config)
 	request_raw(stream.client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream.name .. ' ' .. delievery_subject .. ' \r\n' .. configJson .. '\r\n')
 	local data = response_read(stream.client)
 	if data.action == '-ERR' then
@@ -294,7 +296,7 @@ function js.snapshot.read(stream, delievery_subject)
 end
 
 -- function js.template.create(client, template_name, config)
-	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.CREATE.' .. template_name .. ' \r\n' .. cjson.encode(config) .. '\r\n')
+	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.CREATE.' .. template_name .. ' \r\n' .. encode(config) .. '\r\n')
 	-- local data = response_read(client)
 	-- if data.action == '-ERR' then
 		-- client.error('failed to create stream template: ' .. (data.content or 'unknown error'))
@@ -315,7 +317,7 @@ end
 	-- if data.action ~= 'INFO' then
 		-- client.error('failed to get stream template info: ' .. (data.content or 'unknown error'))
 	-- end
-	-- return cjson.decode(data.content)
+	-- return decode(data.content)
 -- end
 
 -- function js.templates(client)
@@ -324,7 +326,7 @@ end
 	-- if data.action ~= 'INFO' then
 		-- client.error('failed to list stream templates: ' .. (data.content or 'unknown error'))
 	-- end
-	-- return cjson.decode(data.content)
+	-- return decode(data.content)
 -- end
 
 -- $JS.EVENT.METRIC.CONSUMER_ACK.<stream>.<consumer>

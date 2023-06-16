@@ -34,6 +34,7 @@ local uuid   = require('uuid')
 -- ### Local properties / vars ###
 local unpack = _G.unpack or table.unpack
 local type = type
+local encode, decode = cjson.encode, cjson.decode
 local os_time, os_date = os.time, os.date
 local floor = math.floor
 local network, response, request = nats.network, nats.response, nats.request
@@ -83,6 +84,7 @@ end
 -- ### Network methods ###
 function network.write(client, buffer)
 	--if client.trace then print('->> '..buffer:sub(1,-3)) end
+	print('->> '..buffer:sub(1,-3))
 	local _, err = client.network.socket:send(buffer)
 	if not err then client.network.lwrite = buffer
 	else client.error(err) end
@@ -92,6 +94,7 @@ local network_write = network.write
 function network.read(client, len)
 	if len == nil then len = '*l' end
 	local line, err = client.network.socket:receive(len)
+	print('<<- '..line)
 	--if client.trace then print('<<- '..line) end
 	if not err then
 		client.network.lread = line
@@ -228,12 +231,12 @@ function cm.connect(client)
 		config.pass = client.pass
 	end
 
-	request_raw(client, 'CONNECT '..cjson.encode(config)..'\r\n')
+	request_raw(client, 'CONNECT '..encode(config)..'\r\n')
 
 	-- gather the server information
 	local data = response_read(client)
 	if data.action == 'INFO' then
-		client.information = cjson.decode(data.content)
+		client.information = decode(data.content)
 	end
 end
 
@@ -256,14 +259,12 @@ function cm.request(client, subject, payload, callback)
 	return sid, inbox
 end
 
-function cm.get(client, subject, payload, timeout)
+function cm.get(client, subject, payload)
 	local inbox = create_inbox()
-	local data = nil
-	local sid = cm.subscribe(client, inbox, function(message, reply)
-		cm.unsubscribe(client, sid)
-	end)
+	local sid = cm.subscribe(client, inbox, function(message, reply) cm.unsubscribe(client, sid) end)
 	cm.publish(client, subject, payload, inbox)
 	return response_read(client)
+	--return cm.wait(client, sid)
 end
 
 function cm.subscribe(client, subject, callback, queue)
@@ -281,11 +282,12 @@ function cm.unsubscribe(client, sid)
 end
 
 function cm.publish(client, subject, payload, reply)
+	payload = payload or ""
 	reply = reply and ' ' .. reply or ''
 	request_raw(client, {
 		'PUB '..subject..reply..' '..#payload..'\r\n',
 		payload..'\r\n',
-	})
+		})
 end
 
 function cm.wait(client, opts)
@@ -312,23 +314,12 @@ function cm.wait(client, opts)
 			client.subscriptions[data.sid](data.content, data.reply, data.subject, data.sid)
 		elseif data.action == 'PING' then cm.pong(client)
 		elseif data.action == 'INFO' then
-			-- client.information = cjson.decode(data.content) -- notsure if this will overwrite, so lets be safe...
-			for k,v in pairs(cjson.decode(data.content) or {}) do client.information[k] = v end
+			-- client.information = decode(data.content) -- notsure if this will overwrite, so lets be safe...
+			for k,v in pairs(decode(data.content) or {}) do client.information[k] = v end
 		end
 		if (timeout and get_time() > end_time) or (maxcount and count > maxcount) then return end
 	end
 	return
-end
-
-function cm.get(client, subject, payload, timeout)
-	local inbox = create_inbox()
-	local data = nil
-	local sid = cm.subscribe(client, inbox, function(message, reply)
-		cm.unsubscribe(client, sid)
-	end)
-	cm.publish(client, subject, payload, inbox)
-	-- return response_read(client)
-	return cm.wait(client, sid)
 end
 
 function cm.request_raw(client, buffer)
