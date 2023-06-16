@@ -303,7 +303,7 @@ function cm.wait(client, maxcount)
 			-- client.information = decode(data.content) -- notsure if this will overwrite, so lets be safe...
 			for k,v in pairs(decode(data.content) or {}) do client.information[k] = v end
 		end
-		if (maxcount and count > maxcount) then return end
+		if maxcount and count > maxcount then return end
 	end
 	return
 end
