@@ -15,13 +15,6 @@ local create_inbox = nats.create_inbox
 local encode = cjson.encode
 local decode = cjson.decode
 
-local stream_prototype = {
-	name = nil,
-	client = nil,
-	subjects = {},
-	consumers = {},
-}
-
 local stream_metatable = {
 	methods = {},
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
@@ -48,7 +41,8 @@ local cm = nats.client_metatable.methods -- client
 local js = stream_metatable.methods -- stream
 local con = consumer_metatable.methods -- consumer
 
-function js.create(client, stream_name, subjects)
+-- add configuration option or shared subjects table option?
+function cm.stream(client, stream_name, subjects)
 	-- test and adjust subjects so string or table can be passed.
 	-- Only leaky part is 'true' being converted but meh.
 	if subjects then
@@ -58,14 +52,15 @@ function js.create(client, stream_name, subjects)
 	local data = client:get('$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects }))
 	if data.action == '-ERR' then
 		client.error('failed to create stream: ' .. (data.content or 'unknown error'))
-		return
-	end
+	-- check if jetstream returns an error, if so return false.
+	elseif (data.content and data.content.error) then return false, data.content end
 
 	-- create and set stream object
 	local stream = setmetatable({}, stream_metatable)
 	stream.name = stream_name
 	stream.client = client
 	stream.subjects = subjects
+	stream.consumers = {}
 	
 	-- insert stream info into client table
 	client.streams = client.streams or {}
@@ -73,28 +68,25 @@ function js.create(client, stream_name, subjects)
 	
 	return stream
 end
--- client_method:jetstream('woot', {"woot.*","meep.tysx"})
-cm.jetstream = js.create
 
 function js.delete(stream) -- we will need two of them for cm and js
+	-- make request
 	local data = stream.client:get('$JS.API.STREAM.DELETE.' .. stream.name)
 	if data.action == '-ERR' then
 		stream.client.error('failed to delete stream: ' .. (data.content or 'unknown error'))
-		return false
-	end
+	elseif (data.content and data.content.error) then return false, data.content end
+	
 	-- delete client objects stream listing and the object
 	stream.client.streams[stream.name] = nil
 	stream = nil
 	return true
 end
 
-function con.create(stream, consumer_name, config)
-	request_raw(stream.client, 'PUB $JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name .. ' \r\n' .. encode(config) .. '\r\n')
-	local data = response_read(stream.client)
+function js.consumer(stream, consumer_name, config)
+	local data = stream.client:get('$JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name}))
 	if data.action == '-ERR' then
 		client.error('failed to create consumer: ' .. (data.content or 'unknown error'))
-		return
-	end
+	elseif (data.content and data.content.error) then return false, data.content end
 
 	-- create and set consumer object
 	local consumer = setmetatable({}, consumer_metatable)
@@ -108,16 +100,12 @@ function con.create(stream, consumer_name, config)
 	
 	return consumer
 end
--- jetstream:consumer(consumer_name, config)
-js.consumer = con.create
 
 function con.delete(consumer)
-	request_raw(consumer.client, 'PUB $JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name .. ' \r\n')
-	local data = response_read(consumer.client)
+	local data = consumer.client:get('$JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name)
 	if data.action == '-ERR' then
 		consumer.client.error('failed to delete consumer: ' .. (data.content or 'unknown error'))
-		return false
-	end
+	elseif (data.content and data.content.error) then return false, data.content end
 	
 	-- delete references
 	consumer.stream[consumer.name] = nil
@@ -125,20 +113,14 @@ function con.delete(consumer)
 	return true
 end
 
-function js.publish(stream, payload)
-	request_raw(stream.client, 'PUB ' .. stream.name .. ' \r\n' .. payload .. '\r\n')
-	local data = response_read(stream.client)
-	if data.action == '-ERR' then
-		stream.client.error('failed to publish message: ' .. (data.content or 'unknown error'))
-		return false
-	end
+function js.publish(stream, subject, payload)
+	stream.client:publish(subject, payload)
 	return true
 end
 
 function js.info(stream)
-	request_raw(stream.client, 'PUB $JS.API.STREAM.INFO.' .. stream.name .. ' \r\n')
-	local data = response_read(stream.client)
-	if data.action ~= 'INFO' then
+	local data = stream.client:get('$JS.API.STREAM.INFO.' .. stream.name)
+	if data.action ~= '-ERR' then
 		stream.client.error('failed to get stream api info: ' .. (data.content or 'unknown error'))
 		return
 	end
@@ -146,12 +128,11 @@ function js.info(stream)
 end
 
 function con.info(consumer)
-	request_raw(consumer.client, 'PUB $JS.API.CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name .. ' \r\n')
-	local data = response_read(consumer.client)
-	if data.action ~= 'INFO' then
+	local data = consumer.client:get('$JS.API.CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name)
+	if data.action ~= '-ERR' then
 		consumer.client.error('failed to get consumer info: ' .. (data.content or 'unknown error'))
-		return
-	end
+	elseif (data.content and data.content.error) then return false, data.content end
+	
 	return decode(data.content)
 end
 

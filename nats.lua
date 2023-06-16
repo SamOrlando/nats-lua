@@ -269,8 +269,6 @@ end
 
 function cm.subscribe(client, subject, callback, queue)
 	local sid = uuid()
-	-- if queue then request_raw(client, 'SUB '..subject..' '..queue..' '..sid..'\r\n')
-	-- else request_raw(client, 'SUB '..subject..' '..sid..'\r\n') end
 	request_raw(client, 'SUB ' .. subject .. (queue and ' ' .. queue or '') .. ' ' .. sid .. '\r\n')
 	client.subscriptions[sid] = callback
 	return sid
@@ -290,34 +288,20 @@ function cm.publish(client, subject, payload, reply)
 		})
 end
 
-function cm.wait(client, opts)
-	local maxcount,timeout,sid,data
-	if opts then
-		local opts_type = type(opts)
-		if opts_type == "string" then sid = opts
-		elseif opts_type == "number" and opts > 0 then maxcount = opts
-		elseif opts_type == "table" then
-			sid = opts.sid
-			maxcount = opts.count
-			timeout = opts.timeout
-		end
-	end
-		
+function cm.wait(client, maxcount)
 	local count = 0
-	local end_time = timeout and (get_time() + timeout)
 	
 	while true do
 		data = response_read(client)
 		if data.action == 'MSG' then
 			count = count + 1
-			if sid and data.sid and sid == data.sid then return data end
 			client.subscriptions[data.sid](data.content, data.reply, data.subject, data.sid)
 		elseif data.action == 'PING' then cm.pong(client)
 		elseif data.action == 'INFO' then
 			-- client.information = decode(data.content) -- notsure if this will overwrite, so lets be safe...
 			for k,v in pairs(decode(data.content) or {}) do client.information[k] = v end
 		end
-		if (timeout and get_time() > end_time) or (maxcount and count > maxcount) then return end
+		if (maxcount and count > maxcount) then return end
 	end
 	return
 end
