@@ -22,13 +22,6 @@ local stream_metatable = {
 }
 nats.jetstream.stream_metatable = stream_metatable
 
-local consumer_prototype = {
-	name = nil,
-	client = nil,
-	stream = {},
-	config = nil,
-}
-
 local consumer_metatable = {
 	methods = {},
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
@@ -49,11 +42,8 @@ function cm.stream(client, stream_name, subjects)
 		if type(subject) ~= "table" then subjects = {tostring(subjects)} end
 	end
 
-	local data = client:get('$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects }))
-	if data.action == '-ERR' then
-		client.error('failed to create stream: ' .. (data.content or 'unknown error'))
-	-- check if jetstream returns an error, if so return false.
-	elseif (data.content and data.content.error) then return false, data.content end
+	local data = decode(client:get('$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects })))
+	if data.error then return false, data end
 
 	-- create and set stream object
 	local stream = setmetatable({}, stream_metatable)
@@ -66,51 +56,44 @@ function cm.stream(client, stream_name, subjects)
 	client.streams = client.streams or {}
 	client.streams[stream_name] = subjects
 	
-	return stream
+	return stream, data
 end
 
 function js.delete(stream) -- we will need two of them for cm and js
 	-- make request
-	local data = stream.client:get('$JS.API.STREAM.DELETE.' .. stream.name)
-	if data.action == '-ERR' then
-		stream.client.error('failed to delete stream: ' .. (data.content or 'unknown error'))
-	elseif (data.content and data.content.error) then return false, data.content end
+	local data = decode(stream.client:get('$JS.API.STREAM.DELETE.' .. stream.name))
+	if data.error then return false, data end
 	
 	-- delete client objects stream listing and the object
 	stream.client.streams[stream.name] = nil
 	stream = nil
-	return true
+	return true, data
 end
 
 function js.consumer(stream, consumer_name, config)
-	local data = stream.client:get('$JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name}))
-	if data.action == '-ERR' then
-		client.error('failed to create consumer: ' .. (data.content or 'unknown error'))
-	elseif (data.content and data.content.error) then return false, data.content end
+	local data = decode(stream.client:get('$JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name})))
+	if data.error then return false, data end
 
 	-- create and set consumer object
 	local consumer = setmetatable({}, consumer_metatable)
 	consumer.name = consumer_name
-	consumer.client = client
+	consumer.client = stream.client
 	consumer.stream = stream
 	consumer.config = config
 	
 	-- insert consumer info into stream table
 	stream.consumers[consumer_name] = config
 	
-	return consumer
+	return consumer, data
 end
 
 function con.delete(consumer)
-	local data = consumer.client:get('$JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name)
-	if data.action == '-ERR' then
-		consumer.client.error('failed to delete consumer: ' .. (data.content or 'unknown error'))
-	elseif (data.content and data.content.error) then return false, data.content end
-	
+	local data = decode(consumer.client:get('$JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name))
+	if data.error then return false, data end
 	-- delete references
 	consumer.stream[consumer.name] = nil
 	consumer = nil
-	return true
+	return true, data
 end
 
 function js.publish(stream, subject, payload)
@@ -119,129 +102,72 @@ function js.publish(stream, subject, payload)
 end
 
 function js.info(stream)
-	local data = stream.client:get('$JS.API.STREAM.INFO.' .. stream.name)
-	if data.action ~= '-ERR' then
-		stream.client.error('failed to get stream api info: ' .. (data.content or 'unknown error'))
-		return
-	end
-	return decode(data.content)
+	local data = decode(stream.client:get('$JS.API.STREAM.INFO.' .. stream.name))
+	if data.error then return false, data end
+	return data
 end
 
 function con.info(consumer)
-	local data = consumer.client:get('$JS.API.CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name)
-	if data.action ~= '-ERR' then
-		consumer.client.error('failed to get consumer info: ' .. (data.content or 'unknown error'))
-	elseif (data.content and data.content.error) then return false, data.content end
-	
-	return decode(data.content)
+	local data = decode(consumer.client:get('$JS.API.CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name))
+	if data.error then return false, data end
+	return data
 end
 
 function con.nextmsg(consumer)
-	request_raw(consumer.client, 'PUB $JS.API.CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name .. ' \r\n')
-	local data = response_read(consumer.client)
-	if data.action ~= 'MSG' then
-		consumer.client.error('failed to get next message: ' .. (data.content or 'unknown error'))
-		return
-	end
-	return data.content -- you may want to parse this depending on your message format
-end
-
-function con.ack(consumer, msg_sequence, delivery_sequence, domain)
-	request_raw(consumer.client, 'PUB $JS.ACK.' .. consumer.stream.name .. '.' .. consumer.name .. '.' .. msg_sequence .. '.' .. delivery_sequence .. '.' .. domain .. ' \r\n')
-	local data = response_read(consumer.client)
-	if data.action == '-ERR' then
-		con.client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
-		return false
-	end
-	return true
-end
-
-function js.ack(stream, reply)
-	request_raw(stream.client, 'PUB ' .. reply .. ' \r\n')
-	local data = response_read(client)
-	if data.action == '-ERR' then
-		stream.client.error('failed to acknowledge message: ' .. (data.content or 'unknown error'))
-		return false
-	end
-	return true
+	local data = decode(consumer.client:get('$JS.API.CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name))
+	if data.error then return false, data end
+	return data
 end
 
 function cm.stream_list(client)
-	local data = client:get("$JS.API.STREAM.LIST")
-	if data.action == '-ERR' then
-		stream.client.error('failed to get stream list: ' .. (data.content or 'unknown error'))
-		return false
-	end
-	return data.content
+	local data = decode(client:get("$JS.API.STREAM.LIST"))
+	if data.error then return false, data end
+	return data
 end
 
 function js.consumer_list(stream)
-	request_raw(stream.client, 'PUB $JS.API.CONSUMER.LIST.' .. stream.name .. ' \r\n')
-	local data = response_read(stream.client)
-	if data.action ~= 'INFO' then
-		stream.client.error('failed to list consumers: ' .. (data.content or 'unknown error'))
-		return
-	end
-	return decode(data.content)
+	local data = decode(stream.client:get('$JS.API.CONSUMER.LIST.' .. stream.name))
+	if data.error then return false, data end
+	return data
 end
 
 function js.update(stream, configuration)
 	local configJson = encode(configuration)
-	request_raw(stream.client, 'PUB $JS.API.STREAM.UPDATE.' .. stream.name .. ' \r\n' .. configJson .. '\r\n')
-	local data = response_read(client)
-	if data.action ~= 'INFO' then
-		stream.client.error('failed to update stream: ' .. (data.content or 'unknown error'))
-		return
-	end
-	return decode(data.content)
+	local data = decode(stream.client:get('$JS.API.STREAM.UPDATE.' .. stream.name, configJson))
+	if data.error then return false, data end
+	return true, data
 end
 
 function con.update(consumer, configuration)
 	local configJson = encode(configuration)
-	request_raw(consumer.client, 'PUB $JS.API.CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name .. ' \r\n' .. configJson .. '\r\n')
-	local data = response_read(consumer.client)
-	if data.action ~= 'INFO' then
-		consumer.client.error('failed to update consumer: ' .. (data.content or 'unknown error'))
-		return
-	end
-	return decode(data.content)
+	local data = decode(consumer.client:get('$JS.API.CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name, configJson))
+	if data.error then return false, data end
+	return true, data
 end
 
 function js.replay(stream, msg_sequence)
-	request_raw(stream.client, 'PUB $JS.API.STREAM.MSG.GET.' .. stream.name .. ' \r\n' .. msg_sequence .. '\r\n')
-	local data = response_read(stream.client)
-	if data.action ~= 'MSG' then
-		stream.client.error('failed to replay message: ' .. (data.content or 'unknown error'))
-		return
-	end
-	return data.content -- you may want to parse this depending on your message format
+	local data = decode(stream.client:get('$JS.API.STREAM.MSG.GET.' .. stream.name, msg_sequence))
+	if data.error then return false, data end
+	return data
 end
 
 function js.remove(stream, msg_sequence)
-	request_raw(stream.client, 'PUB $JS.API.STREAM.MSG.DELETE.' .. stream.name .. ' \r\n' .. msg_sequence .. '\r\n')
-	local data = response_read(stream.client)
-	if data.action ~= 'MSG' then
-		stream.client.error('failed to delete stream message: ' .. (data.content or 'unknown error'))
-		return
-	end
-	return data.content -- you may want to parse this depending on your message format
+	local data = decode(stream.client:get('$JS.API.STREAM.MSG.DELETE.' .. stream.name, msg_sequence))
+	if data.error then return false, data end
+	return true, data
 end
 
 function js.purge(stream)
-	request_raw(stream.client, 'PUB $JS.API.STREAM.PURGE.' .. stream.name .. ' \r\n')
-	local data = response_read(stream.client)
-	if data.action == '-ERR' then
-		stream.client.error('failed to purge stream: ' .. (data.content or 'unknown error'))
-		return false
-	end
-	return true
+	local data = decode(stream.client:get('$JS.API.STREAM.PURGE.' .. stream.name))
+	if data.error then return false, data end
+	return true, data
 end
 
 js.snapshot = {}
 function js.snapshot.create(stream, config)
 	local delievery_subject = create_inbox() -- create_inbox is a function that generates a unique subject name
 	local configJson = encode(config)
-	request_raw(stream.client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream.name .. ' ' .. delievery_subject .. ' \r\n' .. configJson .. '\r\n')
+	local data = decode(stream.client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream.name .. ' ' .. delievery_subject .. ' \r\n' .. configJson .. '\r\n')
 	local data = response_read(stream.client)
 	if data.action == '-ERR' then
 		stream.client.error('failed to create stream snapshot: ' .. (data.content or 'unknown error'))
@@ -255,7 +181,7 @@ function js.snapshot.restore(stream, snap_data)
 	local reply = stream.client:subscribe(create_inbox(), function(message)
 		-- handle any responses from the server
 	end)
-	request_raw(stream.client, 'PUB $JS.API.STREAM.RESTORE.' .. stream.name .. ' ' .. #snap_data .. '\r\n' .. snap_data .. '\r\n')
+	local data = decode(stream.client, 'PUB $JS.API.STREAM.RESTORE.' .. stream.name .. ' ' .. #snap_data .. '\r\n' .. snap_data .. '\r\n')
 	local data = response_read(stream.client)
 	if data.action == '-ERR' then
 		stream.client.error('failed to restore stream: ' .. (data.content or 'unknown error'))

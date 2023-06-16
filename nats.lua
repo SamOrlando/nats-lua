@@ -251,6 +251,7 @@ function cm.pong(client) request_raw(client, 'PONG\r\n') end
 
 function cm.request(client, subject, payload, callback)
 	local inbox = create_inbox()
+	callback = callback or function() end
 	local sid = client:subscribe(inbox, function(message, reply)
 		client:unsubscribe(sid)
 		callback(message, reply)
@@ -263,8 +264,9 @@ function cm.get(client, subject, payload)
 	local inbox = create_inbox()
 	local sid = cm.subscribe(client, inbox, function(message, reply) cm.unsubscribe(client, sid) end)
 	cm.publish(client, subject, payload, inbox)
-	return response_read(client)
-	--return cm.wait(client, sid)
+	local data = response_read(client)
+	if data.action == '-ERR' then client.error('Client Error: ' .. (data.content or 'unknown error')) end
+	return data.content
 end
 
 function cm.subscribe(client, subject, callback, queue)
