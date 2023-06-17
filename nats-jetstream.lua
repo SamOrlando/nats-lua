@@ -12,8 +12,7 @@ local unpack = _G.unpack or table.unpack
 local request_raw = nats.request.raw
 local response_read = nats.response.read
 local create_inbox = nats.create_inbox
-local encode = cjson.encode
-local decode = cjson.decode
+local encode,decode = cjson.encode, cjson.decode
 
 local stream_metatable = {
 	methods = {},

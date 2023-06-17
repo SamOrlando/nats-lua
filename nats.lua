@@ -1,8 +1,7 @@
 local nats = {
-	_VERSION	 = 'lua-nats 0.0.4',
+	_VERSION	 = 'lua-nats 0.1.0',
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
-	_COPYRIGHT   = 'Copyright (C) 2015 Eric Pinto',
-	methods = {}, -- method metatable for nats core client object
+	_COPYRIGHT   = 'based off lua-nats 0.0.2 - Copyright (C) 2015 Eric Pinto',
 	network = {}, -- network functions
 	request = {}, -- request handling (to server)
 	response = {}, -- response handing (from server)
@@ -18,13 +17,11 @@ nats.client_prototype = {
 	user		  = nil,
 	pass		  = nil,
 	lang		  = 'lua',
-	version	   = '0.0.4',
+	version	   = '0.1.0',
 	verbose	   = false,
 	pedantic	  = false,
-	trace		 = false,  -- not my tick
-	reconnect	 = true,
-	subscriptions = {}, -- k:sid v:func
-	information   = {}, -- server information from INFO in connect
+	trace		 = false,
+	reconnect	 = true
 }
 
 -- ### Library requirements ###
@@ -35,7 +32,6 @@ local uuid   = require('uuid')
 local unpack = _G.unpack or table.unpack
 local type = type
 local encode, decode = cjson.encode, cjson.decode
-local os_time, os_date = os.time, os.date
 local floor = math.floor
 local network, response, request = nats.network, nats.response, nats.request
 local client_prototype, client_metatable = nats.client_prototype, nats.client_metatable
@@ -56,15 +52,17 @@ local function merge_defaults(parameters)
 	return parameters
 end
 
-local function get_time()
-	local currentTime = os_time()
-	local cpuTime = os_clock()
-	return currentTime + (cpuTime - floor(cpuTime))
-end
-
 local function create_client(socket)
 	local client = setmetatable({}, client_metatable)
+	-- legacy prototype
 	for k,v in pairs(client_prototype) do rawset(client, k, v) end
+	-- pulled from prototype as they were shared...
+	client.subscriptions = {}
+	client.information = {}
+	
+	-- en/decoder handler option for each client
+	client.encoder = function(m) return m end -- default passthrough
+	client.decoder = function(m) return m end -- default passthrough
 	
 	-- assign client error handler
 	client.error = nats.error
@@ -83,9 +81,8 @@ end
 
 -- ### Network methods ###
 function network.write(client, buffer)
-	--if client.trace then print('->> '..buffer:sub(1,-3)) end
-	print('->> '..buffer:sub(1,-3))
-	local _, err = client.network.socket:send(buffer)
+	if client.trace then print('->> '..buffer:sub(1,-3)) end
+	local _, err = client.network.socket:send(client.encoder(buffer))
 	if not err then client.network.lwrite = buffer
 	else client.error(err) end
 end
@@ -94,8 +91,7 @@ local network_write = network.write
 function network.read(client, len)
 	if len == nil then len = '*l' end
 	local line, err = client.network.socket:receive(len)
-	print('<<- '..line)
-	--if client.trace then print('<<- '..line) end
+	if client.trace then print('<<- '..line) end
 	if not err then
 		client.network.lread = line
 		return line
@@ -105,7 +101,7 @@ local network_read = network.read
 
 -- ### Response methods ###
 response.methods = {
-	INFO = function(s) return {action=s[1],content=s[2]} end,
+	INFO = function(s, client) return {action=s[1],content=s[2]} end, -- do not use client.encode
 	PING = function(s) return {action=s[1]} end,
 	PONG = function(s) return {action=s[1]} end,
 	MSG = function(s, client)
@@ -121,7 +117,7 @@ response.methods = {
 			data.reply = s[4]
 			data.content = network_read(client, s[5]+2):sub(1, -3)
 		end
-		return data
+		return client.encoder(data)
 	end,
 	["+OK"] = function(s) return {action=s[1]} end,
 }
@@ -144,7 +140,6 @@ local response_read = response.read
 
 
 -- ### Request methods ###
--- Client request sender (RAW)
 function request.raw(client, buffer)
 	local bufferType = type(buffer)
 	if bufferType == 'string' then network_write(client, buffer)
@@ -254,19 +249,19 @@ function cm.request(client, subject, payload, callback)
 	callback = callback or function() end
 	local sid = client:subscribe(inbox, function(message, reply)
 		client:unsubscribe(sid)
-		callback(message, reply)
+		callback(client.decoder(message), reply)
 	end)
-	client:publish(subject, payload, inbox)
+	client:publish(subject, client.encoder(payload), inbox)
 	return sid, inbox
 end
 
 function cm.get(client, subject, payload)
 	local inbox = create_inbox()
 	local sid = cm.subscribe(client, inbox, function(message, reply) cm.unsubscribe(client, sid) end)
-	cm.publish(client, subject, payload, inbox)
+	cm.publish(client, subject, client.encoder(payload), inbox)
 	local data = response_read(client)
 	if data.action == '-ERR' then client.error('Client Error: ' .. (data.content or 'unknown error')) end
-	return data.content
+	return client.decoder(data.content)
 end
 
 function cm.subscribe(client, subject, callback, queue)
@@ -282,7 +277,7 @@ function cm.unsubscribe(client, sid)
 end
 
 function cm.publish(client, subject, payload, reply)
-	payload = payload or ""
+	payload = client.encoder(payload or "")
 	reply = reply and ' ' .. reply or ''
 	request_raw(client, {
 		'PUB '..subject..reply..' '..#payload..'\r\n',
@@ -297,7 +292,7 @@ function cm.wait(client, maxcount)
 		data = response_read(client)
 		if data.action == 'MSG' then
 			count = count + 1
-			client.subscriptions[data.sid](data.content, data.reply, data.subject, data.sid)
+			client.subscriptions[data.sid](client.encoder(data.content), data.reply, data.subject, data.sid)
 		elseif data.action == 'PING' then cm.pong(client)
 		elseif data.action == 'INFO' then
 			-- client.information = decode(data.content) -- notsure if this will overwrite, so lets be safe...
