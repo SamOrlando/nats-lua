@@ -7,6 +7,8 @@ local nats = {
 	response = {}, -- response handing (from server)
 }
 
+-- todo (convert all string concat to tables)
+
 nats.client_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
 	__call = function(self, ...) return	end,
@@ -274,7 +276,7 @@ function cm.publish(client, subject, payload, reply)
 end
 
 function cm.wait(client, maxcount)
-	local count = 0
+	local count, data = 0
 	
 	while true do
 		data = response_read(client)
