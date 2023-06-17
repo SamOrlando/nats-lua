@@ -8,20 +8,11 @@ local nats = {
 }
 
 nats.client_metatable = {
-	methods = {},
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
 	__call = function(self, ...) return	end,
-}
-
-nats.client_prototype = {
-	user		  = nil,
-	pass		  = nil,
-	lang		  = 'lua',
-	version	   = '0.1.0',
-	verbose	   = false,
-	pedantic	  = false,
-	trace		 = false,
-	reconnect	 = true
+	methods = {},
+	lang = 'lua',
+	version = '0.1.0',
 }
 
 -- ### Library requirements ###
@@ -36,27 +27,32 @@ local floor = math.floor
 local network, response, request = nats.network, nats.response, nats.request
 local client_prototype, client_metatable = nats.client_prototype, nats.client_metatable
 
-local defaults = {
+-- ### Local methods ###
+local connect_defaults = {
 	host		= '127.0.0.1',
 	port		= 4222,
 	tcp_nodelay = true,
 	path		= nil,
 }
 
--- ### Local methods ###
 local function merge_defaults(parameters)
 	parameters = parameters or {}
-	for k, v in pairs(defaults) do
-		parameters[k] = parameters[k] or defaults[k]
-	end
+	for k, v in pairs(connect_defaults) do parameters[k] = parameters[k] or connect_defaults[k] end
 	return parameters
 end
 
 local function create_client(socket)
 	local client = setmetatable({}, client_metatable)
-	-- legacy prototype
-	for k,v in pairs(client_prototype) do rawset(client, k, v) end
-	-- pulled from prototype as they were shared...
+	-- defaults
+	client.config = {
+		user = nil,
+		pass = nil,
+		verbose = false,
+		pedantic = false,
+		trace = false, -- make take out of config for speed considerations
+		reconnect = true,
+	}
+
 	client.subscriptions = {}
 	client.information = {}
 	
@@ -66,6 +62,7 @@ local function create_client(socket)
 	
 	-- assign client error handler
 	client.error = nats.error
+
 	-- assign client network methods
 	client.network = {
 		socket = socket,
@@ -74,6 +71,7 @@ local function create_client(socket)
 		lread  = nil,
 		lwrite = nil,
 	}
+	
 	uuid.seed()
 	return client
 end
@@ -81,7 +79,7 @@ end
 
 -- ### Network methods ###
 function network.write(client, buffer)
-	if client.trace then print('->> '..buffer:sub(1,-3)) end
+	if client.config.trace then print('->> '..buffer:sub(1,-3)) end -- YUK! FIX THIS SOME HOW!
 	local _, err = client.network.socket:send(client.encoder(buffer))
 	if not err then client.network.lwrite = buffer
 	else client.error(err) end
@@ -91,7 +89,7 @@ local network_write = network.write
 function network.read(client, len)
 	if len == nil then len = '*l' end
 	local line, err = client.network.socket:receive(len)
-	if client.trace then print('<<- '..line) end
+	if client.config.trace then print('<<- '..line) end -- YUK # 2
 	if not err then
 		client.network.lread = line
 		return line
@@ -214,19 +212,7 @@ local create_inbox = nats.create_inbox -- vroom
 -- ### NATS Client Methods ###
 local cm = nats.client_metatable.methods
 function cm.connect(client)
-	local config = {
-		lang	 = client.lang,
-		version  = client.version,
-		verbose  = client.verbose,
-		pedantic = client.pedantic,
-	}
-
-	if client.user ~= nil and client.pass ~= nil then
-		config.user = client.user
-		config.pass = client.pass
-	end
-
-	request_raw(client, 'CONNECT '..encode(config)..'\r\n')
+	request_raw(client, 'CONNECT '..encode(client.config)..'\r\n')
 
 	-- gather the server information
 	local data = response_read(client)
@@ -292,7 +278,7 @@ function cm.wait(client, maxcount)
 		data = response_read(client)
 		if data.action == 'MSG' then
 			count = count + 1
-			client.subscriptions[data.sid](client.encoder(data.content), data.reply, data.subject, data.sid)
+			client.subscriptions[data.sid](client.decoder(data.content), data.reply, data.subject, data.sid)
 		elseif data.action == 'PING' then cm.pong(client)
 		elseif data.action == 'INFO' then
 			-- client.information = decode(data.content) -- notsure if this will overwrite, so lets be safe...
@@ -308,20 +294,23 @@ function cm.request_raw(client, buffer)
 	return response_read(client)
 end
 
-function cm.set_auth(client, user, pass)
-	client.user = user
-	client.pass = pass
+function cm.auth(client, user, pass)
+	client.config.user = user or client.config.user
+	client.config.pass = pass or client.config.pass
+	return {user=client.config.user,pass=client.config.pass}
 end
 
-function cm.enable_trace(client) client.trace = true end
+function cm.trace(client, b)
+    if b ~= nil then client.config.trace = b
+    else client.config.trace = not client.config.trace end
+    return client.config.trace
+end
 
-function cm.set_verbose(client, verbose) client.verbose = verbose end
-
-function cm.set_pedantic(client, pedantic) client.pedantic = pedantic end
-
-function cm.count_subscriptions(client) return #client.subscriptions end
-
-function cm.server_info(client)	return client.information end
+function cm.pedantic(client, b)
+    if b ~= nil then client.config.pedantic = b
+    else client.config.pedantic = not client.config.pedantic end
+    return client.config.pedantic
+end
 
 function cm.shutdown(client) client.network.socket:shutdown() end
 
