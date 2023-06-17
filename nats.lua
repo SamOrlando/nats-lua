@@ -308,19 +308,26 @@ end
 
 -- assign functions to handle bool options
 local valid_config_toggles = {verbose=true,headers=true,trace=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
-local function config_toggle(client, k, b)
-	if valid_config_toggles[k] then
-		if b ~= nil then client.config[k] = b
-		else client.config[k] = not client.config[k] end
+local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true}
+local function config_set(client, k, v)
+	local opt = valid_config_toggles[k] or valid_config_string[k]
+	if opt then
+		if v ~= nil then client.config[k] = v
+		elseif valid_config_toggles[k] then client.config[k] = not client.config[k] end
 		return client.config[k]
 	end
 	return
 end
 
--- assign methods for all config options
+-- assign methods for all config toggle options
 for k,v in pairs(valid_config_toggles) do
-	cm[k] = function(client, b) return config_toggle(client, k, b) end
+	cm[k] = function(client, b) return config_set(client, k, b) end
 end
+-- assign methods for all config string options
+for k,v in pairs(valid_config_strings) do
+	cm[k] = function(client, s) return config_set(client, k, s) end
+end
+
 
 function cm.shutdown(client) client.network.socket:shutdown() end
 
