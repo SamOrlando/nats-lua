@@ -47,6 +47,8 @@ local function create_client(socket)
 	client.config = {
 		user = nil,
 		pass = nil,
+		lang = client_metatable.lang,
+		version = client_metatable.version,
 		verbose = false,
 		pedantic = false,
 		trace = false, -- make take out of config for speed considerations
