@@ -7,7 +7,9 @@ local nats = {
 	response = {}, -- response handing (from server)
 }
 
--- todo (convert all string concat to tables)
+-- todo - convert all string concat to tables
+-- todo - header support and options
+-- todo - make encoded connection a seperate object
 
 nats.client_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
@@ -60,7 +62,7 @@ local function create_client(socket)
 	client.subscriptions = {}
 	client.information = {}
 	
-	-- en/decoder handler option for each client
+	-- en/decoder handler option for each client (local funcs for lazy)
 	client.encoder = function(m) return m end -- default passthrough
 	client.decoder = function(m) return m end -- default passthrough
 	
@@ -304,16 +306,20 @@ function cm.auth(client, user, pass)
 	return {user=client.config.user,pass=client.config.pass}
 end
 
-function cm.trace(client, b)
-    if b ~= nil then client.config.trace = b
-    else client.config.trace = not client.config.trace end
-    return client.config.trace
+-- assign functions to handle bool options
+local valid_config_toggles = {verbose=true,headers=true,trace=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
+local function config_toggle(client, k, b)
+	if valid_config_toggles[k] then
+		if b ~= nil then client.config[k] = b
+		else client.config[k] = not client.config[k] end
+		return client.config[k]
+	end
+	return
 end
 
-function cm.pedantic(client, b)
-    if b ~= nil then client.config.pedantic = b
-    else client.config.pedantic = not client.config.pedantic end
-    return client.config.pedantic
+-- assign methods for all config options
+for k,v in pairs(valid_config_toggles) do
+	cm[k] = function(client, b) return config_toggle(client, k, b) end
 end
 
 function cm.shutdown(client) client.network.socket:shutdown() end
