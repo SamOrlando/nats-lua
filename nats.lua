@@ -16,7 +16,7 @@ nats.client_metatable = {
 	__call = function(self, ...) return	end,
 	methods = {},
 	lang = 'lua',
-	version = '0.1.0',
+	version = nats._VERSION,
 }
 
 -- ### Library requirements ###
@@ -31,21 +31,25 @@ local floor = math.floor
 local network, response, request = nats.network, nats.response, nats.request
 local client_prototype, client_metatable = nats.client_prototype, nats.client_metatable
 
--- ### Local methods ###
+local valid_config_toggles = {verbose=true,headers=true,trace=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
+local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true}
+
 local connect_defaults = {
-	host		= '127.0.0.1',
-	port		= 4222,
+	host = '127.0.0.1',
+	port = 4222,
 	tcp_nodelay = true,
-	path		= nil,
+	path = nil,
+	timeout = -1,
 }
 
+-- ### Local methods ###
 local function merge_defaults(parameters)
 	parameters = parameters or {}
 	for k, v in pairs(connect_defaults) do parameters[k] = parameters[k] or connect_defaults[k] end
 	return parameters
 end
 
-local function create_client(socket)
+local function create_client(socket, config)
 	local client = setmetatable({}, client_metatable)
 	-- defaults
 	client.config = {
@@ -55,9 +59,11 @@ local function create_client(socket)
 		version = client_metatable.version,
 		verbose = false,
 		pedantic = false,
-		trace = false, -- make take out of config for speed considerations
-		reconnect = true,
+		trace = false, -- make take out of config for speed considerations -- not offical - FIX
+		reconnect = true, -- not used or documented as real client config value in connect
 	}
+	
+	for k,v in pairs(config or {}) do client.config[k] = v end	
 
 	client.subscriptions = {}
 	client.information = {}
@@ -95,7 +101,7 @@ local network_write = network.write
 function network.read(client, len)
 	if len == nil then len = '*l' end
 	local line, err = client.network.socket:receive(len)
-	if client.config.trace then print('<<- '..line) end -- YUK # 2
+	if client.config.trace then print('<<- '..(line or "")) end -- YUK # 2
 	if not err then
 		client.network.lread = line
 		return line
@@ -121,6 +127,42 @@ response.methods = {
 			data.reply = s[4]
 			data.content = network_read(client, s[5]+2):sub(1, -3)
 		end
+		return client.encoder(data)
+	end,
+	-- "NATS/1.0" : HMSG <subject> <sid> [reply-to] <#header bytes> <#total bytes>␍␊[headers]␍␊␍␊[payload]␍␊
+	HMSG = function(s, client)
+		local data
+		if #s > 5 then
+			data = {
+				action = s[1],
+				subject = s[2],
+				sid = s[3],
+				reply = s[4],
+				header_size = s[5],
+				total_size = s[6],
+			}
+		else 
+			data = {
+				action = s[1],
+				subject = s[2],
+				sid = s[3],
+				header_size = s[4],
+				total_size = s[5],
+			}
+		end
+		
+		if network_read(client) == "NATS/1.0" then
+			data.headers = {}
+			local hcount, hread = 0
+			while true do
+				hread = network_read(client)
+				if #hread == 0 then break end
+				hcount = hcount + 1
+				print(hread)	
+			end
+		end
+
+		data.content = network_read(client)
 		return client.encoder(data)
 	end,
 	["+OK"] = function(s) return {action=s[1]} end,
@@ -196,6 +238,26 @@ end
 -- ### Nats library methods ###
 function nats.error(message, level)
 	error(message, (level or 1) + 1)
+end
+
+function nats.client(opts, host, port, timeout)
+	local opt_t = {}
+
+	if type(opts) == "string" then
+		timeout = port
+		port = host
+		host = opts
+		opts = nil
+	end
+	
+	local nparms = { host = host, port = port, timeout = tonumber(timeout) }
+	
+	for k,v in pairs(opts or {}) do
+		if (valid_config_toggles[k] or valid_config_strings[k]) then opt_t[k] = v end
+	end
+	
+	local socket = create_connection(merge_defaults(nparms))
+	return create_client(socket, opt_t)
 end
 
 function nats.connect(...)
@@ -277,16 +339,34 @@ function cm.publish(client, subject, payload, reply)
 		})
 end
 
+function cm.publish_whead(client, subject, payload, headers, reply)
+	payload = client.encoder(payload or "")
+	headers = headers or ""
+	reply = reply and ' ' .. reply or ''
+	request_raw(client, {
+		'HPUB '..subject..reply..' '..#headers..' '..#payload..'\r\n',
+		'\r\n\r\n',
+		payload..'\r\n',
+		})
+end
+
+-- HPUB <subject> [reply-to] <#header bytes> <#total bytes>␍␊[headers]␍␊␍␊[payload]␍␊
+
 function cm.wait(client, maxcount)
 	local count, data = 0
 	
 	while true do
 		data = response_read(client)
-		if data.action == 'MSG' then
+		action = data.action
+		
+		if action == 'MSG' then
 			count = count + 1
 			client.subscriptions[data.sid](client.decoder(data.content), data.reply, data.subject, data.sid)
-		elseif data.action == 'PING' then cm.pong(client)
-		elseif data.action == 'INFO' then
+		elseif action == 'HMSG' then
+			count = count + 1
+			client.subscriptions[data.sid](client.decoder(data.content), data.reply, data.subject, data.sid, data.headers)
+		elseif action == 'PING' then cm.pong(client)
+		elseif action == 'INFO' then
 			-- client.information = decode(data.content) -- notsure if this will overwrite, so lets be safe...
 			for k,v in pairs(decode(data.content) or {}) do client.information[k] = v end
 		end
@@ -295,7 +375,7 @@ function cm.wait(client, maxcount)
 	return
 end
 
-function cm.request_raw(client, buffer)
+function cm.raw(client, buffer)
 	request_raw(client, buffer .. '\r\n')
 	return response_read(client)
 end
@@ -307,8 +387,6 @@ function cm.auth(client, user, pass)
 end
 
 -- assign functions to handle bool options
-local valid_config_toggles = {verbose=true,headers=true,trace=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
-local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true}
 local function config_set(client, k, v)
 	local opt = valid_config_toggles[k] or valid_config_string[k]
 	if opt then
@@ -321,13 +399,12 @@ end
 
 -- assign methods for all config toggle options
 for k,v in pairs(valid_config_toggles) do
-	cm[k] = function(client, b) return config_set(client, k, b) end
+	cm[k] = cm[k] or function(client, b) return config_set(client, k, b) end
 end
 -- assign methods for all config string options
 for k,v in pairs(valid_config_strings) do
-	cm[k] = function(client, s) return config_set(client, k, s) end
+	cm[k] = cm[k] or function(client, s) return config_set(client, k, s) end
 end
-
 
 function cm.shutdown(client) client.network.socket:shutdown() end
 

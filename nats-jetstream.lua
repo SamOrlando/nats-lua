@@ -8,7 +8,6 @@ local cjson  = require('cjson')
 local uuid   = require('uuid')
 
 -- ### Local properties ### speed and neet laziness ftw
-local unpack = _G.unpack or table.unpack
 local request_raw = nats.request.raw
 local response_read = nats.response.read
 local create_inbox = nats.create_inbox
