@@ -359,10 +359,7 @@ function cm.wait(client, maxcount)
 		data = response_read(client)
 		action = data.action
 		
-		if action == 'MSG' then
-			count = count + 1
-			client.subscriptions[data.sid](client.decoder(data.content), data.reply, data.subject, data.sid)
-		elseif action == 'HMSG' then
+		if action == 'MSG' or action == 'HMSG' then
 			count = count + 1
 			client.subscriptions[data.sid](client.decoder(data.content), data.reply, data.subject, data.sid, data.headers)
 		elseif action == 'PING' then cm.pong(client)
