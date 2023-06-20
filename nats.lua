@@ -30,9 +30,8 @@ local uuid   = require('uuid')
 -- ### Local properties / vars ###
 local insert, concat = table.insert, table.concat
 local type = type
-local tonumber = tonumber
+local floor, tonumber = math.floor, tonumber
 local encode, decode = cjson.encode, cjson.decode
-local floor = math.floor
 local network, response, request = nats.network, nats.response, nats.request
 local client_prototype, client_metatable = nats.client_prototype, nats.client_metatable
 
@@ -48,7 +47,7 @@ local connect_defaults = {
 	tls_required = false,
 }
 
--- ### Local methods ###
+-- ### Local methods ### -- fix for false boolean handling
 local function merge_defaults(parameters)
 	parameters = parameters or {}
 	for k, v in pairs(connect_defaults) do parameters[k] = parameters[k] or connect_defaults[k] end
@@ -78,6 +77,11 @@ local function create_client(socket, config)
 	client.encoder = function(m) return m end -- default passthrough
 	client.decoder = function(m) return m end -- default passthrough
 	
+	if client.config.headers then
+		client.header_encoder = function(m) return m end
+		client.header_decoder = function(m) return m end
+	end
+	
 	-- assign client error handler
 	client.error = nats.error
 
@@ -94,19 +98,9 @@ local function create_client(socket, config)
 	return client
 end
 
-local function toHEX(s)
-	local hexString, byteValue = ""
-	for i = 1, #s do
-		byteValue = string.byte(s, i)
-		hexString = hexString .. string.format("%02X ", byteValue)
-	end
-	return hexString
-end
-
-
 local function encode_header(t) return concat({t[1],': ',t[2],'\r\n'}) end
 
-local function decoded_header(s) return s:match("([^:]+):%s*(.+)") end
+local function decode_headers(s) return s:match("([^:]+):%s*(.+)") end
 
 -- ### Network methods ###
 function network.write(client, buffer)
@@ -130,7 +124,7 @@ local network_read = network.read
 
 -- ### Response methods ###
 response.methods = {
-	INFO = function(s, client) return {action=s[1],content=s[2]} end, -- do not use client.encode
+	INFO = function(s, client) return {action=s[1],content=s[2]} end,
 	PING = function(s) return {action=s[1]} end,
 	PONG = function(s) return {action=s[1]} end,
 	MSG = function(s, client)
@@ -146,7 +140,7 @@ response.methods = {
 			data.reply = s[4]
 			data.content = network_read(client, s[5]+2):sub(1, -3)
 		end
-		return client.encoder(data)
+		return data
 	end,
 	HMSG = function(s, client)
 		local data
@@ -170,7 +164,7 @@ response.methods = {
 		end
 		
 		if tonumber(data.header_size) > 0 and network_read(client) == "NATS/1.0" then
-			data.headers = 'NATS/1.0\r\n'
+			data.headers = ''
 			local hread
 			while true do
 				hread = network_read(client)
@@ -178,9 +172,9 @@ response.methods = {
 				else data.headers = data.headers .. '\r\n' .. hread end
 			end
 		end
-
+		
 		data.content = network_read(client)
-		return client.encoder(data)
+		return data
 	end,
 	["+OK"] = function(s) return {action=s[1]} end,
 }
