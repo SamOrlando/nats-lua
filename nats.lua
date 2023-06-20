@@ -142,7 +142,6 @@ response.methods = {
 		end
 		return client.encoder(data)
 	end,
-	-- "NATS/1.0" : HMSG <subject> <sid> [reply-to] <#header bytes> <#total bytes>␍␊[headers]␍␊␍␊[payload]␍␊
 	HMSG = function(s, client)
 		local data
 		if #s > 5 then
@@ -164,14 +163,13 @@ response.methods = {
 			}
 		end
 		
-		if network_read(client) == "NATS/1.0" then
-			data.headers = {}
-			local hcount, hread = 0
+		if data.header_size > 0 and network_read(client) == "NATS/1.0" then
+			data.headers = 'NATS/1.0\r\n'
+			local hread
 			while true do
 				hread = network_read(client)
-				if #hread == 0 then break end
-				hcount = hcount + 1
-				print(hread)	
+				if #hread == 0 then	break
+				else data.headers = data.headers .. '\r\n' .. hread end
 			end
 		end
 
@@ -396,12 +394,7 @@ function cm.h_publish(client, subject, payload, reply, headers)
 	-- insert payload
 	insert(st, payload)
 	insert(st, '\r\n')
-	
-	-- print(#headers .. ':' .. #payload .. ':' .. #headers + #payload)
-	
-	-- printTable(st)
-	-- print(toHEX(concat(st)))
-	
+
 	request_raw(client, st)
 end
 
@@ -426,7 +419,7 @@ function cm.wait(client, maxcount)
 end
 
 function cm.raw(client, buffer)
-	request_raw(client, buffer .. '\r\n')
+	request_raw(client, buffer)
 	return response_read(client)
 end
 
