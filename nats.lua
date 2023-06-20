@@ -163,13 +163,15 @@ response.methods = {
 			}
 		end
 		
+		local dheaders = ''
 		if tonumber(data.header_size) > 0 and network_read(client) == "NATS/1.0" then
-			data.headers = ''
 			local hread
 			while true do
 				hread = network_read(client)
-				if #hread == 0 then	break
-				else data.headers = data.headers .. '\r\n' .. hread end
+				if #hread == 0 then
+					data.headers = dheaders:sub(3)
+					break
+				else dheaders = dheaders .. '\r\n' .. hread end
 			end
 		end
 		
@@ -204,7 +206,6 @@ function request.raw(client, buffer)
 	else client.error('argument error: ' .. bufferType) end
 end
 local request_raw = request.raw
-
 
 -- ### Socket connection methods ###
 local function connect_tcp(socket, parameters)
