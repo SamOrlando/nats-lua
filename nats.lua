@@ -1,7 +1,7 @@
 local nats = {
 	_VERSION	 = 'lua-nats 0.1.2',
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
-	_COPYRIGHT   = 'based off Eric Pinto lua-nats 0.0.2 - Copyright (C) Sam Orlando 2023',
+	_COPYRIGHT   = 'slightly based off Eric Pinto lua-nats 0.0.2 - Copyright (C) Sam Orlando 2023',
 	network = {}, -- network functions
 	request = {}, -- request handling (to server)
 	response = {}, -- response handing (from server)
@@ -21,10 +21,9 @@ nats.client_metatable = {
 	version = '0.1.2',
 }
 
--- ### Library requirements ###
 local cjson  = require('cjson')
 local uuid   = require('uuid')
---local ssl = require('ssl') TLS SUPPORT
+local ssl = require('ssl')
 
 -- ### Local properties / vars ###
 local verbose = false -- (false or nil for off) levels 1-5
@@ -389,7 +388,8 @@ function cm.unsubscribe(client, sid)
 	client.subscriptions[sid] = nil
 end
 
-function cm.publish(client, subject, payload, reply)
+function cm.publish(client, subject, payload, reply, headers)
+	if headers then	return cm.h_publish(lient, subject, payload, reply, headers) end
 	payload = client.encoder(payload or "")
 	
 	-- create send table for message string
