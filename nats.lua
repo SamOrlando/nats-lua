@@ -1,15 +1,18 @@
 local nats = {
-	_VERSION	 = 'lua-nats 0.1.0',
+	_VERSION	 = 'lua-nats 0.1.1',
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
-	_COPYRIGHT   = 'based off lua-nats 0.0.2 - Copyright (C) 2015 Eric Pinto',
+	_COPYRIGHT   = 'based off Eric Pinto lua-nats 0.0.2 - Copyright (C) Sam Orlando 2023',
 	network = {}, -- network functions
 	request = {}, -- request handling (to server)
 	response = {}, -- response handing (from server)
 }
 
 -- todo - convert all string concat to tables
--- todo - header support and options
+-- fix options to be pure in submit to server CONNECT
 -- todo - make encoded connection a seperate object
+-- todo - support verbose mode natively to nats-lua
+-- todo - header encoding and decoding option
+-- todo - protocol setting in CONNECT (confirm dynamic INFO adjustments in client)
 
 nats.client_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
@@ -22,17 +25,19 @@ nats.client_metatable = {
 -- ### Library requirements ###
 local cjson  = require('cjson')
 local uuid   = require('uuid')
+--local ssl = require('ssl') TLS SUPPORT
 
 -- ### Local properties / vars ###
 local insert, concat = table.insert, table.concat
 local type = type
+local tonumber = tonumber
 local encode, decode = cjson.encode, cjson.decode
 local floor = math.floor
 local network, response, request = nats.network, nats.response, nats.request
 local client_prototype, client_metatable = nats.client_prototype, nats.client_metatable
 
 local valid_config_toggles = {verbose=true,headers=true,trace=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
-local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true}
+local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true,protocol=true}
 
 local connect_defaults = {
 	host = '127.0.0.1',
@@ -40,6 +45,7 @@ local connect_defaults = {
 	tcp_nodelay = true,
 	path = nil,
 	timeout = -1,
+	tls_required = false,
 }
 
 -- ### Local methods ###
@@ -55,12 +61,12 @@ local function create_client(socket, config)
 	client.config = {
 		user = nil,
 		pass = nil,
-		lang = client_metatable.lang,
-		version = client_metatable.version,
 		verbose = false,
+		protocol = 1,
 		pedantic = false,
 		trace = false, -- make take out of config for speed considerations -- not offical - FIX
 		reconnect = true, -- not used or documented as real client config value in connect
+		tls_required = false,
 	}
 	
 	for k,v in pairs(config or {}) do client.config[k] = v end	
@@ -163,7 +169,7 @@ response.methods = {
 			}
 		end
 		
-		if data.header_size > 0 and network_read(client) == "NATS/1.0" then
+		if tonumber(data.header_size) > 0 and network_read(client) == "NATS/1.0" then
 			data.headers = 'NATS/1.0\r\n'
 			local hread
 			while true do
@@ -185,7 +191,7 @@ function response.read(client)
 	local slices  = {}
 	local data	= {}
 
-	for slice in payload:gmatch('[^%s]+') do table.insert(slices, slice) end
+	for slice in payload:gmatch('[^%s]+') do insert(slices, slice) end
 
 	if slices[1] and response_methods[slices[1]] then
 		return response_methods[slices[1]](slices, client)
@@ -217,6 +223,19 @@ local function connect_tcp(socket, parameters)
 	end
 
 	socket:setoption('tcp-nodelay', parameters.tcp_nodelay)
+
+	if parameters.tls_required then
+         local tls_params = {
+            mode = "client",
+            protocol = "tlsv1_2",
+            options = "all",
+         }
+         local n_socket = ssl.wrap(socket, tls_params)
+         assert(n_socket, 'failed to wrap socket with TLS')
+		 n_socket:dohandshake()
+		 socket = n_socket
+    end
+	
 	return socket
 end
 
@@ -242,7 +261,7 @@ local function create_connection(parameters)
 		end
 		perform_connection, socket = connect_tcp, require('socket').tcp
 	end
-
+	
 	return perform_connection(socket(), parameters)
 end
 
@@ -261,11 +280,11 @@ function nats.client(opts, host, port, timeout)
 		opts = nil
 	end
 	
-	local nparms = { host = host, port = port, timeout = tonumber(timeout) }
-	
 	for k,v in pairs(opts or {}) do
 		if (valid_config_toggles[k] or valid_config_strings[k]) then opt_t[k] = v end
 	end
+	
+	local nparms = { host = host, port = port, timeout = tonumber(timeout), tls_required = opt_t.tls_required}
 	
 	local socket = create_connection(merge_defaults(nparms))
 	return create_client(socket, opt_t)
@@ -428,6 +447,8 @@ function cm.auth(client, user, pass)
 	client.config.pass = pass or client.config.pass
 	return {user=client.config.user,pass=client.config.pass}
 end
+
+function cm.server_info(client) return client.information end
 
 -- assign functions to handle bool options
 local function config_set(client, k, v)
