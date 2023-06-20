@@ -1,116 +1,181 @@
-This is a Lua client library for NATS, a simple, high performance open source messaging system for cloud native applications, IoT messaging, and microservices architectures. The library provides an interface for connecting to a NATS server, sending requests, and handling responses. 
+## lua-nats Documentation
 
-The library includes the following features:
+lua-nats is a Lua client library for the NATS messaging system. It provides functionality for connecting to a NATS server, subscribing to subjects, publishing messages, and handling various NATS protocol operations.
 
-- Connection to a NATS server with optional authentication.
-- Subscription to subjects with optional queue groups.
-- Publishing of messages to subjects.
-- Unsubscription from subjects.
-- Ping and Pong operations for connection keep-alive.
-- Raw command sending and receiving.
-- Server information retrieval.
-- Error handling.
-- Support for JetStream, a full-featured, distributed persistence engine built into NATS.
+### Installation
 
-The JetStream related commands include:
+To use lua-nats, you need to have Lua installed on your system. You can then install the required dependencies by running the following command:
 
-- Stream creation and deletion.
-- Consumer creation and deletion.
-- Message publishing.
-- Stream and consumer information retrieval.
-- Retrieving the next message from a consumer.
-- Acknowledging receipt of a message from a consumer.
-- Listing all streams and consumers.
-- Updating the configuration of a stream or consumer.
-- Replaying a message from a stream.
-- Purging all messages from a stream.
-- Stream template creation, deletion, and information retrieval.
-- Listing all stream templates.
-- Creating, restoring, and reading a snapshot of a stream.
+```
+luarocks install lua-nats
+```
 
-The library uses LuaSocket for network communication and Lua CJSON for JSON encoding and decoding. It also uses the UUID library for generating unique identifiers. The library is compatible with Lua 5.1 and later.
+### Usage
 
+To use lua-nats in your Lua code, you need to require the library:
 
-Local Functions
+```lua
+local nats = require('lua-nats')
+```
 
-    create_inbox(): Returns a properly formatted inbox subject.
+#### Creating a Client
 
-    merge_defaults(parameters): Merges default parameters with the provided parameters, with the provided parameters taking precedence.
+To create a new NATS client instance, you have two options:
 
-    load_methods(proto, commands): Loads methods from a given prototype and commands table to a new client.
+1. Using `nats.client` function:
 
-    create_client(client_proto, client_socket, commands): Creates a new client based on a prototype, a socket, and a list of commands.
+```lua
+local client = nats.client(opts, host, port, timeout)
+```
 
-Network Functions
+Parameters:
+- `opts` (table, optional): Options for configuring the client.
+- `host` (string): The host of the NATS server.
+- `port` (number): The port of the NATS server.
+- `timeout` (number, optional): The timeout for network operations.
 
-    network.write(client, buffer): Writes a buffer to a client's socket.
+2. Using `nats.connect` function:
 
-    network.read(client, len): Reads data from a client's socket with a given length.
+```lua
+local client = nats.connect(parameters)
+```
 
-Response Functions
+Parameters:
+- `parameters` (table): Connection parameters for the client.
 
-    response.read(client): Reads a response from a client.
+#### Connecting to the NATS Server
 
-Request Functions
+To connect to the NATS server, you can use the `connect` method of the client object:
 
-    request.raw(client, buffer): Sends a raw request from a client using a given buffer.
+```lua
+client:connect()
+```
 
-Client Prototype Functions
+This establishes a TCP connection with the NATS server and retrieves server information.
 
-    These functions allow modifications and actions related to a NATS client, such as sending raw commands, setting authentication, enabling trace, setting verbosity, setting pedantic mode, counting subscriptions, getting server info, and shutting down a client.
+#### Subscribing to Subjects
 
-Connection Functions
+To subscribe to a subject and receive messages, you can use the `subscribe` method of the client object:
 
-    These functions (connect_tcp(socket, parameters), connect_unix(socket, parameters), and create_connection(parameters)) manage the connections, either TCP or Unix, and are responsible for the creation of connections with proper parameters.
+```lua
+local sid = client:subscribe(subject, callback, queue)
+```
 
-Nats Library Functions
+Parameters:
+- `subject` (string): The subject to subscribe to.
+- `callback` (function): A function to handle received messages.
+- `queue` (string, optional): The optional queue group name.
 
-    nats.error(message, level): Throws an error with a given message and level.
+The `callback` function is invoked whenever a message is received on the subscribed subject. The function is passed the received message payload, the reply subject (if applicable), the subject the message was received on, the subscription ID, and the headers (if applicable).
 
-    nats.connect(...): Connects to a NATS server with given parameters.
+#### Publishing Messages
 
-    nats.command(cmd, opts): Executes a command with given options.
+To publish a message to a subject, you can use the `publish` method of the client object:
 
-Core Commands
+```lua
+client:publish(subject, payload, reply, headers)
+```
 
-    nats.command.connect(client) - This function initiates a connection with the server.
+Parameters:
+- `subject` (string): The subject to publish the message to.
+- `payload` (string): The payload of the message.
+- `reply` (string, optional): The optional reply subject.
+- `headers` (table, optional): Additional headers for the message.
 
-    nats.command.ping(client) - This function sends a PING command to the server and returns true if it receives a PONG response.
+#### Request-Reply
 
-    nats.command.pong(client) - This function sends a PONG command to the server.
+To send a request message and receive a reply, you can use the `request` method of the client object:
 
-    nats.command.request(client, subject, payload, callback) - This function sends a request to the server with a given subject and payload, and specifies a callback to be executed once a response is received.
+```lua
+local response = client:request(subject, payload, headers)
+```
 
-    nats.command.subscribe(client, subject, callback, queue) - This function subscribes to a specific subject and queue and assigns a callback to be executed once a message is received.
+Parameters:
+- `subject` (string): The subject to send the request to.
+- `payload` (string): The payload of the request.
+- `headers` (table, optional): Additional headers for the request.
 
-    nats.command.unsubscribe(client, unique_id) - This function unsubscribes from a subject or queue with the given unique ID.
+The `request` method sends a request message and waits for the reply. It returns the response received from the server.
 
-    nats.command.publish(client, subject, payload, reply) - This function publishes a message with a given payload to a specific subject and optionally includes a reply subject.
+#### Other Methods
 
-    nats.command.wait(client, quantity) - This function waits for a certain quantity of messages to be received before continuing.
+The client object provides several other methods for various operations:
 
-Jetstream
+- `ping()`: Sends a PING message to the server.
+- `pong()`: Sends a PONG message to the server.
+- `unsubscribe(sid)`: Unsubscribes from a subscription identified by the subscription ID.
+- `wait(maxcount)`:
 
-    nats.js.create(client, name, subjects) - This function creates a new JetStream stream with the given name and subjects.
+ Waits for incoming messages from the server.
 
-    nats.js.delete(client, name) - This function deletes a JetStream stream with the given name.
+### Configuration Options
 
-    nats.js.consumer.create(client, streamName, durableName, config) - This function creates a new JetStream consumer under the specified stream with a given durable name and configuration.
+The client object allows you to configure various options using the provided methods. The available configuration options are:
 
-    nats.js.consumer.delete(client, streamName, durableName) - This function deletes a JetStream consumer with the given durable name from the specified stream.
+- `verbose(b)`: Enables or disables verbose mode.
+- `headers(b)`: Enables or disables header encoding and decoding.
+- `pedantic(b)`: Enables or disables pedantic mode.
+- `tls_required(b)`: Enables or disables TLS requirement.
+- `user(s)`: Sets the username for authentication.
+- `pass(s)`: Sets the password for authentication.
+- `auth_token(s)`: Sets the authentication token.
+- `name(s)`: Sets the client name.
+- `sig(s)`: Sets the client signature.
+- `jwt(s)`: Sets the JWT authentication token.
+- `nkey(s)`: Sets the NKEY authentication token.
+- `protocol(s)`: Sets the protocol version.
 
-    nats.js.publish(client, streamName, payload) - This function publishes a message to a specific JetStream stream.
+### Error Handling
 
-    nats.js.info(client, streamName) - This function fetches and returns information about a specific JetStream stream.
+If an error occurs during the execution of the client, the `error` method of the client object is called. You can override this method to handle errors according to your needs.
 
-    nats.js.consumer.info(client, streamName, consumerName) - This function fetches and returns information about a specific JetStream consumer from a given stream.
+### Server Information
 
-    nats.js.nextmsg(client, streamName, consumerName) - This function fetches the next message from a specific JetStream consumer from a given stream.
+To retrieve the server information, you can use the `server_info` method of the client object. It returns a table containing the server information.
 
-    nats.js.ackmsg(client, subject) - This function acknowledges receipt of a message with the given subject.
+```lua
+local info = client:server_info()
+```
 
-    nats.js.streams(client) - This function fetches and returns a list of all JetStream streams.
+### Shutting Down
 
-    nats.js.consumers(client, streamName) - This function fetches and returns a list of all JetStream consumers in a given stream.
+To gracefully shut down the client and close the connection to the server, you can use the `shutdown` method of the client object:
 
-    nats.js.update(client, streamName, configuration) - This function updates the configuration of a specific JetStream stream.
+```lua
+client:shutdown()
+```
+
+This ensures that any pending operations are completed and the connection is closed.
+
+### Example
+
+Here's an example usage of the lua-nats library:
+
+```lua
+local nats = require('lua-nats')
+
+local client = nats.connect({
+  host = '127.0.0.1',
+  port = 4222
+})
+
+client:connect()
+
+local sid = client:subscribe('my.subject', function(message, reply, subject, sid)
+  print('Received message:', message)
+end)
+
+client:publish('my.subject', 'Hello, NATS!')
+
+client:wait()
+
+client:unsubscribe(sid)
+
+client:shutdown()
+```
+
+This example establishes a connection to a NATS server, subscribes to a subject, publishes a message, waits for incoming messages, unsubscribes from the subject, and shuts down the client.
+
+### License
+
+lua-nats is released under the MIT License.
