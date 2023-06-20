@@ -16,7 +16,7 @@ nats.client_metatable = {
 	__call = function(self, ...) return	end,
 	methods = {},
 	lang = 'lua',
-	version = nats._VERSION,
+	version = '0.1.1',
 }
 
 -- ### Library requirements ###
@@ -24,7 +24,7 @@ local cjson  = require('cjson')
 local uuid   = require('uuid')
 
 -- ### Local properties / vars ###
-local unpack = _G.unpack or table.unpack
+local insert, concat = table.insert, table.concat
 local type = type
 local encode, decode = cjson.encode, cjson.decode
 local floor = math.floor
@@ -88,10 +88,23 @@ local function create_client(socket, config)
 	return client
 end
 
+local function toHEX(s)
+	local hexString, byteValue = ""
+	for i = 1, #s do
+		byteValue = string.byte(s, i)
+		hexString = hexString .. string.format("%02X ", byteValue)
+	end
+	return hexString
+end
+
+
+local function encode_header(t) return concat({t[1],': ',t[2],'\r\n'}) end
+
+local function decoded_header(s) return s:match("([^:]+):%s*(.+)") end
 
 -- ### Network methods ###
 function network.write(client, buffer)
-	if client.config.trace then print('->> '..buffer:sub(1,-3)) end -- YUK! FIX THIS SOME HOW!
+	if client.config.trace then print('->> '..buffer) end -- YUK! FIX THIS SOME HOW!
 	local _, err = client.network.socket:send(client.encoder(buffer))
 	if not err then client.network.lwrite = buffer
 	else client.error(err) end
@@ -189,7 +202,7 @@ local response_read = response.read
 function request.raw(client, buffer)
 	local bufferType = type(buffer)
 	if bufferType == 'string' then network_write(client, buffer)
-	elseif bufferType == 'table' then network_write(client, table.concat(buffer))
+	elseif bufferType == 'table' then network_write(client, concat(buffer))
 	else client.error('argument error: ' .. bufferType) end
 end
 local request_raw = request.raw
@@ -332,25 +345,65 @@ end
 
 function cm.publish(client, subject, payload, reply)
 	payload = client.encoder(payload or "")
-	reply = reply and ' ' .. reply or ''
-	request_raw(client, {
-		'PUB '..subject..reply..' '..#payload..'\r\n',
-		payload..'\r\n',
-		})
+	
+	-- create send table for message string
+	local st = {'PUB '}
+	insert(st, subject)
+	insert(st, ' ')
+	if reply then
+		insert(st, reply)
+		insert(st, ' ')
+	end
+	insert(st, #payload)
+	insert(st, '\r\n')
+	
+	insert(st, payload)
+	insert(st, '\r\n')
+	
+	request_raw(client, st)
 end
 
-function cm.publish_whead(client, subject, payload, headers, reply)
-	payload = client.encoder(payload or "")
-	headers = headers or ""
-	reply = reply and ' ' .. reply or ''
-	request_raw(client, {
-		'HPUB '..subject..reply..' '..#headers..' '..#payload..'\r\n',
-		'\r\n\r\n',
-		payload..'\r\n',
-		})
-end
+function cm.h_publish(client, subject, payload, reply, headers)
+	payload = client.encoder(payload or '')
 
--- HPUB <subject> [reply-to] <#header bytes> <#total bytes>␍␊[headers]␍␊␍␊[payload]␍␊
+	if type(headers) == "table" then
+		local tht = {'NATS/1.0\r\n'}
+		for k,v in pairs(headers) do
+			insert(tht, encode_header({k,v}))
+		end
+		insert(tht, '\r\n')
+		headers = concat(tht)
+	end
+	-- create table for message string
+	local st = {'HPUB '}
+	insert(st, subject)
+	insert(st, ' ')
+	-- if reply insert
+	if reply then
+		insert(st, reply)
+		insert(st, ' ')
+	end
+	-- header handling if nil
+	if headers and #headers > 0 then
+	else headers = '' end
+	-- finish up the op string
+	insert(st, #headers)
+	insert(st, ' ')
+	insert(st, (#payload + #headers))
+	insert(st, '\r\n')
+	-- insert headers
+	insert(st, headers)
+	-- insert payload
+	insert(st, payload)
+	insert(st, '\r\n')
+	
+	-- print(#headers .. ':' .. #payload .. ':' .. #headers + #payload)
+	
+	-- printTable(st)
+	-- print(toHEX(concat(st)))
+	
+	request_raw(client, st)
+end
 
 function cm.wait(client, maxcount)
 	local count, data = 0

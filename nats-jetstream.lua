@@ -36,10 +36,8 @@ local con = consumer_metatable.methods -- consumer
 function cm.stream(client, stream_name, subjects)
 	-- test and adjust subjects so string or table can be passed.
 	-- Only leaky part is 'true' being converted but meh.
-	if subjects then
-		if type(subject) ~= "table" then subjects = {tostring(subjects)} end
-	end
-
+	if subjects and type(subject) ~= "table" then subjects = {tostring(subjects)} end
+	
 	local data = decode(client:get('$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects })))
 	if data.error then return false, data end
 
