@@ -3,7 +3,6 @@ local nats = nats or require('nats')
 nats.jetstream = {}
 
 -- ### Library requirements ###
-
 local cjson  = require('cjson')
 local uuid   = require('uuid')
 
@@ -197,6 +196,8 @@ function js.snapshot.read(stream, delievery_subject)
 	stream.client:unsubscribe(unique_id) -- unsubscribe from the delivery subject
 	return table.concat(snapshot) -- concatenate the chunks to form the complete snapshot
 end
+
+return nats
 
 -- function js.template.create(client, template_name, config)
 	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.CREATE.' .. template_name .. ' \r\n' .. encode(config) .. '\r\n')

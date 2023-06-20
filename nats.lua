@@ -1,5 +1,5 @@
 local nats = {
-	_VERSION	 = 'lua-nats 0.1.1',
+	_VERSION	 = 'lua-nats 0.1.2',
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'based off Eric Pinto lua-nats 0.0.2 - Copyright (C) Sam Orlando 2023',
 	network = {}, -- network functions
@@ -7,11 +7,10 @@ local nats = {
 	response = {}, -- response handing (from server)
 }
 
--- todo - convert all string concat to tables
 -- fix options to be pure in submit to server CONNECT
 -- todo - make encoded connection a seperate object
 -- todo - support verbose mode natively to nats-lua
--- todo - header encoding and decoding option
+-- todo - header encoding and decoding options
 -- todo - protocol setting in CONNECT (confirm dynamic INFO adjustments in client)
 
 nats.client_metatable = {
@@ -19,7 +18,7 @@ nats.client_metatable = {
 	__call = function(self, ...) return	end,
 	methods = {},
 	lang = 'lua',
-	version = '0.1.1',
+	version = '0.1.2',
 }
 
 -- ### Library requirements ###
@@ -28,6 +27,7 @@ local uuid   = require('uuid')
 --local ssl = require('ssl') TLS SUPPORT
 
 -- ### Local properties / vars ###
+local verbose = false -- (false or nil for off) levels 1-5
 local insert, concat = table.insert, table.concat
 local type = type
 local floor, tonumber = math.floor, tonumber
@@ -35,7 +35,7 @@ local encode, decode = cjson.encode, cjson.decode
 local network, response, request = nats.network, nats.response, nats.request
 local client_prototype, client_metatable = nats.client_prototype, nats.client_metatable
 
-local valid_config_toggles = {verbose=true,headers=true,trace=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
+local valid_config_toggles = {verbose=true,headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
 local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true,protocol=true}
 
 local connect_defaults = {
@@ -54,17 +54,25 @@ local function merge_defaults(parameters)
 	return parameters
 end
 
+local function toHEX(s)
+	local hexString, byteValue = ""
+	for i = 1, #s do
+		byteValue = string.byte(s, i)
+		hexString = hexString .. string.format("%02X ", byteValue)
+	end
+	return hexString
+end
+
 local function create_client(socket, config)
 	local client = setmetatable({}, client_metatable)
 	-- defaults
 	client.config = {
 		user = nil,
 		pass = nil,
+		no_responders = false,
 		verbose = false,
 		protocol = 1,
 		pedantic = false,
-		trace = false, -- make take out of config for speed considerations -- not offical - FIX
-		reconnect = true, -- not used or documented as real client config value in connect
 		tls_required = false,
 	}
 	
@@ -104,7 +112,10 @@ local function decode_headers(s) return s:match("([^:]+):%s*(.+)") end
 
 -- ### Network methods ###
 function network.write(client, buffer)
-	if client.config.trace then print('->> '..buffer) end -- YUK! FIX THIS SOME HOW!
+	if verbose then
+		if verbose > 0 then print('->> '..buffer:sub(1,-3)) end
+		if verbose > 1 then print(toHEX(buffer)) end
+	end
 	local _, err = client.network.socket:send(client.encoder(buffer))
 	if not err then client.network.lwrite = buffer
 	else client.error(err) end
@@ -114,7 +125,10 @@ local network_write = network.write
 function network.read(client, len)
 	if len == nil then len = '*l' end
 	local line, err = client.network.socket:receive(len)
-	if client.config.trace then print('<<- '..(line or "")) end -- YUK # 2
+	if verbose then
+		if verbose > 0 then print('<<- '..line) end
+		if verbose > 1 then print(toHEX(line)) end
+	end
 	if not err then
 		client.network.lread = line
 		return line
@@ -124,42 +138,50 @@ local network_read = network.read
 
 -- ### Response methods ###
 response.methods = {
-	INFO = function(s, client) return {action=s[1],content=s[2]} end,
-	PING = function(s) return {action=s[1]} end,
-	PONG = function(s) return {action=s[1]} end,
+	INFO = function(s, client) return {op=s[1],payload=s[2]} end,
+	PING = function(s) return {op=s[1]} end,
+	PONG = function(s) return {op=s[1]} end,
 	MSG = function(s, client)
-		local data = {
-			action = s[1],
-			subject = s[2],
-			sid = s[3]
-		}
-		-- ask for line ending chars and remove them
-		if #s == 4 then
-			data.content = network_read(client, s[4]+2):sub(1, -3)
-		else
-			data.reply = s[4]
-			data.content = network_read(client, s[5]+2):sub(1, -3)
+		local data
+		if #s > 4 then
+			data = {
+				op = s[1],
+				subject = s[2],
+				sid = s[3],
+				reply = s[4],
+				size = s[5],
+			}
+		else 
+			data = {
+				op = s[1],
+				subject = s[2],
+				sid = s[3],
+				size = s[4],
+			}
 		end
+		
+		data.payload = network_read(client)
+		
 		return data
 	end,
 	HMSG = function(s, client)
 		local data
 		if #s > 5 then
 			data = {
-				action = s[1],
+				op = s[1],
 				subject = s[2],
 				sid = s[3],
 				reply = s[4],
 				header_size = s[5],
-				total_size = s[6],
+				size = s[6],
 			}
 		else 
 			data = {
-				action = s[1],
+				op = s[1],
 				subject = s[2],
 				sid = s[3],
 				header_size = s[4],
-				total_size = s[5],
+				size = s[5],
 			}
 		end
 		
@@ -175,10 +197,10 @@ response.methods = {
 			end
 		end
 		
-		data.content = network_read(client)
+		data.payload = network_read(client)
 		return data
 	end,
-	["+OK"] = function(s) return {action=s[1]} end,
+	["+OK"] = function(s) return {op=s[1]} end,
 }
 local response_methods = response.methods
 
@@ -189,11 +211,8 @@ function response.read(client)
 
 	for slice in payload:gmatch('[^%s]+') do insert(slices, slice) end
 
-	if slices[1] and response_methods[slices[1]] then
-		return response_methods[slices[1]](slices, client)
-	else
-		return {action = "-ERR", content = payload}
-	end
+	if slices[1] and response_methods[slices[1]] then return response_methods[slices[1]](slices, client)
+	else return {op = "-ERR", payload = payload} end
 end
 local response_read = response.read
 
@@ -305,53 +324,68 @@ local create_inbox = nats.create_inbox -- vroom
 -- ### NATS Client Methods ###
 local cm = nats.client_metatable.methods
 function cm.connect(client)
-	request_raw(client, 'CONNECT '..encode(client.config)..'\r\n')
+	request_raw(client, {'CONNECT ',encode(client.config),'\r\n'})
 
 	-- gather the server information
 	local data = response_read(client)
-	if data.action == 'INFO' then
-		client.information = decode(data.content)
+	if data.op == 'INFO' then
+		client.information = decode(data.payload)
 	end
 end
 
 function cm.ping(client)
 	request_raw(client, 'PING\r\n')
 	local data = response_read(client)
-	if data.action == 'PONG' then return true end
+	if data.op == 'PONG' then return true end
 	return false
 end
 
 function cm.pong(client) request_raw(client, 'PONG\r\n') end
 
-function cm.request(client, subject, payload, callback)
-	local inbox = create_inbox()
-	callback = callback or function() end
-	local sid = client:subscribe(inbox, function(message, reply)
-		client:unsubscribe(sid)
-		callback(client.decoder(message), reply)
-	end)
-	client:publish(subject, client.encoder(payload), inbox)
-	return sid, inbox
-end
-
-function cm.get(client, subject, payload)
+-- we may have to have handlers or a wait system that offers breakoffs
+function cm.request(client, subject, payload, headers)
 	local inbox = create_inbox()
 	local sid = cm.subscribe(client, inbox, function(message, reply) cm.unsubscribe(client, sid) end)
-	cm.publish(client, subject, client.encoder(payload), inbox)
+	
+	if headers then cm.h_publish(client, subject, client.encoder(payload), inbox, headers)
+	else cm.publish(client, subject, client.encoder(payload), inbox, headers) end
+	
 	local data = response_read(client)
-	if data.action == '-ERR' then client.error('Client Error: ' .. (data.content or 'unknown error')) end
-	return client.decoder(data.content)
+	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
+	return data
+end
+
+-- wait/read/sync issues? return?
+function cm.get(client, subject, payload, headers)
+	local inbox = create_inbox()
+	local sid = cm.subscribe(client, inbox, function(message, reply) cm.unsubscribe(client, sid) end)
+	
+	if headers then cm.h_publish(client, subject, client.encoder(payload), inbox, headers)
+	else cm.publish(client, subject, client.encoder(payload), inbox, headers) end
+	
+	local data = response_read(client)
+	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
+	return client.decoder(data.payload)
 end
 
 function cm.subscribe(client, subject, callback, queue)
 	local sid = uuid()
-	request_raw(client, 'SUB ' .. subject .. (queue and ' ' .. queue or '') .. ' ' .. sid .. '\r\n')
+	
+	local st = {'SUB ', subject, ' '}
+	if queue then
+		insert(st, queue)
+		insert(st, ' ')
+	end
+	insert(st, sid)
+	insert(st, '\r\n')
+	
+	request_raw(client, st)
 	client.subscriptions[sid] = callback
 	return sid
 end
 
 function cm.unsubscribe(client, sid)
-	request_raw(client, 'UNSUB '..sid..'\r\n')
+	request_raw(client, {'UNSUB ', sid, '\r\n'})
 	client.subscriptions[sid] = nil
 end
 
@@ -359,13 +393,13 @@ function cm.publish(client, subject, payload, reply)
 	payload = client.encoder(payload or "")
 	
 	-- create send table for message string
-	local st = {'PUB '}
-	insert(st, subject)
-	insert(st, ' ')
+	local st = {'PUB ', subject, ' '}
+
 	if reply then
 		insert(st, reply)
 		insert(st, ' ')
 	end
+
 	insert(st, #payload)
 	insert(st, '\r\n')
 	
@@ -387,9 +421,7 @@ function cm.h_publish(client, subject, payload, reply, headers)
 		headers = concat(tht)
 	end
 	-- create table for message string
-	local st = {'HPUB '}
-	insert(st, subject)
-	insert(st, ' ')
+	local st = {'HPUB ', subject, ' '}
 	-- if reply insert
 	if reply then
 		insert(st, reply)
@@ -403,7 +435,7 @@ function cm.h_publish(client, subject, payload, reply, headers)
 	insert(st, ' ')
 	insert(st, (#payload + #headers))
 	insert(st, '\r\n')
-	-- insert headers
+		-- insert headers
 	insert(st, headers)
 	-- insert payload
 	insert(st, payload)
@@ -417,22 +449,22 @@ function cm.wait(client, maxcount)
 	
 	while true do
 		data = response_read(client)
-		action = data.action
+		op = data.op
 		
-		if action == 'MSG' or action == 'HMSG' then
+		if op == 'MSG' or op == 'HMSG' then
 			count = count + 1
-			client.subscriptions[data.sid](client.decoder(data.content), data.reply, data.subject, data.sid, data.headers)
-		elseif action == 'PING' then cm.pong(client)
-		elseif action == 'INFO' then
-			-- client.information = decode(data.content) -- notsure if this will overwrite, so lets be safe...
-			for k,v in pairs(decode(data.content) or {}) do client.information[k] = v end
+			client.subscriptions[data.sid](client.decoder(data.payload), data.reply, data.subject, data.sid, data.headers)
+		elseif op == 'PING' then cm.pong(client)
+		elseif op == 'INFO' then
+			-- client.information = decode(data.payload) -- notsure if this will overwrite, so lets be safe...
+			for k,v in pairs(decode(data.payload) or {}) do client.information[k] = v end
 		end
 		if maxcount and count > maxcount then return end
 	end
 	return
 end
 
-function cm.raw(client, buffer)
+function cm.request_raw(client, buffer)
 	request_raw(client, buffer)
 	return response_read(client)
 end
