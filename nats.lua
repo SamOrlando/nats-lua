@@ -2,6 +2,7 @@ local nats = {
 	_VERSION	 = 'lua-nats 0.1.2',
 	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
 	_COPYRIGHT   = 'slightly based off Eric Pinto lua-nats 0.0.2 - Copyright (C) Sam Orlando 2023',
+	verbose = false,
 	network = {}, -- network functions
 	request = {}, -- request handling (to server)
 	response = {}, -- response handing (from server)
@@ -26,7 +27,7 @@ local uuid   = require('uuid')
 local ssl = require('ssl')
 
 -- ### Local properties / vars ###
-local verbose = false -- (false or nil for off) levels 1-5
+local verbose = nats.verbose -- (false or nil for off) levels 1-5
 local insert, concat = table.insert, table.concat
 local type = type
 local floor, tonumber = math.floor, tonumber
@@ -212,6 +213,8 @@ local response_methods = response.methods
 
 function response.read(client)
 	local payload = network_read(client)
+	if not payload then return end -- nonblocking move on
+	
 	local slices  = {}
 	local data	= {}
 
@@ -302,6 +305,13 @@ function nats.client(opts, host, port, timeout)
 	local network_parms = { host = host, port = port, timeout = tonumber(timeout), tls_required = opt_t.tls_required}
 	
 	return create_client(opt_t, network_parms)
+end
+
+function nats.verbose_level(v)
+	if v ~= nil then
+		nats.verbose = tonumber(v) or nil
+		verbose = nats.verbose -- local reassign
+	else return nats.verbose end
 end
 
 -- i hate this thing
@@ -473,6 +483,8 @@ function cm.wait(client, maxcount, timeout)
 		end
 
 		data = response_read(client)
+		if not data then return end
+		
 		op = data.op
 		
 		if op == 'MSG' or op == 'HMSG' then
