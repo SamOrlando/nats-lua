@@ -37,8 +37,8 @@ function cm.stream(client, stream_name, subjects)
 	-- Only leaky part is 'true' being converted but meh.
 	if subjects and type(subject) ~= "table" then subjects = {tostring(subjects)} end
 	
-	local data = decode(client:get('$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects })))
-	if data.error then return false, data end
+	local msg = decode(client:get('$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects })))
+	if msg.error then return false, msg end
 
 	-- create and set stream object
 	local stream = setmetatable({}, stream_metatable)
@@ -51,23 +51,23 @@ function cm.stream(client, stream_name, subjects)
 	client.streams = client.streams or {}
 	client.streams[stream_name] = subjects
 	
-	return stream, data
+	return stream, msg
 end
 
 function js.delete(stream) -- we will need two of them for cm and js
 	-- make request
-	local data = decode(stream.client:get('$JS.API.STREAM.DELETE.' .. stream.name))
-	if data.error then return false, data end
+	local msg = decode(stream.client:get('$JS.API.STREAM.DELETE.' .. stream.name))
+	if msg.error then return false, msg end
 	
 	-- delete client objects stream listing and the object
 	stream.client.streams[stream.name] = nil
 	stream = nil
-	return true, data
+	return true, msg
 end
 
 function js.consumer(stream, consumer_name, config)
-	local data = decode(stream.client:get('$JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name})))
-	if data.error then return false, data end
+	local msg = decode(stream.client:get('$JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name})))
+	if msg.error then return false, msg end
 
 	-- create and set consumer object
 	local consumer = setmetatable({}, consumer_metatable)
@@ -79,16 +79,16 @@ function js.consumer(stream, consumer_name, config)
 	-- insert consumer info into stream table
 	stream.consumers[consumer_name] = config
 	
-	return consumer, data
+	return consumer, msg
 end
 
 function con.delete(consumer)
-	local data = decode(consumer.client:get('$JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name))
-	if data.error then return false, data end
+	local msg = decode(consumer.client:get('$JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name))
+	if msg.error then return false, msg end
 	-- delete references
 	consumer.stream[consumer.name] = nil
 	consumer = nil
-	return true, data
+	return true, msg
 end
 
 function js.publish(stream, subject, payload)
@@ -97,66 +97,68 @@ function js.publish(stream, subject, payload)
 end
 
 function js.info(stream)
-	local data = decode(stream.client:get('$JS.API.STREAM.INFO.' .. stream.name))
-	if data.error then return false, data end
-	return data
+	local msg = decode(stream.client:get('$JS.API.STREAM.INFO.' .. stream.name))
+	if msg.error then return false, msg end
+	return msg
 end
 
 function con.info(consumer)
-	local data = decode(consumer.client:get('$JS.API.CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name))
-	if data.error then return false, data end
-	return data
+	local msg = decode(consumer.client:get('$JS.API.CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name))
+	if msg.error then return false, msg end
+	return msg
 end
 
 function con.nextmsg(consumer)
-	local data = decode(consumer.client:get('$JS.API.CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name))
-	if data.error then return false, data end
-	return data
+	local msg = decode(consumer.client:get('$JS.API.CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name))
+	if msg.error then return false, msg end
+	return msg
 end
 
 function cm.stream_list(client)
-	local data = decode(client:get("$JS.API.STREAM.LIST"))
-	if data.error then return false, data end
-	return data
+	local msg = decode(client:get("$JS.API.STREAM.LIST"))
+	if msg.error then return false, msg end
+	return msg
 end
 
 function js.consumer_list(stream)
-	local data = decode(stream.client:get('$JS.API.CONSUMER.LIST.' .. stream.name))
-	if data.error then return false, data end
-	return data
+	local msg = decode(stream.client:get('$JS.API.CONSUMER.LIST.' .. stream.name))
+	if msg.error then return false, msg end
+	return msg
 end
 
 function js.update(stream, configuration)
 	local configJson = encode(configuration)
-	local data = decode(stream.client:get('$JS.API.STREAM.UPDATE.' .. stream.name, configJson))
-	if data.error then return false, data end
-	return true, data
+	local msg = decode(stream.client:get('$JS.API.STREAM.UPDATE.' .. stream.name, configJson))
+	if msg.error then return false, msg end
+	return true, msg
 end
 
 function con.update(consumer, configuration)
 	local configJson = encode(configuration)
-	local data = decode(consumer.client:get('$JS.API.CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name, configJson))
-	if data.error then return false, data end
-	return true, data
+	local msg = decode(consumer.client:get('$JS.API.CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name, configJson))
+	if msg.error then return false, msg end
+	return true, msg
 end
 
 function js.replay(stream, msg_sequence)
-	local data = decode(stream.client:get('$JS.API.STREAM.MSG.GET.' .. stream.name, msg_sequence))
-	if data.error then return false, data end
-	return data
+	local msg = decode(stream.client:get('$JS.API.STREAM.MSG.GET.' .. stream.name, msg_sequence))
+	if msg.error then return false, msg end
+	return msg
 end
 
 function js.remove(stream, msg_sequence)
-	local data = decode(stream.client:get('$JS.API.STREAM.MSG.DELETE.' .. stream.name, msg_sequence))
-	if data.error then return false, data end
-	return true, data
+	local msg = decode(stream.client:get('$JS.API.STREAM.MSG.DELETE.' .. stream.name, msg_sequence))
+	if msg.error then return false, msg end
+	return true, msg
 end
 
 function js.purge(stream)
-	local data = decode(stream.client:get('$JS.API.STREAM.PURGE.' .. stream.name))
-	if data.error then return false, data end
-	return true, data
+	local msg = decode(stream.client:get('$JS.API.STREAM.PURGE.' .. stream.name))
+	if msg.error then return false, msg end
+	return true, msg
 end
+
+--fix below
 
 js.snapshot = {}
 function js.snapshot.create(stream, config)

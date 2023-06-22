@@ -32,7 +32,7 @@ local type = type
 local floor, tonumber = math.floor, tonumber
 local encode, decode = cjson.encode, cjson.decode
 local network, response, request = nats.network, nats.response, nats.request
-local client_prototype, client_metatable = nats.client_prototype, nats.client_metatable
+local client_metatable = nats.client_metatable
 
 local valid_config_toggles = {verbose=true,headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
 local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true,protocol=true}
@@ -47,13 +47,13 @@ local connect_defaults = {
 }
 
 -- ### Local methods ### -- fix for false boolean handling
-local function merge_defaults(parameters)
-	parameters = parameters or {}
-	for k, v in pairs(connect_defaults) do parameters[k] = parameters[k] or connect_defaults[k] end
-	return parameters
+local function merge_defaults(parms)
+	parms = parms or {}
+	for k, v in pairs(connect_defaults) do parms[k] = parms[k] or connect_defaults[k] end
+	return parms
 end
 
-local function toHEX(s)
+local function toHEX(s) -- for debuging when js was mean on headers
 	local hexString, byteValue = ""
 	for i = 1, #s do
 		byteValue = string.byte(s, i)
@@ -62,45 +62,42 @@ local function toHEX(s)
 	return hexString
 end
 
-local function create_client(socket, config)
-	local client = setmetatable({}, client_metatable)
+local function create_client(config, net_parms)
 	-- defaults
-	client.config = {
-		user = nil,
-		pass = nil,
-		no_responders = false,
-		verbose = false,
-		protocol = 1,
-		pedantic = false,
-		tls_required = false,
-	}
+	local client = setmetatable({
+			connected = false,
+			subscriptions = {},
+			information = {},
+			config = {
+				user = nil,
+				pass = nil,
+				no_responders = false,
+				verbose = false,
+				protocol = 1,
+				pedantic = false,
+				tls_required = false,
+			},
+			network = {
+				-- socket = socket,
+				read   = network.read,
+				write  = network.write,
+				lread  = nil,
+				lwrite = nil,
+				parms = net_parms,
+			},
+			encoder = function(m) return m end, -- default passthrough
+			decoder = function(m) return m end, -- default passthrough
+			error = nats.error,
+	}, client_metatable)
 	
 	for k,v in pairs(config or {}) do client.config[k] = v end	
 
-	client.subscriptions = {}
-	client.information = {}
-	
 	-- en/decoder handler option for each client (local funcs for lazy)
-	client.encoder = function(m) return m end -- default passthrough
-	client.decoder = function(m) return m end -- default passthrough
-	
 	if client.config.headers then
 		client.header_encoder = function(m) return m end
 		client.header_decoder = function(m) return m end
 	end
-	
-	-- assign client error handler
-	client.error = nats.error
 
-	-- assign client network methods
-	client.network = {
-		socket = socket,
-		read   = network.read,
-		write  = network.write,
-		lread  = nil,
-		lwrite = nil,
-	}
-	
 	uuid.seed()
 	return client
 end
@@ -109,6 +106,7 @@ local function encode_header(t) return concat({t[1],': ',t[2],'\r\n'}) end
 
 local function decode_headers(s) return s:match("([^:]+):%s*(.+)") end
 
+
 -- ### Network methods ###
 function network.write(client, buffer)
 	if verbose then
@@ -116,24 +114,33 @@ function network.write(client, buffer)
 		if verbose > 1 then print(toHEX(buffer)) end
 	end
 	local _, err = client.network.socket:send(client.encoder(buffer))
-	if not err then client.network.lwrite = buffer
-	else client.error(err) end
+	if err then
+		client.error('connection error: ' .. err)
+	else client.network.lwrite = buffer end
 end
 local network_write = network.write
 
 function network.read(client, len)
 	if len == nil then len = '*l' end
 	local line, err = client.network.socket:receive(len)
-	if verbose then
-		if verbose > 0 then print('<<- '..line) end
-		if verbose > 1 then print(toHEX(line)) end
-	end
-	if not err then
+	if err then
+		if err == "timeout" then return
+		elseif err == "closed" then
+			client.connected = false
+			return
+		end
+		client.error('connection error: ' .. err)
+	else
 		client.network.lread = line
+		if verbose then
+			if verbose > 0 then print('<<- '..line) end
+			if verbose > 1 then print(toHEX(line)) end
+		end
 		return line
-	else client.error('connection error: ' .. err) end
+	end
 end
 local network_read = network.read
+
 
 -- ### Response methods ###
 response.methods = {
@@ -226,18 +233,18 @@ end
 local request_raw = request.raw
 
 -- ### Socket connection methods ###
-local function connect_tcp(socket, parameters)
-	local host, port = parameters.host, tonumber(parameters.port)
-	if parameters.timeout then socket:settimeout(parameters.timeout, 't') end
+local function connect_tcp(socket, parms)
+	local host, port = parms.host, tonumber(parms.port)
+	if parms.timeout then socket:settimeout(parms.timeout, 't') end
 
 	local ok, err = socket:connect(host, port)
 	if not ok then
 		nats.error('could not connect to '..host..':'..port..' ['..err..']')
 	end
 
-	socket:setoption('tcp-nodelay', parameters.tcp_nodelay)
+	socket:setoption('tcp-nodelay', parms.tcp_nodelay)
 
-	if parameters.tls_required then
+	if parms.tls_required then
          local tls_params = {
             mode = "client",
             protocol = "tlsv1_2",
@@ -252,30 +259,25 @@ local function connect_tcp(socket, parameters)
 	return socket
 end
 
-local function connect_unix(socket, parameters)
-	local ok, err = socket:connect(parameters.path)
+local function connect_unix(socket, parms)
+	local ok, err = socket:connect(parms.path)
 	if not ok then
-		nats.error('could not connect to '..parameters.path..' ['..err..']')
+		nats.error('could not connect to '..parms.path..' ['..err..']')
 	end
 	return socket
 end
 
-local function create_connection(parameters)
-	if parameters.socket then return parameters.socket end
-	local perform_connection, socket
+local function create_connection(parms)
+	local connect_func, socket
 
-	if parameters.scheme == 'unix' then
-		perform_connection, socket = connect_unix, require('socket.unix')
+	if parms.unix then
+		connect_func, socket = connect_unix, require('socket.unix')
 		assert(socket, 'your build of LuaSocket does not support UNIX domain sockets')
 	else
-		if parameters.scheme then
-			local scheme = parameters.scheme
-			assert(scheme == 'nats' or scheme == 'tcp', 'invalid scheme: '..scheme)
-		end
-		perform_connection, socket = connect_tcp, require('socket').tcp
+		connect_func, socket = connect_tcp, require('socket').tcp
 	end
 	
-	return perform_connection(socket(), parameters)
+	return connect_func(socket(), parms)
 end
 
 -- ### Nats library methods ###
@@ -297,12 +299,12 @@ function nats.client(opts, host, port, timeout)
 		if (valid_config_toggles[k] or valid_config_strings[k]) then opt_t[k] = v end
 	end
 	
-	local nparms = { host = host, port = port, timeout = tonumber(timeout), tls_required = opt_t.tls_required}
+	local network_parms = { host = host, port = port, timeout = tonumber(timeout), tls_required = opt_t.tls_required}
 	
-	local socket = create_connection(merge_defaults(nparms))
-	return create_client(socket, opt_t)
+	return create_client(opt_t, network_parms)
 end
 
+-- i hate this thing
 function nats.connect(...)
 	local args, parameters = {...}, nil
 
@@ -312,8 +314,8 @@ function nats.connect(...)
 		parameters = { host = host, port = port, timeout = tonumber(timeout) }
 	end
 
-	local socket = create_connection(merge_defaults(parameters))
-	return create_client(socket)
+	local client = create_client(socket, nil, parameters)
+	client:connect()
 end
 
 -- Create a properly formatted inbox subject.
@@ -323,13 +325,19 @@ local create_inbox = nats.create_inbox -- vroom
 -- ### NATS Client Methods ###
 local cm = nats.client_metatable.methods
 function cm.connect(client)
+	if not client.connected then 
+		client.network.socket = create_connection(merge_defaults(client.network.parms))
+		if not client.network.socket then client.error("Unable to connect socket.") end
+	end
+	
 	request_raw(client, {'CONNECT ',encode(client.config),'\r\n'})
 
 	-- gather the server information
 	local data = response_read(client)
 	if data.op == 'INFO' then
-		client.information = decode(data.payload)
+		client.information = data.payload
 	end
+	client.connected = true
 end
 
 function cm.ping(client)
@@ -346,25 +354,35 @@ function cm.request(client, subject, payload, headers)
 	local inbox = create_inbox()
 	local sid = cm.subscribe(client, inbox, function(message, reply) cm.unsubscribe(client, sid) end)
 	
-	if headers then cm.h_publish(client, subject, client.encoder(payload), inbox, headers)
-	else cm.publish(client, subject, client.encoder(payload), inbox, headers) end
+	cm.publish(client, subject, client.encoder(payload), inbox, headers)
 	
 	local data = response_read(client)
 	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
 	return data
 end
 
+-- function cm.submit(client, subject, payload, headers, callback)
+	-- local inbox = create_inbox()
+	-- local sid = cm.subscribe(client, inbox, function(client, payload, reply, subject, sid, headers)
+		-- callback(client, client.decoder(payload), reply, subject, sid, headers)
+		-- cm.unsubscribe(client, sid)
+	-- end)
+	
+	-- cm.publish(client, subject, client.encoder(payload), inbox, headers)
+	
+	-- return sid, inbox
+-- end
+
 -- wait/read/sync issues? return?
 function cm.get(client, subject, payload, headers)
 	local inbox = create_inbox()
 	local sid = cm.subscribe(client, inbox, function(message, reply) cm.unsubscribe(client, sid) end)
 	
-	if headers then cm.h_publish(client, subject, client.encoder(payload), inbox, headers)
-	else cm.publish(client, subject, client.encoder(payload), inbox, headers) end
-	
+	cm.publish(client, subject, client.encoder(payload), inbox, headers)
+		
 	local data = response_read(client)
 	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
-	return client.decoder(data.payload)
+	return data.payload
 end
 
 function cm.subscribe(client, subject, callback, queue)
@@ -444,10 +462,16 @@ function cm.h_publish(client, subject, payload, reply, headers)
 	request_raw(client, st)
 end
 
-function cm.wait(client, maxcount)
-	local count, data = 0
+function cm.wait(client, maxcount, timeout)
+	local count, socket, data = 0, client.network.socket
+	local last_timeout
 	
 	while true do
+		if timeout then
+			last_timeout = socket:gettimeout(timeout)
+			socket:settimeout(timeout)
+		end
+
 		data = response_read(client)
 		op = data.op
 		
@@ -459,6 +483,7 @@ function cm.wait(client, maxcount)
 			-- client.information = decode(data.payload) -- notsure if this will overwrite, so lets be safe...
 			for k,v in pairs(decode(data.payload) or {}) do client.information[k] = v end
 		end
+		
 		if maxcount and count > maxcount then return end
 	end
 	return
