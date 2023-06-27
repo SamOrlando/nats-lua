@@ -63,7 +63,7 @@ local function encode_headers(t)
 		insert(tht, '\r\n')
 		return concat(tht)
 	end
-	return t -- anything else? user messed up or compiled their own header string.
+	return t or "" -- anything else? user messed up or compiled their own header string.
 end
 
 local function decode_headers(s)
@@ -182,9 +182,11 @@ response.methods = {
 				size = s[4],
 			}
 		end
-		
-		data.payload = client.payload_decoder(network_read(client))
-		
+
+		local dpl = network_read(client) -- data_payload
+		local pds, payload = pcall(client.payload_decoder, dpl) -- payload_decoder_success
+		data.payload = (dpl ~= '') and (pds and payload or dpl) or ''
+
 		return data
 	end,
 	HMSG = function(s, client)
@@ -208,20 +210,20 @@ response.methods = {
 			}
 		end
 		
-		-- need to add header decoder and encoder options
 		local dheaders = ''
 		if tonumber(data.header_size) > 0 and network_read(client) == "NATS/1.0" then
-			local hread
-			while true do
-				hread = network_read(client)
-				if #hread == 0 then break
-				else dheaders = hread .. '\r\n' .. dheaders end
-			end
+		  local hread
+		  repeat
+			hread = network_read(client)
+			dheaders = hread .. '\r\n' .. dheaders
+		  until #hread == 0
 		end
-		
-		printTable(client)
 		data.headers = client.headers_decoder(dheaders) or dheaders 
-		data.payload = client.payload_decoder(network_read(client))
+
+		local dpl = network_read(client) -- data_payload
+		local pds, payload = pcall(client.payload_decoder, dpl) -- payload_decoder_success
+		data.payload = (dpl ~= '') and (pds and payload or dpl) or ''
+
 		return data
 	end,
 	["+OK"] = function(s) return {op=s[1]} end,
@@ -423,8 +425,11 @@ end
 
 function cm.publish(client, subject, payload, reply, headers)
 	if headers then	return cm.h_publish(client, subject, payload, reply, headers) end
-	payload = client.payload_encoder(payload or "")
-	
+	if payload ~= nil then
+	  local s, encoded = pcall(client.payload_encoder, payload)
+	  payload = s and encoded or ""
+	else payload = "" end
+
 	-- create send table for message string
 	local st = {'PUB ', subject, ' '}
 
@@ -443,8 +448,11 @@ function cm.publish(client, subject, payload, reply, headers)
 end
 
 function cm.h_publish(client, subject, payload, reply, headers)
-	payload = client.payload_encoder(payload or '')
-	headers = client.headers_encoder(headers or '')
+	if payload ~= nil then
+	  local s, encoded = pcall(client.payload_encoder, payload)
+	  payload = s and encoded or ""
+	else payload = "" end
+	headers = client.headers_encoder(headers)
 	-- break out to headers decoder function
 	-- create table for message string
 	local st = {'HPUB ', subject, ' '}
