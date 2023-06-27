@@ -35,7 +35,7 @@ local encode, decode = cjson.encode, cjson.decode
 local network, response, request = nats.network, nats.response, nats.request
 local client_metatable = nats.client_metatable
 
-local valid_config_toggles = {verbose=true,headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
+local valid_config_toggles = {headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
 local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true,protocol=true}
 
 local connect_defaults = {
@@ -122,7 +122,6 @@ local function create_client(config, net_parms)
 	uuid.seed()
 	return client
 end
-
 
 
 -- ### Network methods ###
@@ -219,7 +218,9 @@ response.methods = {
 				else dheaders = hread .. '\r\n' .. dheaders end
 			end
 		end
-		data.headers = client.headers_decoder(dheaders) or dheaders
+		
+		printTable(client)
+		data.headers = client.headers_decoder(dheaders) or dheaders 
 		data.payload = client.payload_decoder(network_read(client))
 		return data
 	end,
@@ -396,7 +397,7 @@ function cm.get(client, subject, payload, headers)
 		
 	local data = response_read(client)
 	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
-	return client.payload_decoder(data.payload)
+	return data.payload
 end
 
 function cm.subscribe(client, subject, callback, queue)
