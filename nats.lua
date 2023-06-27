@@ -54,6 +54,30 @@ local function merge_defaults(parms)
 	return parms
 end
 
+local function encode_headers(t)
+	if type(t) == "table" then
+		local tht = {'NATS/1.0\r\n'}
+		for k,v in pairs(t) do
+			insert(tht, concat({k,': ',v,'\r\n'}))
+		end
+		insert(tht, '\r\n')
+		return concat(tht)
+	end
+	return t -- anything else? user messed up or compiled their own header string.
+end
+
+local function decode_headers(s)
+	local tbl = {}
+	for line in s:gmatch("(.-)\r\n") do
+		local k,v = line:match("(.-):%s*(.*)")
+		if k then tbl[k] = v end
+	end
+	return tbl
+end
+--s:match("([^:]+):%s*(.+)") end
+
+local function passthru_func(...) return unpack({...}) end
+
 local function toHEX(s) -- for debuging when js was mean on headers
 	local hexString, byteValue = ""
 	for i = 1, #s do
@@ -86,26 +110,19 @@ local function create_client(config, net_parms)
 				lwrite = nil,
 				parms = net_parms,
 			},
-			encoder = function(m) return m end, -- default passthrough
-			decoder = function(m) return m end, -- default passthrough
+			headers_encoder = encode_headers; -- if user wish to setup their own func, it will happen for MSG,HMSG,PUB
+			headers_decoder = decode_headers; -- i added default header handling if table is passed. It will compile a table unless you set as passthru_func
+			payload_encoder = passthru_func;
+			payload_decoder = passthru_func;
 			error = nats.error,
 	}, client_metatable)
 	
 	for k,v in pairs(config or {}) do client.config[k] = v end	
 
-	-- en/decoder handler option for each client (local funcs for lazy)
-	if client.config.headers then
-		client.header_encoder = function(m) return m end
-		client.header_decoder = function(m) return m end
-	end
-
 	uuid.seed()
 	return client
 end
 
-local function encode_header(t) return concat({t[1],': ',t[2],'\r\n'}) end
-
-local function decode_headers(s) return s:match("([^:]+):%s*(.+)") end
 
 
 -- ### Network methods ###
@@ -114,7 +131,7 @@ function network.write(client, buffer)
 		if verbose > 0 then print('->> '..buffer:sub(1,-3)) end
 		if verbose > 1 then print(toHEX(buffer)) end
 	end
-	local _, err = client.network.socket:send(client.encoder(buffer))
+	local _, err = client.network.socket:send(buffer)
 	if err then
 		client.error('connection error: ' .. err)
 	else client.network.lwrite = buffer end
@@ -167,7 +184,7 @@ response.methods = {
 			}
 		end
 		
-		data.payload = network_read(client)
+		data.payload = client.payload_decoder(network_read(client))
 		
 		return data
 	end,
@@ -192,19 +209,18 @@ response.methods = {
 			}
 		end
 		
+		-- need to add header decoder and encoder options
 		local dheaders = ''
 		if tonumber(data.header_size) > 0 and network_read(client) == "NATS/1.0" then
 			local hread
 			while true do
 				hread = network_read(client)
-				if #hread == 0 then
-					data.headers = dheaders:sub(3)
-					break
-				else dheaders = dheaders .. '\r\n' .. hread end
+				if #hread == 0 then break
+				else dheaders = hread .. '\r\n' .. dheaders end
 			end
 		end
-		
-		data.payload = network_read(client)
+		data.headers = client.headers_decoder(dheaders) or dheaders
+		data.payload = client.payload_decoder(network_read(client))
 		return data
 	end,
 	["+OK"] = function(s) return {op=s[1]} end,
@@ -364,35 +380,23 @@ function cm.request(client, subject, payload, headers)
 	local inbox = create_inbox()
 	local sid = cm.subscribe(client, inbox, function(message, reply) cm.unsubscribe(client, sid) end)
 	
-	cm.publish(client, subject, client.encoder(payload), inbox, headers)
+	cm.publish(client, subject, client.payload_encoder(payload), inbox, client.headers_encoder(headers)) --header encoder?
 	
 	local data = response_read(client)
 	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
+	
 	return data
 end
 
--- function cm.submit(client, subject, payload, headers, callback)
-	-- local inbox = create_inbox()
-	-- local sid = cm.subscribe(client, inbox, function(client, payload, reply, subject, sid, headers)
-		-- callback(client, client.decoder(payload), reply, subject, sid, headers)
-		-- cm.unsubscribe(client, sid)
-	-- end)
-	
-	-- cm.publish(client, subject, client.encoder(payload), inbox, headers)
-	
-	-- return sid, inbox
--- end
-
--- wait/read/sync issues? return?
 function cm.get(client, subject, payload, headers)
 	local inbox = create_inbox()
-	local sid = cm.subscribe(client, inbox, function(message, reply) cm.unsubscribe(client, sid) end)
-	
-	cm.publish(client, subject, client.encoder(payload), inbox, headers)
+	local sid = cm.subscribe(client, inbox, function() cm.unsubscribe(client, sid) end)
+
+	cm.publish(client, subject, client.payload_encoder(payload), inbox, client.headers_encoder(headers))
 		
 	local data = response_read(client)
 	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
-	return data.payload
+	return client.payload_decoder(data.payload)
 end
 
 function cm.subscribe(client, subject, callback, queue)
@@ -417,8 +421,8 @@ function cm.unsubscribe(client, sid)
 end
 
 function cm.publish(client, subject, payload, reply, headers)
-	if headers then	return cm.h_publish(lient, subject, payload, reply, headers) end
-	payload = client.encoder(payload or "")
+	if headers then	return cm.h_publish(client, subject, payload, reply, headers) end
+	payload = client.payload_encoder(payload or "")
 	
 	-- create send table for message string
 	local st = {'PUB ', subject, ' '}
@@ -438,16 +442,9 @@ function cm.publish(client, subject, payload, reply, headers)
 end
 
 function cm.h_publish(client, subject, payload, reply, headers)
-	payload = client.encoder(payload or '')
-
-	if type(headers) == "table" then
-		local tht = {'NATS/1.0\r\n'}
-		for k,v in pairs(headers) do
-			insert(tht, encode_header({k,v}))
-		end
-		insert(tht, '\r\n')
-		headers = concat(tht)
-	end
+	payload = client.payload_encoder(payload or '')
+	headers = client.headers_encoder(headers or '')
+	-- break out to headers decoder function
 	-- create table for message string
 	local st = {'HPUB ', subject, ' '}
 	-- if reply insert
@@ -472,14 +469,15 @@ function cm.h_publish(client, subject, payload, reply, headers)
 	request_raw(client, st)
 end
 
-function cm.wait(client, maxcount, timeout)
+function cm.wait(client, maxcount, timeout_b, timeout_t)
 	local count, socket, data = 0, client.network.socket
-	local last_timeout
+	local last_timeout_b, last_timeout_t
 	
 	while true do
-		if timeout then
-			last_timeout = socket:gettimeout(timeout)
-			socket:settimeout(timeout)
+		if timeout_b or timeout_t then
+			last_timeout_b, last_timeout_t = socket:gettimeout()
+			socket:settimeout(timeout_b,'b')
+			if timeout_t then socket:settimeout(timeout_t,'t') end
 		end
 
 		data = response_read(client)
@@ -487,17 +485,22 @@ function cm.wait(client, maxcount, timeout)
 		
 		op = data.op
 		
+		-- add header decode and encode option
 		if op == 'MSG' or op == 'HMSG' then
 			count = count + 1
-			client.subscriptions[data.sid](client.decoder(data.payload), data.reply, data.subject, data.sid, data.headers)
+			client.subscriptions[data.sid](data.payload, data.reply, data.subject, data.sid, data.headers)
 		elseif op == 'PING' then cm.pong(client)
 		elseif op == 'INFO' then
 			-- client.information = decode(data.payload) -- notsure if this will overwrite, so lets be safe...
 			for k,v in pairs(decode(data.payload) or {}) do client.information[k] = v end
 		end
 		
-		if maxcount and count > maxcount then return end
+		if maxcount and count > maxcount then break end
 	end
+	
+	socket:settimeout(last_timeout_b,'b')
+	socket:settimeout(last_timeout_t,'t')
+
 	return
 end
 
