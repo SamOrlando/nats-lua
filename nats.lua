@@ -311,10 +311,7 @@ function nats.client(opts, host, port, timeout)
 	local opt_t = {}
 
 	if type(opts) == "string" then
-		timeout = port
-		port = host
-		host = opts
-		opts = nil
+		timeout, port, host, opts = port, host, opts, nil
 	end
 	
 	for k,v in pairs(opts or {}) do
@@ -335,15 +332,14 @@ end
 
 -- i hate this thing
 function nats.connect(...)
-	local args, parameters = {...}, nil
+	local args, net_parms = {...}, {}
 
-	if #args == 1 then parameters = args[1]
-	elseif #args > 1 then
+	if #args > 0 then
 		local host, port, timeout = unpack(args)
-		parameters = { host = host, port = port, timeout = tonumber(timeout) }
+		net_parms = { host = host, port = port, timeout = tonumber(timeout) }
 	end
 
-	local client = create_client(socket, nil, parameters)
+	local client = create_client(socket, nil, net_parms)
 	client:connect()
 end
 
@@ -385,9 +381,8 @@ function cm.request(client, subject, payload, headers)
 	
 	cm.publish(client, subject, client.payload_encoder(payload), inbox, client.headers_encoder(headers)) --header encoder?
 	
-	local data = response_read(client)
+	local data = response_read(client) -- data_payload
 	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
-	
 	return data
 end
 
@@ -396,8 +391,8 @@ function cm.get(client, subject, payload, headers)
 	local sid = cm.subscribe(client, inbox, function() cm.unsubscribe(client, sid) end)
 
 	cm.publish(client, subject, client.payload_encoder(payload), inbox, client.headers_encoder(headers))
-		
-	local data = response_read(client)
+	
+	local data = response_read(client) -- data_payload
 	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
 	return data.payload
 end
