@@ -1,11 +1,11 @@
 local nats = {
-	_VERSION	 = 'lua-nats 0.1.2',
-	_DESCRIPTION = 'LUA client for NATS messaging system. https://nats.io',
-	_COPYRIGHT   = 'slightly based off Eric Pinto lua-nats 0.0.2 - Copyright (C) Sam Orlando 2023',
-	verbose = false,
+	_VERSION	 = 'lua-nats-js 0.0.1',
+	_DESCRIPTION = 'LUA client for NATS and JETSTREAM messaging system. https://nats.io',
+	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2023',
+	verbose = false, -- make client based
 	network = {}, -- network functions
-	request = {}, -- request handling (to server)
-	response = {}, -- response handing (from server)
+	request = {}, -- request handling (from client to server)
+	response = {}, -- response handing (from server to client)
 }
 
 -- fix options to be pure in submit to server CONNECT
@@ -19,23 +19,26 @@ nats.client_metatable = {
 	__call = function(self, ...) return	end,
 	methods = {},
 	lang = 'lua',
-	version = '0.1.2',
+	version = '0.0.1',
 }
 
 local cjson  = require('cjson')
 local uuid   = require('uuid')
+local socket = require('socket')
 local ssl = require('ssl')
 
--- ### Local properties / vars ###
+-- ### Local Vars, Shortcuts, Speed
+local network, response, request = nats.network, nats.response, nats.request -- Shortcuts
 local verbose = nats.verbose -- (false or nil for off) levels 1-5
 local insert, concat = table.insert, table.concat
+local gettime = socket.gettime()
 local type = type
 local floor, tonumber = math.floor, tonumber
 local encode, decode = cjson.encode, cjson.decode
-local network, response, request = nats.network, nats.response, nats.request
-local client_metatable = nats.client_metatable
 
-local valid_config_toggles = {headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true}
+local client_metatable = nats.client_metatable -- !!!!!!
+
+local valid_config_toggles = {headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true,verbose=true}
 local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true,protocol=true}
 
 local connect_defaults = {
@@ -47,11 +50,11 @@ local connect_defaults = {
 	tls_required = false,
 }
 
--- ### Local methods ### -- fix for false boolean handling
-local function merge_defaults(parms)
-	parms = parms or {}
-	for k, v in pairs(connect_defaults) do parms[k] = parms[k] or connect_defaults[k] end
-	return parms
+-- ### Local Functions
+local function merge_connect_defaults(ct)
+	ct = ct or {}
+	for k, v in pairs(connect_defaults) do ct[k] = ct[k] or connect_defaults[k] end
+	return ct
 end
 
 local function encode_headers(t)
@@ -74,61 +77,49 @@ local function decode_headers(s)
 	end
 	return tbl
 end
---s:match("([^:]+):%s*(.+)") end
 
 local function passthru_func(...) return unpack({...}) end
 
-local function toHEX(s) -- for debuging when js was mean on headers
-	local hexString, byteValue = ""
-	for i = 1, #s do
-		byteValue = string.byte(s, i)
-		hexString = hexString .. string.format("%02X ", byteValue)
-	end
-	return hexString
-end
-
-local function create_client(config, net_parms)
+local function create_client(config, n_opts)
 	-- defaults
 	local client = setmetatable({
-			connected = false,
-			subscriptions = {},
-			information = {},
-			config = {
-				user = nil,
-				pass = nil,
-				no_responders = false,
-				verbose = false,
-				protocol = 1,
-				pedantic = false,
-				tls_required = false,
-			},
-			network = {
-				-- socket = socket,
-				read   = network.read,
-				write  = network.write,
-				lread  = nil,
-				lwrite = nil,
-				parms = net_parms,
-			},
-			headers_encoder = encode_headers; -- if user wish to setup their own func, it will happen for MSG,HMSG,PUB
-			headers_decoder = decode_headers; -- i added default header handling if table is passed. It will compile a table unless you set as passthru_func
-			payload_encoder = passthru_func;
-			payload_decoder = passthru_func;
-			error = nats.error,
+		connected = false,
+		subscriptions = {},
+		information = {},
+		config = {
+			user = nil,
+			pass = nil,
+			no_responders = false,
+			verbose = false,
+			protocol = 1,
+			pedantic = false,
+			tls_required = false,
+		},
+		network = {
+			-- socket = socket,
+			read   = nats.network.read,
+			write  = nats.network.write,
+			lread  = nil,
+			lwrite = nil,
+			opts = n_opts,
+		},
+		error = nats.error,
 	}, client_metatable)
-	
+
+	-- headers_encoder = passthru_func; -- encode_headers; -- if user wish to setup their own func, it will happen for MSG,HMSG,PUB
+	-- headers_decoder = passthru_func; -- i added default header handling if table is passed. It will compile a table unless you set as passthru_func
+	-- payload_encoder = passthru_func;
+	-- payload_decoder = passthru_func;
 	for k,v in pairs(config or {}) do client.config[k] = v end	
 
 	uuid.seed()
 	return client
 end
 
-
--- ### Network methods ###
+-- ### Network Functions (socket)
 function network.write(client, buffer)
 	if verbose then
-		if verbose > 0 then print('->> '..buffer:sub(1,-3)) end
-		if verbose > 1 then print(toHEX(buffer)) end
+		if verbose > 3 then print('->> '..buffer:sub(1,-3)) end
 	end
 	local _, err = client.network.socket:send(buffer)
 	if err then
@@ -150,16 +141,14 @@ function network.read(client, len)
 	else
 		client.network.lread = line
 		if verbose then
-			if verbose > 0 then print('<<- '..line) end
-			if verbose > 1 then print(toHEX(line)) end
+			if verbose > 3 then print('<<- '..line) end
 		end
 		return line
 	end
 end
 local network_read = network.read
 
-
--- ### Response methods ###
+-- ### Response Methods / Ops
 response.methods = {
 	INFO = function(s, client) return {op=s[1],payload=s[2]} end,
 	PING = function(s) return {op=s[1]} end,
@@ -238,8 +227,7 @@ function response.read(client)
 end
 local response_read = response.read
 
-
--- ### Request methods ###
+-- ### Request Functions
 function request.raw(client, buffer)
 	local bufferType = type(buffer)
 	if bufferType == 'string' then network_write(client, buffer)
@@ -248,7 +236,7 @@ function request.raw(client, buffer)
 end
 local request_raw = request.raw
 
--- ### Socket connection methods ###
+-- ### Socket Functions and Connection
 local function connect_tcp(socket, parms)
 	local host, port = parms.host, tonumber(parms.port)
 	if parms.timeout then socket:settimeout(parms.timeout, 't') end
@@ -296,25 +284,25 @@ local function create_connection(parms)
 	return connect_func(socket(), parms)
 end
 
--- ### Nats library methods ###
+-- ### NATS Module Core Functions
 function nats.error(message, level)
 	error(message, (level or 1) + 1)
 end
 
 function nats.client(opts, host, port, timeout)
-	local opt_t = {}
+	local t_opts = {}
 
 	if type(opts) == "string" then
 		timeout, port, host, opts = port, host, opts, nil
 	end
 	
 	for k,v in pairs(opts or {}) do
-		if (valid_config_toggles[k] or valid_config_strings[k]) then opt_t[k] = v end
+		if (valid_config_toggles[k] or valid_config_strings[k]) then t_opts[k] = v end
 	end
 	
-	local network_parms = { host = host, port = port, timeout = tonumber(timeout), tls_required = opt_t.tls_required}
+	local n_opts = { host = host, port = port, timeout = tonumber(timeout), tls_required = t_opts.tls_required}
 	
-	return create_client(opt_t, network_parms)
+	return create_client(t_opts, n_opts)
 end
 
 function nats.verbose_level(v)
@@ -324,32 +312,30 @@ function nats.verbose_level(v)
 	else return nats.verbose end
 end
 
--- i hate this thing
 function nats.connect(...)
-	local args, net_parms = {...}, {}
+	local args, n_opts = {...}, {}
 
 	if #args > 0 then
 		local host, port, timeout = unpack(args)
-		net_parms = { host = host, port = port, timeout = tonumber(timeout) }
+		n_opts = { host = host, port = port, timeout = tonumber(timeout) }
 	end
 
-	local client = create_client(socket, nil, net_parms)
+	local client = create_client(nil, n_opts)
 	client:connect()
 end
 
--- Create a properly formatted inbox subject.
 function nats.create_inbox() return '_INBOX.' .. uuid() end
 local create_inbox = nats.create_inbox -- vroom
 
--- ### NATS Client Methods ###
+-- ### NATS Client Methods
 local cm = nats.client_metatable.methods
 function cm.connect(client)
-	if not client.connected then 
-		client.network.socket = create_connection(merge_defaults(client.network.parms))
-		if not client.network.socket then client.error("Unable to connect socket.") end
-	end
+	if client.connected then return true end --review - how do we handle reconnect? do we need to redo all?
+
+	client.network.socket = client.network.socket or create_connection(merge_connect_defaults(client.network.opts))
+	if not client.network.socket then client.error("Unable to connect socket.") end
 	
-	request_raw(client, {'CONNECT ',encode(client.config),'\r\n'})
+	request_raw(client, {'CONNECT ', encode(client.config),'\r\n'})
 
 	-- gather the server information
 	local data = response_read(client)
