@@ -31,7 +31,7 @@ local ssl = require('ssl')
 local network, response, request = nats.network, nats.response, nats.request -- Shortcuts
 local verbose = nats.verbose -- (false or nil for off) levels 1-5
 local insert, concat = table.insert, table.concat
-local gettime = socket.gettime()
+local gettime = socket.gettime
 local type = type
 local floor, tonumber = math.floor, tonumber
 local encode, decode = cjson.encode, cjson.decode
@@ -59,24 +59,26 @@ end
 
 local function encode_headers(t)
 	if type(t) == "table" then
-		local tht = {'NATS/1.0\r\n'}
+		local tht = {}
 		for k,v in pairs(t) do
 			insert(tht, concat({k,': ',v,'\r\n'}))
 		end
-		insert(tht, '\r\n')
 		return concat(tht)
 	end
 	return t or "" -- anything else? user messed up or compiled their own header string.
 end
+nats.encode_headers = encode_headers
 
 local function decode_headers(s)
 	local tbl = {}
+	if not s then return end
 	for line in s:gmatch("(.-)\r\n") do
 		local k,v = line:match("(.-):%s*(.*)")
 		if k then tbl[k] = v end
 	end
 	return tbl
 end
+nats.decode_headers = decode_headers
 
 local function passthru_func(...) return unpack({...}) end
 
@@ -330,7 +332,7 @@ local create_inbox = nats.create_inbox -- vroom
 -- ### NATS Client Methods
 local cm = nats.client_metatable.methods
 function cm.connect(client)
-	if client.connected then return true end --review - how do we handle reconnect? do we need to redo all?
+	if client.connected and client.network.socket then return true end --review - how do we handle reconnect? do we need to redo all?
 
 	client.network.socket = client.network.socket or create_connection(merge_connect_defaults(client.network.opts))
 	if not client.network.socket then client.error("Unable to connect socket.") end
@@ -354,74 +356,66 @@ end
 
 function cm.pong(client) request_raw(client, 'PONG\r\n') end
 
--- client.subscriptions[data.sid](data.payload, data.reply, data.subject, data.sid, data.headers)
+function cm.publish(client, subject, payload, reply, headers)
+	local st
+	payload = payload or ''
+	
+	if headers and #headers > 0 then
+		st = {'HPUB ', subject}
+	else
+		st = {'PUB ', subject}
+		headers = nil
+	end
+	
+	-- if reply insert
+	if reply then
+		insert(st, ' ')
+		insert(st, reply)
+	end
+	
+	-- headers add size and to total size
+	if headers then
+		headers = 'NATS/1.0\r\n' .. headers .. '\r\n'
+		insert(st, ' ')
+		insert(st, #headers)
+		insert(st, ' ')
+		insert(st, (#headers + #payload))
+		insert(st, '\r\n')
+		-- insert the headers 
+		insert(st, headers)
+	else
+		-- insert payload size
+		insert(st, ' ')
+		insert(st, #payload)
+		insert(st, '\r\n')
+	end
+
+	-- insert payload
+	insert(st, payload)
+	insert(st, '\r\n')
+
+	request_raw(client, st)
+end
+
 function cm.request(client, subject, callback, payload, headers)
 	local inbox = create_inbox()
 	local sid = cm.subscribe(client, inbox, function(payload, reply, subject, sid, headers)
-		if payload and payload ~= '' then
-			local pds, pdr = pcall(client.payload_decoder, payload) -- payload_decoder_success
-			payload = (pds and pdr) or payload
-		end
-		if headers and headers ~= '' then
-			local hds, hdr = pcall(client.headers_decoder, dheaders)
-			headers = (hdr and hdr) or headers
-		end
 		cm.unsubscribe(client, sid)
 		pcall(callback, client, payload, reply, subject, sid, headers)
 	end)
 
-	cm.publish(client, subject, client.payload_encoder(payload), inbox, client.headers_encoder(headers))
-	
-	return sid
-end
-
-function cm.request_raw(client, subject, callback, payload, headers)
-	local inbox = create_inbox()
-	local sid = cm.subscribe(client, inbox, function(payload, reply, subject, sid, headers)
-		cm.unsubscribe(client, sid)
-		pcall(callback, client, payload, reply, subject, sid, headers)
-	end)
-
-	cm.publish_raw(client, subject, payload, inbox, headers)
+	cm.publish(client, subject, payload, inbox, headers)
 	
 	return sid
 end
 
 function cm.get(client, subject, payload, headers)
-	local inbox = create_inbox()
-	local sid = cm.subscribe(client, inbox, function(payload, reply, subject, sid, headers)
-		cm.unsubscribe(client, sid)		
-	end)
-
-	cm.publish(client, subject, payload, inbox, headers)
-	
+	local sid = cm.request(client, subject, function() end, payload, headers)
 	local data = cm.wait(client, sid, nil, 2)
-	if data then
-		if headers and headers ~= '' then
-			local hds, hdr = pcall(client.headers_decoder, dheaders)
-			headers = (hdr and hdr) or headers
-		end
-		if data.payload and data.payload ~= '' then
-			local pds, pdr = pcall(client.payload_decoder, data.payload) -- payload_decoder_success
-			data.payload = (pds and pdr) or data.payload
-		end
-	else cm.unsubscribe(client, sid) end
 	
-	return data
-end
-
-function cm.get_raw(client, subject, payload, headers)
-	local inbox = create_inbox()
-	local sid = cm.subscribe(client, inbox, function(_, _, _, sid, _)
-		cm.unsubscribe(client, sid)		
-	end)
-
-	cm.publish_raw(client, subject, payload, inbox, headers)
-	
-	local data = cm.wait(client, sid, nil, 2)
 	if data then
 	else cm.unsubscribe(client, sid) end
-	
+
 	return data
 end
 
@@ -442,78 +436,40 @@ function cm.subscribe(client, subject, callback, queue)
 end
 
 function cm.unsubscribe(client, sid)
-	--print("unsub: " .. tostring(sid))
 	request_raw(client, {'UNSUB ', sid, '\r\n'})
 	client.subscriptions[sid] = nil
 end
 
-function cm.publish(client, subject, payload, reply, headers)
-	if headers then	return cm.h_publish(client, subject, payload, reply, headers) end
-	if payload ~= nil then
-	  local s, encoded = pcall(client.payload_encoder, payload)
-	  payload = s and encoded or ""
-	else payload = "" end
-
-	cm.publish_raw(client, subject, payload, reply)
+function cm.auth(client, user, pass)
+	client.config.user = user or client.config.user
+	client.config.pass = pass or client.config.pass
+	return {user=client.config.user,pass=client.config.pass}
 end
 
-function cm.publish_raw(client, subject, payload, reply, headers)
-	if headers then -- cover headers if we get them
-		cm.h_publish_raw(client, subject, payload, reply, headers)
-		return
+function cm.server_info(client) return client.information end
+
+-- assign functions to handle bool options
+local function config_set(client, k, v)
+	local opt = valid_config_toggles[k] or valid_config_string[k]
+	if opt then
+		if v ~= nil then client.config[k] = v
+		elseif valid_config_toggles[k] then client.config[k] = not client.config[k] end
+		return client.config[k]
 	end
-	payload = payload or ""
-	
-	local st = {'PUB ', subject, ' '}
-
-	if reply then
-		insert(st, reply)
-		insert(st, ' ')
-	end
-
-	insert(st, #payload)
-	insert(st, '\r\n')
-	
-	insert(st, payload)
-	insert(st, '\r\n')
-	
-	request_raw(client, st)
+	return
 end
 
-function cm.h_publish(client, subject, payload, reply, headers)
-	if payload ~= nil then
-	  local s, encoded = pcall(client.payload_encoder, payload)
-	  payload = s and encoded or ""
-	else payload = "" end
-	headers = client.headers_encoder(headers)
-	cm.h_publish_raw(client, subject, payload, reply, headers)
+-- assign methods for all config toggle options
+for k,v in pairs(valid_config_toggles) do
+	cm[k] = cm[k] or function(client, b) return config_set(client, k, b) end
+end
+-- assign methods for all config string options
+for k,v in pairs(valid_config_strings) do
+	cm[k] = cm[k] or function(client, s) return config_set(client, k, s) end
 end
 
-function cm.h_publish_raw(client, subject, payload, reply, headers)
-	local st = {'HPUB ', subject, ' '}
-	-- if reply insert
-	if reply then
-		insert(st, reply)
-		insert(st, ' ')
-	end
-	-- header handling if nil
-	if headers and #headers > 0 then
-	else headers = '' end
-	-- finish up the op string
-	insert(st, #headers)
-	insert(st, ' ')
-	insert(st, (#payload + #headers))
-	insert(st, '\r\n')
-		-- insert headers
-	insert(st, headers)
-	-- insert payload
-	insert(st, payload)
-	insert(st, '\r\n')
+function cm.shutdown(client) client.network.socket:shutdown() end
 
-	request_raw(client, st)
-end
-
-local gettime = require("socket").gettime
 function cm.wait(client, sid, maxcount, timeout)
 	local count, socket, data = 0, client.network.socket
 	local timeout_b, timeout_t, last_timeout_b, last_timeout_t
@@ -580,35 +536,5 @@ function cm.wait(client, sid, maxcount, timeout)
 
 	return data
 end
-
-function cm.auth(client, user, pass)
-	client.config.user = user or client.config.user
-	client.config.pass = pass or client.config.pass
-	return {user=client.config.user,pass=client.config.pass}
-end
-
-function cm.server_info(client) return client.information end
-
--- assign functions to handle bool options
-local function config_set(client, k, v)
-	local opt = valid_config_toggles[k] or valid_config_string[k]
-	if opt then
-		if v ~= nil then client.config[k] = v
-		elseif valid_config_toggles[k] then client.config[k] = not client.config[k] end
-		return client.config[k]
-	end
-	return
-end
-
--- assign methods for all config toggle options
-for k,v in pairs(valid_config_toggles) do
-	cm[k] = cm[k] or function(client, b) return config_set(client, k, b) end
-end
--- assign methods for all config string options
-for k,v in pairs(valid_config_strings) do
-	cm[k] = cm[k] or function(client, s) return config_set(client, k, s) end
-end
-
-function cm.shutdown(client) client.network.socket:shutdown() end
 
 return nats
