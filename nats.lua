@@ -374,28 +374,35 @@ end
 
 function cm.pong(client) request_raw(client, 'PONG\r\n') end
 
--- we may have to have handlers or a wait system that offers breakoffs
-function cm.request(client, subject, payload, headers)
+-- client.subscriptions[data.sid](data.payload, data.reply, data.subject, data.sid, data.headers)
+function cm.request(client, subject, callback, payload, headers)
 	local inbox = create_inbox()
-	local sid = cm.subscribe(client, inbox, function(message, reply) cm.unsubscribe(client, sid) end)
+	local sid = cm.subscribe(client, inbox, function(payload, reply, subject, sid, headers)
+		cm.unsubscribe(client, sid)
+		--printTable({payload, reply, subject, sid, headers})
+		pcall(callback, client, payload, reply, subject, sid, headers)
+	end)
+
+	cm.publish(client, subject, client.payload_encoder(payload), inbox, client.headers_encoder(headers))
 	
-	cm.publish(client, subject, client.payload_encoder(payload), inbox, client.headers_encoder(headers)) --header encoder?
-	
-	local data = response_read(client) -- data_payload
-	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
-	return data
+	return sid
 end
 
 function cm.get(client, subject, payload, headers)
 	local inbox = create_inbox()
-	local sid = cm.subscribe(client, inbox, function() cm.unsubscribe(client, sid) end)
+	local sid = cm.subscribe(client, inbox, function(payload, reply, subject, sid, headers)
+		cm.unsubscribe(client, sid)		
+	end)
 
 	cm.publish(client, subject, client.payload_encoder(payload), inbox, client.headers_encoder(headers))
 	
-	local data = response_read(client) -- data_payload
-	if data.op == '-ERR' then client.error('Client Error: ' .. (data.payload or 'unknown error')) end
+	local data = cm.wait(client, sid, nil, 0.10)
+	if data then
+	else cm.unsubscribe(client, sid) end
+	
 	return data.payload
 end
+
 
 function cm.subscribe(client, subject, callback, queue)
 	local sid = uuid()
@@ -414,6 +421,7 @@ function cm.subscribe(client, subject, callback, queue)
 end
 
 function cm.unsubscribe(client, sid)
+	--print("unsub: " .. tostring(sid))
 	request_raw(client, {'UNSUB ', sid, '\r\n'})
 	client.subscriptions[sid] = nil
 end
@@ -473,39 +481,72 @@ function cm.h_publish(client, subject, payload, reply, headers)
 	request_raw(client, st)
 end
 
-function cm.wait(client, maxcount, timeout_b, timeout_t)
+local gettime = require("socket").gettime
+function cm.wait(client, sid, maxcount, timeout)
 	local count, socket, data = 0, client.network.socket
-	local last_timeout_b, last_timeout_t
+	local timeout_b, timeout_t, last_timeout_b, last_timeout_t
 	
-	while true do
-		if timeout_b or timeout_t then
-			last_timeout_b, last_timeout_t = socket:gettimeout()
-			socket:settimeout(timeout_b,'b')
-			if timeout_t then socket:settimeout(timeout_t,'t') end
+	if not sid or type(sid) == "number" then 
+		if maxcount then
+			timeout = timeout or maxcount
+		end
+		maxcount = sid
+		sid = nil
+	end
+
+	if timeout then
+		local ttyp = type(timeout)
+		if ttyp == "number" then timeout_b = timeout
+		elseif ttyp == "table" then
+			timeout_b = timeout[1]
+			timeout_t = timeout[2]
 		end
 
+		last_timeout_b, last_timeout_t = socket:gettimeout()
+		if timeout_b then socket:settimeout(timeout_b,'b') end
+		if timeout_t then socket:settimeout(timeout_t,'t') end
+	end
+	
+	--printTable({sid, maxcount, timeout})
+	local toe, loop_run_start = 0, gettime()
+	while true do
 		data = response_read(client)
 		if not data then return end
 		
-		op = data.op
+		local op = data.op
 		
 		-- add header decode and encode option
 		if op == 'MSG' or op == 'HMSG' then
+			if sid and sid == data.sid then break end -- before or after?
 			count = count + 1
 			client.subscriptions[data.sid](data.payload, data.reply, data.subject, data.sid, data.headers)
+			if maxcount and count >= maxcount then
+				print("maxcount:" .. maxcount .. ":" .. count)
+				break
+			end
 		elseif op == 'PING' then cm.pong(client)
 		elseif op == 'INFO' then
 			-- client.information = decode(data.payload) -- notsure if this will overwrite, so lets be safe...
 			for k,v in pairs(decode(data.payload) or {}) do client.information[k] = v end
 		end
 		
-		if maxcount and count > maxcount then break end
+		if timeout_b then
+			toe = toe + 1
+			if toe >= 500 then
+				local current_time = gettime()
+				if timeout_b <= (current_time - loop_run_start) then
+					print("timeout on " .. count .. " nats:cm.wait loop " .. (current_time - loop_run_start))
+					return
+				end
+				toe = 0	
+			end
+		end
 	end
 	
-	socket:settimeout(last_timeout_b,'b')
-	socket:settimeout(last_timeout_t,'t')
+	if timeout_b then socket:settimeout(last_timeout_b,'b') end
+	if timeout_t then socket:settimeout(last_timeout_t,'t') end
 
-	return
+	return data
 end
 
 function cm.request_raw(client, buffer)
