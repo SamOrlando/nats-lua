@@ -36,8 +36,9 @@ function cm.stream(client, stream_name, subjects)
 	-- test and adjust subjects so string or table can be passed.
 	-- Only leaky part is 'true' being converted but meh.
 	if subjects and type(subject) ~= "table" then subjects = {tostring(subjects)} end
-	
-	local msg = decode(client:get('$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects })))
+
+	local msg = cm.get_raw(client, '$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects }))
+	printTable(msg)
 	if msg.error then return false, msg end
 
 	-- create and set stream object
@@ -56,7 +57,7 @@ end
 
 function js.delete(stream) -- we will need two of them for cm and js
 	-- make request
-	local msg = decode(stream.client:get('$JS.API.STREAM.DELETE.' .. stream.name))
+	local msg = decode(stream.client:get_raw('$JS.API.STREAM.DELETE.' .. stream.name).payload)
 	if msg.error then return false, msg end
 	
 	-- delete client objects stream listing and the object
@@ -66,7 +67,8 @@ function js.delete(stream) -- we will need two of them for cm and js
 end
 
 function js.consumer(stream, consumer_name, config)
-	local msg = decode(stream.client:get('$JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name})))
+	local msg = stream.client:get_raw('$JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name}))
+	printTable(msg)
 	if msg.error then return false, msg end
 
 	-- create and set consumer object
@@ -83,7 +85,7 @@ function js.consumer(stream, consumer_name, config)
 end
 
 function con.delete(consumer)
-	local msg = decode(consumer.client:get('$JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name))
+	local msg = decode(consumer.client:get_raw('$JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name).payload)
 	if msg.error then return false, msg end
 	-- delete references
 	consumer.stream[consumer.name] = nil
@@ -97,63 +99,63 @@ function js.publish(stream, subject, payload)
 end
 
 function js.info(stream)
-	local msg = decode(stream.client:get('$JS.API.STREAM.INFO.' .. stream.name))
+	local msg = decode(stream.client:get_raw('$JS.API.STREAM.INFO.' .. stream.name).payload)
 	if msg.error then return false, msg end
 	return msg
 end
 
 function con.info(consumer)
-	local msg = decode(consumer.client:get('$JS.API.CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name))
+	local msg = decode(consumer.client:get_raw('$JS.API.CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name).payload)
 	if msg.error then return false, msg end
 	return msg
 end
 
 function con.nextmsg(consumer)
-	local msg = decode(consumer.client:get('$JS.API.CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name))
+	local msg = decode(consumer.client:get_raw('$JS.API.CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name).payload)
 	if msg.error then return false, msg end
 	return msg
 end
 
 function cm.stream_list(client)
-	local msg = decode(client:get("$JS.API.STREAM.LIST"))
+	local msg = decode(client:get_raw("$JS.API.STREAM.LIST").payload)
 	if msg.error then return false, msg end
 	return msg
 end
 
 function js.consumer_list(stream)
-	local msg = decode(stream.client:get('$JS.API.CONSUMER.LIST.' .. stream.name))
+	local msg = decode(stream.client:get_raw('$JS.API.CONSUMER.LIST.' .. stream.name).payload)
 	if msg.error then return false, msg end
 	return msg
 end
 
 function js.update(stream, configuration)
 	local configJson = encode(configuration)
-	local msg = decode(stream.client:get('$JS.API.STREAM.UPDATE.' .. stream.name, configJson))
+	local msg = decode(stream.client:get_raw('$JS.API.STREAM.UPDATE.' .. stream.name, configJson).payload)
 	if msg.error then return false, msg end
 	return true, msg
 end
 
 function con.update(consumer, configuration)
 	local configJson = encode(configuration)
-	local msg = decode(consumer.client:get('$JS.API.CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name, configJson))
+	local msg = decode(consumer.client:get_raw('$JS.API.CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name, configJson).payload)
 	if msg.error then return false, msg end
 	return true, msg
 end
 
 function js.replay(stream, msg_sequence)
-	local msg = decode(stream.client:get('$JS.API.STREAM.MSG.GET.' .. stream.name, msg_sequence))
+	local msg = decode(stream.client:get_raw('$JS.API.STREAM.MSG.GET.' .. stream.name, msg_sequence).payload)
 	if msg.error then return false, msg end
 	return msg
 end
 
 function js.remove(stream, msg_sequence)
-	local msg = decode(stream.client:get('$JS.API.STREAM.MSG.DELETE.' .. stream.name, msg_sequence))
+	local msg = decode(stream.client:get_raw('$JS.API.STREAM.MSG.DELETE.' .. stream.name, msg_sequence).payload)
 	if msg.error then return false, msg end
 	return true, msg
 end
 
 function js.purge(stream)
-	local msg = decode(stream.client:get('$JS.API.STREAM.PURGE.' .. stream.name))
+	local msg = decode(stream.client:get_raw('$JS.API.STREAM.PURGE.' .. stream.name).payload)
 	if msg.error then return false, msg end
 	return true, msg
 end

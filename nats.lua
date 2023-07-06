@@ -183,10 +183,7 @@ response.methods = {
 			}
 		end
 
-		local dpl = network_read(client) -- data_payload
-		local pds, payload = pcall(client.payload_decoder, dpl) -- payload_decoder_success
-		data.payload = (dpl ~= '') and (pds and payload or dpl) or ''
-
+		data.payload = network_read(client) -- data_payload
 		return data
 	end,
 	HMSG = function(s, client)
@@ -218,12 +215,9 @@ response.methods = {
 			dheaders = hread .. '\r\n' .. dheaders
 		  until #hread == 0
 		end
-		data.headers = client.headers_decoder(dheaders) or dheaders 
+		data.headers = dheaders 
 
-		local dpl = network_read(client) -- data_payload
-		local pds, payload = pcall(client.payload_decoder, dpl) -- payload_decoder_success
-		data.payload = (dpl ~= '') and (pds and payload or dpl) or ''
-
+		data.payload = network_read(client) -- data_payload
 		return data
 	end,
 	["+OK"] = function(s) return {op=s[1]} end,
@@ -378,12 +372,31 @@ function cm.pong(client) request_raw(client, 'PONG\r\n') end
 function cm.request(client, subject, callback, payload, headers)
 	local inbox = create_inbox()
 	local sid = cm.subscribe(client, inbox, function(payload, reply, subject, sid, headers)
+		if payload and payload ~= '' then
+			local pds, pdr = pcall(client.payload_decoder, payload) -- payload_decoder_success
+			payload = (pds and pdr) or payload
+		end
+		if headers and headers ~= '' then
+			local hds, hdr = pcall(client.headers_decoder, dheaders)
+			headers = (hdr and hdr) or headers
+		end
 		cm.unsubscribe(client, sid)
-		--printTable({payload, reply, subject, sid, headers})
 		pcall(callback, client, payload, reply, subject, sid, headers)
 	end)
 
 	cm.publish(client, subject, client.payload_encoder(payload), inbox, client.headers_encoder(headers))
+	
+	return sid
+end
+
+function cm.request_raw(client, subject, callback, payload, headers)
+	local inbox = create_inbox()
+	local sid = cm.subscribe(client, inbox, function(payload, reply, subject, sid, headers)
+		cm.unsubscribe(client, sid)
+		pcall(callback, client, payload, reply, subject, sid, headers)
+	end)
+
+	cm.publish_raw(client, subject, payload, inbox, headers)
 	
 	return sid
 end
@@ -394,15 +407,37 @@ function cm.get(client, subject, payload, headers)
 		cm.unsubscribe(client, sid)		
 	end)
 
-	cm.publish(client, subject, client.payload_encoder(payload), inbox, client.headers_encoder(headers))
+	cm.publish(client, subject, payload, inbox, headers)
 	
-	local data = cm.wait(client, sid, nil, 0.10)
+	local data = cm.wait(client, sid, nil, 2)
+	if data then
+		if headers and headers ~= '' then
+			local hds, hdr = pcall(client.headers_decoder, dheaders)
+			headers = (hdr and hdr) or headers
+		end
+		if data.payload and data.payload ~= '' then
+			local pds, pdr = pcall(client.payload_decoder, data.payload) -- payload_decoder_success
+			data.payload = (pds and pdr) or data.payload
+		end
+	else cm.unsubscribe(client, sid) end
+	
+	return data
+end
+
+function cm.get_raw(client, subject, payload, headers)
+	local inbox = create_inbox()
+	local sid = cm.subscribe(client, inbox, function(_, _, _, sid, _)
+		cm.unsubscribe(client, sid)		
+	end)
+
+	cm.publish_raw(client, subject, payload, inbox, headers)
+	
+	local data = cm.wait(client, sid, nil, 2)
 	if data then
 	else cm.unsubscribe(client, sid) end
 	
-	return data.payload
+	return data
 end
-
 
 function cm.subscribe(client, subject, callback, queue)
 	local sid = uuid()
@@ -433,7 +468,16 @@ function cm.publish(client, subject, payload, reply, headers)
 	  payload = s and encoded or ""
 	else payload = "" end
 
-	-- create send table for message string
+	cm.publish_raw(client, subject, payload, reply)
+end
+
+function cm.publish_raw(client, subject, payload, reply, headers)
+	if headers then -- cover headers if we get them
+		cm.h_publish_raw(client, subject, payload, reply, headers)
+		return
+	end
+	payload = payload or ""
+	
 	local st = {'PUB ', subject, ' '}
 
 	if reply then
@@ -456,8 +500,10 @@ function cm.h_publish(client, subject, payload, reply, headers)
 	  payload = s and encoded or ""
 	else payload = "" end
 	headers = client.headers_encoder(headers)
-	-- break out to headers decoder function
-	-- create table for message string
+	cm.h_publish_raw(client, subject, payload, reply, headers)
+end
+
+function cm.h_publish_raw(client, subject, payload, reply, headers)
 	local st = {'HPUB ', subject, ' '}
 	-- if reply insert
 	if reply then
@@ -512,7 +558,7 @@ function cm.wait(client, sid, maxcount, timeout)
 	while true do
 		data = response_read(client)
 		if not data then return end
-		
+		print("tick:wait:data:" .. #data)
 		local op = data.op
 		
 		-- add header decode and encode option
@@ -547,11 +593,6 @@ function cm.wait(client, sid, maxcount, timeout)
 	if timeout_t then socket:settimeout(last_timeout_t,'t') end
 
 	return data
-end
-
-function cm.request_raw(client, buffer)
-	request_raw(client, buffer)
-	return response_read(client)
 end
 
 function cm.auth(client, user, pass)
