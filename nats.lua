@@ -394,10 +394,13 @@ function cm.publish(client, subject, payload, reply, headers)
 end
 
 function cm.request(client, subject, callback, payload, headers)
-	local inbox = create_inbox()
+	local inbox = create_inbox() 
 	local sid = cm.subscribe(client, inbox, function(payload, reply, subject, sid, headers)
 		cm.unsubscribe(client, sid)
-		pcall(callback, client, payload, reply, subject, sid, headers)
+		if callback then
+			local s, d = pcall(callback, payload, reply, subject, sid, headers)
+			if s then return d end
+		end
 	end)
 
 	cm.publish(client, subject, payload, inbox, headers)
@@ -405,9 +408,8 @@ function cm.request(client, subject, callback, payload, headers)
 	return sid
 end
 
-local empty_func = function() end
 function cm.get(client, subject, payload, headers)
-	local sid = cm.request(client, subject, empty_func, payload, headers)
+	local sid = cm.request(client, subject, nil, payload, headers)
 	local data = cm.wait(client, sid, nil, 2)
 	
 	if data then
@@ -449,10 +451,9 @@ nats.encoded_client_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, "client")[key] end,
 	methods = {}
 }
-local encoded_client_metatable = nats.encoded_client_metatable
 
 function cm.encoded_client(client)
-	return setmetatable({client = client}, encoded_client_metatable)
+	return setmetatable({client = client}, nats.encoded_client_metatable)
 end
 
 local ec = nats.encoded_client_metatable.methods
@@ -473,24 +474,25 @@ function ec.get(client, subject, payload, headers)
 	return data
 end
 
-local function encoded_request_wrapper(client, subject, callback, payload, headers)
-	_, payload = pcall(client.decoding.payload, payload)
-	_, headers = pcall(client.decoding.headers, headers)
-	return client, subject, callback, payload, headers
-end
-
 function ec.request(client, subject, callback, payload, headers)
 	client = rawget(client, "client")
 	_, payload = pcall(client.encoding.payload, payload)
 	_, headers = pcall(client.encoding.headers, headers)
-	return cm.request(client, subject, encoded_request_wrapper, payload, headers)
+	return cm.request(client, subject, function(client, subject, callback, payload, headers)
+		_, payload = pcall(client.decoding.payload, payload)
+		_, headers = pcall(client.decoding.headers, headers)
+		local s,r = pcall(callback, client, subject, callback, payload, headers)
+		if s then return r end
+	end, payload, headers)
 end
 
-function ec.wait(client, sid, maxcount, timeout)
-	local data = cm.wait(rawget(client, "client"), sid, maxcount, timeout)
-	_, data.payload = pcall(client.decoding.payload, data.payload)
-	_, data.headers = pcall(client.decoding.headers, data.headers)
-	return data
+function ec.subscribe(client, subject, callback, queue)
+	cm.subscribe(getraw(client, "client"), subject, function(payload, reply, subject, sid, headers)
+		_, payload = pcall(client.decoding.payload, payload)
+		_, headers = pcall(client.decoding.headers, headers)
+		local s,r = pcall(callback, payload, reply, subject, sid, headers)
+		if s then return r end
+	end, queue)
 end
 
 -- assign functions to handle bool options
@@ -540,8 +542,7 @@ function cm.wait(client, sid, maxcount, timeout)
 		if timeout_t then socket:settimeout(timeout_t,'t') end
 	end
 	
-	--printTable({sid, maxcount, timeout})
-	local toe, loop_run_start, func_run_start = 0, gettime(), loop_run_start
+	local toe, loop_run_start = 0, gettime(), loop_run_start
 	while true do
 		data = response_read(client)
 		if not data then return end
@@ -549,10 +550,11 @@ function cm.wait(client, sid, maxcount, timeout)
 		
 		-- add header decode and encode option
 		if op == 'MSG' or op == 'HMSG' then
-			if not client.subscriptions[data.sid] then print("wtf: " .. data.sid)
-			else client.subscriptions[data.sid](data.payload, data.reply, data.subject, data.sid, data.headers) end
+			for k,v in pairs(client.subscriptions[data.sid](data.payload, data.reply, data.subject, data.sid, data.headers) or {}) do
+				data[k] = v
+			end
+			if sid and sid == data.sid then break end
 			count = count + 1
-			if sid and sid == data.sid then break end -- before or after?
 			if maxcount and count >= maxcount then
 				print("maxcount:" .. maxcount .. ":" .. count)
 				break
