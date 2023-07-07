@@ -1,7 +1,7 @@
 local nats = {
 	_VERSION	 = 'lua-nats-js 0.0.1',
-	_DESCRIPTION = 'LUA client for NATS and JETSTREAM messaging system. https://nats.io',
-	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2023',
+	_DESCRIPTION = 'LUA client for NATS w/header, tls - https://nats.io',
+	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2023 - MIT Cheese Please',
 	verbose = false, -- make client based
 	network = {}, -- network functions
 	request = {}, -- request handling (from client to server)
@@ -81,6 +81,7 @@ end
 nats.decode_headers = decode_headers
 
 local function passthru_func(...) return unpack({...}) end
+nats.passthru_func = passthru_func
 
 local function create_client(config, n_opts)
 	-- defaults
@@ -98,20 +99,23 @@ local function create_client(config, n_opts)
 			tls_required = false,
 		},
 		network = {
-			-- socket = socket,
 			read   = nats.network.read,
 			write  = nats.network.write,
 			lread  = nil,
 			lwrite = nil,
 			opts = n_opts,
 		},
+		encoding = {
+			payload = nil,
+			headers = nil,
+		},
+		decoding = {
+			payload = nil,
+			headers = nil,
+		},
 		error = nats.error,
 	}, client_metatable)
 
-	-- headers_encoder = passthru_func; -- encode_headers; -- if user wish to setup their own func, it will happen for MSG,HMSG,PUB
-	-- headers_decoder = passthru_func; -- i added default header handling if table is passed. It will compile a table unless you set as passthru_func
-	-- payload_encoder = passthru_func;
-	-- payload_decoder = passthru_func;
 	for k,v in pairs(config or {}) do client.config[k] = v end	
 
 	uuid.seed()
@@ -220,23 +224,23 @@ function response.read(client)
 	if not payload then return end -- nonblocking move on
 	
 	local slices  = {}
-	local data	= {}
-
 	for slice in payload:gmatch('[^%s]+') do insert(slices, slice) end
-
-	if slices[1] and response_methods[slices[1]] then return response_methods[slices[1]](slices, client)
-	else return {op = "-ERR", payload = payload} end
+	if slices[1] and response_methods[slices[1]] then
+		return response_methods[slices[1]](slices, client)
+	else
+		return {op = "-ERR", payload = payload}
+	end
 end
 local response_read = response.read
 
 -- ### Request Functions
-function request.raw(client, buffer)
+function request.write(client, buffer)
 	local bufferType = type(buffer)
 	if bufferType == 'string' then network_write(client, buffer)
 	elseif bufferType == 'table' then network_write(client, concat(buffer))
 	else client.error('argument error: ' .. bufferType) end
 end
-local request_raw = request.raw
+local request_write = request.write
 
 -- ### Socket Functions and Connection
 local function connect_tcp(socket, parms)
@@ -337,7 +341,7 @@ function cm.connect(client)
 	client.network.socket = client.network.socket or create_connection(merge_connect_defaults(client.network.opts))
 	if not client.network.socket then client.error("Unable to connect socket.") end
 	
-	request_raw(client, {'CONNECT ', encode(client.config),'\r\n'})
+	request_write(client, {'CONNECT ', encode(client.config),'\r\n'})
 
 	-- gather the server information
 	local data = response_read(client)
@@ -348,13 +352,13 @@ function cm.connect(client)
 end
 
 function cm.ping(client)
-	request_raw(client, 'PING\r\n')
+	request_write(client, 'PING\r\n')
 	local data = response_read(client)
 	if data.op == 'PONG' then return true end
 	return false
 end
 
-function cm.pong(client) request_raw(client, 'PONG\r\n') end
+function cm.pong(client) request_write(client, 'PONG\r\n') end
 
 function cm.publish(client, subject, payload, reply, headers)
 	local st
@@ -394,7 +398,7 @@ function cm.publish(client, subject, payload, reply, headers)
 	insert(st, payload)
 	insert(st, '\r\n')
 
-	request_raw(client, st)
+	request_write(client, st)
 end
 
 function cm.request(client, subject, callback, payload, headers)
@@ -430,13 +434,13 @@ function cm.subscribe(client, subject, callback, queue)
 	insert(st, sid)
 	insert(st, '\r\n')
 	
-	request_raw(client, st)
+	request_write(client, st)
 	client.subscriptions[sid] = callback
 	return sid
 end
 
 function cm.unsubscribe(client, sid)
-	request_raw(client, {'UNSUB ', sid, '\r\n'})
+	request_write(client, {'UNSUB ', sid, '\r\n'})
 	client.subscriptions[sid] = nil
 end
 
@@ -447,6 +451,23 @@ function cm.auth(client, user, pass)
 end
 
 function cm.server_info(client) return client.information end
+
+-- nats.encoded_client_metatable = {
+	-- __index = function(self, key) return rawget(getmetatable(self), "ec_methods")[key] or rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
+	-- methods = nats.client_metatable.methods
+	-- ec_methods = {},
+	-- lang = 'lua',
+	-- version = '0.0.1',
+-- }
+-- local encoded_client_metatable = nats.encoded_client_metatable
+
+-- function cm.encoded_client(client)
+	-- local ec = setmetatable(client, encoded_client_metatable)
+	-- return ec
+-- end
+
+-- local ec = nats.encoded_client_metatable.ec_methods
+-- function ec.get
 
 -- assign functions to handle bool options
 local function config_set(client, k, v)
@@ -471,7 +492,7 @@ end
 function cm.shutdown(client) client.network.socket:shutdown() end
 
 function cm.wait(client, sid, maxcount, timeout)
-	local count, socket, data = 0, client.network.socket
+	local count, socket, data = 1, client.network.socket
 	local timeout_b, timeout_t, last_timeout_b, last_timeout_t
 	
 	if not sid or type(sid) == "number" then 
@@ -496,18 +517,17 @@ function cm.wait(client, sid, maxcount, timeout)
 	end
 	
 	--printTable({sid, maxcount, timeout})
-	local toe, loop_run_start = 0, gettime()
+	local toe, loop_run_start, func_run_start = 0, gettime(), loop_run_start
 	while true do
 		data = response_read(client)
 		if not data then return end
-		print("tick:wait:data:" .. #data)
 		local op = data.op
 		
 		-- add header decode and encode option
 		if op == 'MSG' or op == 'HMSG' then
-			if sid and sid == data.sid then break end -- before or after?
-			count = count + 1
 			client.subscriptions[data.sid](data.payload, data.reply, data.subject, data.sid, data.headers)
+			count = count + 1
+			if sid and sid == data.sid then break end -- before or after?
 			if maxcount and count >= maxcount then
 				print("maxcount:" .. maxcount .. ":" .. count)
 				break
@@ -520,7 +540,7 @@ function cm.wait(client, sid, maxcount, timeout)
 		
 		if timeout_b then
 			toe = toe + 1
-			if toe >= 500 then
+			if toe >= 100 then
 				local current_time = gettime()
 				if timeout_b <= (current_time - loop_run_start) then
 					print("timeout on " .. count .. " nats:cm.wait loop " .. (current_time - loop_run_start))
