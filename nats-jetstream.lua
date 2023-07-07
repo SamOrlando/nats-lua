@@ -7,9 +7,6 @@ local cjson  = require('cjson')
 local uuid   = require('uuid')
 
 -- ### Local properties ### speed and neet laziness ftw
-local request_raw = nats.request.raw
-local response_read = nats.response.read
-local create_inbox = nats.create_inbox
 local encode,decode = cjson.encode, cjson.decode
 
 local stream_metatable = {
@@ -33,8 +30,7 @@ local con = consumer_metatable.methods -- consumer
 
 -- add configuration option or shared subjects table option?
 function cm.stream(client, stream_name, subjects)
-	-- test and adjust subjects so string or table can be passed.
-	-- Only leaky part is 'true' being converted but meh.
+	-- test and adjust subjects ; leaky part is 'true' being converted but meh.
 	if subjects and type(subject) ~= "table" then subjects = {tostring(subjects)} end
 
 	local msg = cm.get(client, '$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects })).payload
@@ -158,97 +154,3 @@ function js.purge(stream)
 	return true, msg
 end
 
---fix below
-
-js.snapshot = {}
-function js.snapshot.create(stream, config)
-	local delievery_subject = create_inbox() -- create_inbox is a function that generates a unique subject name
-	local configJson = encode(config)
-	local data = decode(stream.client, 'PUB $JS.API.STREAM.SNAPSHOT.' .. stream.name .. ' ' .. delievery_subject .. ' \r\n' .. configJson .. '\r\n')
-	local data = response_read(stream.client)
-	if data.action == '-ERR' then
-		stream.client.error('failed to create stream snapshot: ' .. (data.content or 'unknown error'))
-		return
-	end
-	return delievery_subject
-end
-
---$JS.SNAPSHOT.RESTORE.<stream>.<msg id> future?
-function js.snapshot.restore(stream, snap_data)
-	local reply = stream.client:subscribe(create_inbox(), function(message)
-		-- handle any responses from the server
-	end)
-	local data = decode(stream.client, 'PUB $JS.API.STREAM.RESTORE.' .. stream.name .. ' ' .. #snap_data .. '\r\n' .. snap_data .. '\r\n')
-	local data = response_read(stream.client)
-	if data.action == '-ERR' then
-		stream.client.error('failed to restore stream: ' .. (data.content or 'unknown error'))
-		stream.client:unsubscribe(reply)
-		return false
-	end
-	stream.client:unsubscribe(reply) -- unsubscribe from the delivery subject
-	return true
-end
-
-function js.snapshot.read(stream, delievery_subject)
-	local snapshot = {}
-	local unique_id = stream.client:subscribe(delievery_subject, function(message)
-		table.insert(snapshot, message)
-	end)
-	stream.client:wait() -- wait for all snapshot chunks to be received
-	stream.client:unsubscribe(unique_id) -- unsubscribe from the delivery subject
-	return table.concat(snapshot) -- concatenate the chunks to form the complete snapshot
-end
-
-return nats
-
--- function js.template.create(client, template_name, config)
-	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.CREATE.' .. template_name .. ' \r\n' .. encode(config) .. '\r\n')
-	-- local data = response_read(client)
-	-- if data.action == '-ERR' then
-		-- client.error('failed to create stream template: ' .. (data.content or 'unknown error'))
-	-- end
--- end
-
--- function js.template.delete(client, template_name)
-	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.DELETE.' .. template_name .. ' \r\n')
-	-- local data = response_read(client)
-	-- if data.action == '-ERR' then
-		-- client.error('failed to delete stream template: ' .. (data.content or 'unknown error'))
-	-- end
--- end
-
--- function js.template.info(client, template_name)
-	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.INFO.' .. template_name .. ' \r\n')
-	-- local data = response_read(client)
-	-- if data.action ~= 'INFO' then
-		-- client.error('failed to get stream template info: ' .. (data.content or 'unknown error'))
-	-- end
-	-- return decode(data.content)
--- end
-
--- function js.templates(client)
-	-- request_raw(client, 'PUB $JS.API.STREAM.TEMPLATE.LIST \r\n')
-	-- local data = response_read(client)
-	-- if data.action ~= 'INFO' then
-		-- client.error('failed to list stream templates: ' .. (data.content or 'unknown error'))
-	-- end
-	-- return decode(data.content)
--- end
-
--- $JS.EVENT.METRIC.CONSUMER_ACK.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.STREAM.CREATED.<stream>
--- $JS.EVENT.ADVISORY.STREAM.DELETED.<stream>
--- $JS.EVENT.ADVISORY.STREAM.UPDATED.<stream>
--- $JS.EVENT.ADVISORY.CONSUMER.CREATED.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.CONSUMER.DELETED.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.STREAM.SNAPSHOT_CREATE.<stream>
--- $JS.EVENT.ADVISORY.STREAM.SNAPSHOT_COMPLETE.<stream>
--- $JS.EVENT.ADVISORY.STREAM.RESTORE_CREATE.<stream>
--- $JS.EVENT.ADVISORY.STREAM.RESTORE_COMPLETE.<stream>
--- $JS.EVENT.ADVISORY.STREAM.LEADER_ELECTED.<stream>
--- $JS.EVENT.ADVISORY.STREAM.QUORUM_LOST.<stream>
--- $JS.EVENT.ADVISORY.CONSUMER.LEADER_ELECTED.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.CONSUMER.QUORUM_LOST.<stream>.<consumer>
--- $JS.EVENT.ADVISORY.API

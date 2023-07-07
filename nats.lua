@@ -105,14 +105,6 @@ local function create_client(config, n_opts)
 			lwrite = nil,
 			opts = n_opts,
 		},
-		encoding = {
-			payload = nil,
-			headers = nil,
-		},
-		decoding = {
-			payload = nil,
-			headers = nil,
-		},
 		error = nats.error,
 	}, client_metatable)
 
@@ -413,8 +405,9 @@ function cm.request(client, subject, callback, payload, headers)
 	return sid
 end
 
+local empty_func = function() end
 function cm.get(client, subject, payload, headers)
-	local sid = cm.request(client, subject, function() end, payload, headers)
+	local sid = cm.request(client, subject, empty_func, payload, headers)
 	local data = cm.wait(client, sid, nil, 2)
 	
 	if data then
@@ -452,22 +445,53 @@ end
 
 function cm.server_info(client) return client.information end
 
--- nats.encoded_client_metatable = {
-	-- __index = function(self, key) return rawget(getmetatable(self), "ec_methods")[key] or rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
-	-- methods = nats.client_metatable.methods
-	-- ec_methods = {},
-	-- lang = 'lua',
-	-- version = '0.0.1',
--- }
--- local encoded_client_metatable = nats.encoded_client_metatable
+nats.encoded_client_metatable = {
+	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, "client")[key] end,
+	methods = {}
+}
+local encoded_client_metatable = nats.encoded_client_metatable
 
--- function cm.encoded_client(client)
-	-- local ec = setmetatable(client, encoded_client_metatable)
-	-- return ec
--- end
+function cm.encoded_client(client)
+	return setmetatable({client = client}, encoded_client_metatable)
+end
 
--- local ec = nats.encoded_client_metatable.ec_methods
--- function ec.get
+local ec = nats.encoded_client_metatable.methods
+function ec.publish(client, subject, payload, reply, headers)
+	client = rawget(client, "client")
+	_, payload = pcall(client.encoding.payload, payload)
+	_, headers = pcall(client.encoding.headers, headers)
+	cm.publish(client, subject, payload, reply, headers)
+end
+
+function ec.get(client, subject, payload, headers)
+	client = rawget(client, "client")
+	_, payload = pcall(client.encoding.payload, payload)
+	_, headers = pcall(client.encoding.headers, headers)
+	local data = cm.get(client, subject, payload, headers)
+	_, data.payload = pcall(client.decoding.payload, data.payload)
+	_, data.headers = pcall(client.decoding.headers, data.headers)
+	return data
+end
+
+local function encoded_request_wrapper(client, subject, callback, payload, headers)
+	_, payload = pcall(client.decoding.payload, payload)
+	_, headers = pcall(client.decoding.headers, headers)
+	return client, subject, callback, payload, headers
+end
+
+function ec.request(client, subject, callback, payload, headers)
+	client = rawget(client, "client")
+	_, payload = pcall(client.encoding.payload, payload)
+	_, headers = pcall(client.encoding.headers, headers)
+	return cm.request(client, subject, encoded_request_wrapper, payload, headers)
+end
+
+function ec.wait(client, sid, maxcount, timeout)
+	local data = cm.wait(rawget(client, "client"), sid, maxcount, timeout)
+	_, data.payload = pcall(client.decoding.payload, data.payload)
+	_, data.headers = pcall(client.decoding.headers, data.headers)
+	return data
+end
 
 -- assign functions to handle bool options
 local function config_set(client, k, v)
@@ -525,7 +549,8 @@ function cm.wait(client, sid, maxcount, timeout)
 		
 		-- add header decode and encode option
 		if op == 'MSG' or op == 'HMSG' then
-			client.subscriptions[data.sid](data.payload, data.reply, data.subject, data.sid, data.headers)
+			if not client.subscriptions[data.sid] then print("wtf: " .. data.sid)
+			else client.subscriptions[data.sid](data.payload, data.reply, data.subject, data.sid, data.headers) end
 			count = count + 1
 			if sid and sid == data.sid then break end -- before or after?
 			if maxcount and count >= maxcount then
