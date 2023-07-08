@@ -32,7 +32,7 @@ local network, response, request = nats.network, nats.response, nats.request -- 
 local verbose = nats.verbose -- (false or nil for off) levels 1-5
 local insert, concat = table.insert, table.concat
 local gettime = socket.gettime
-local type = type
+local type, pcall, rawget, setmetatable = type, pcall, rawget, setmetatable
 local floor, tonumber = math.floor, tonumber
 local encode, decode = cjson.encode, cjson.decode
 
@@ -121,6 +121,7 @@ function network.write(client, buffer)
 	end
 	local _, err = client.network.socket:send(buffer)
 	if err then
+		client.connected = false
 		client.error('connection error: ' .. err)
 	else client.network.lwrite = buffer end
 end
@@ -133,7 +134,6 @@ function network.read(client, len)
 		if err == "timeout" then return
 		elseif err == "closed" then
 			client.connected = false
-			return
 		end
 		client.error('connection error: ' .. err)
 	else
@@ -340,7 +340,7 @@ function cm.connect(client)
 	if data.op == 'INFO' then
 		client.information = data.payload
 	end
-	client.connected = true
+	client.connected = true -- should this be in the op check?
 end
 
 function cm.ping(client)
@@ -410,7 +410,7 @@ end
 
 function cm.get(client, subject, payload, headers)
 	local sid = cm.request(client, subject, nil, payload, headers)
-	local data = cm.wait(client, sid, nil, 2)
+	local data = cm.wait(client, sid, nil, 2) -- add timeout config here
 	
 	if data then
 	else cm.unsubscribe(client, sid) end
@@ -448,50 +448,79 @@ end
 function cm.server_info(client) return client.information end
 
 nats.encoded_client_metatable = {
-	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, "client")[key] end,
-	methods = {}
+	__index = function(self, key)
+		return rawget(getmetatable(self), "methods")[key] or rawget(self, "client")[key]
+	end,
+	methods = {},
 }
 
-function cm.encoded_client(client)
+function cm.encoded_client(client) -- passthru_func removed for obvious json and http header support.
+	client.encoding_payload = client.encoding_payload or encode
+	client.decoding_payload = client.decoding_payload or decode
+	client.encoding_headers = client.encoding_headers or nats.encode_headers
+	client.decoding_headers = client.decoding_headers or nats.decode_headers
 	return setmetatable({client = client}, nats.encoded_client_metatable)
 end
 
 local ec = nats.encoded_client_metatable.methods
-function ec.publish(client, subject, payload, reply, headers)
-	client = rawget(client, "client")
-	_, payload = pcall(client.encoding.payload, payload)
-	_, headers = pcall(client.encoding.headers, headers)
-	cm.publish(client, subject, payload, reply, headers)
+function ec.encode_payload(client, payload)
+	if not payload then return end
+	local s, r = pcall(client.encoding_payload, payload)
+	if s then return r else print("encode_payload error: " .. r .. " : " .. tostring(payload)) end
 end
+local ec_encode_payload = ec.encode_payload
 
-function ec.get(client, subject, payload, headers)
-	client = rawget(client, "client")
-	_, payload = pcall(client.encoding.payload, payload)
-	_, headers = pcall(client.encoding.headers, headers)
-	local data = cm.get(client, subject, payload, headers)
-	_, data.payload = pcall(client.decoding.payload, data.payload)
-	_, data.headers = pcall(client.decoding.headers, data.headers)
-	return data
+function ec.decode_payload(client, payload)
+	if not payload or payload == '' then return end
+	local s, r = pcall(client.decoding_payload, payload)
+	if s then return r else print("decode_payload error: " .. r .. " : " .. tostring(payload)) end
+end
+local ec_decode_payload = ec.decode_payload
+
+function ec.encode_headers(client, headers)
+	if not headers then return end
+	local s, r = pcall(client.encoding_headers, headers)
+	if s then return r else print("encode_headers error: " .. r .. " : " .. tostring(headers)) end
+end
+local ec_encode_headers = ec.encode_headers
+
+function ec.decode_headers(client, headers)
+	if not headers then return end
+	local s, r = pcall(client.decoding_headers, headers)
+	if s then return r else print("decode_headers error: " .. r .. " : "  .. tostring(headers)) end
+end
+local ec_decode_headers = ec.decode_headers
+
+function ec.publish(client, subject, payload, reply, headers)
+	cm.publish(rawget(client, "client"), subject, ec_encode_payload(client, payload), reply, ec_encode_headers(client, headers))
 end
 
 function ec.request(client, subject, callback, payload, headers)
 	client = rawget(client, "client")
-	_, payload = pcall(client.encoding.payload, payload)
-	_, headers = pcall(client.encoding.headers, headers)
-	return cm.request(client, subject, function(client, subject, callback, payload, headers)
-		_, payload = pcall(client.decoding.payload, payload)
-		_, headers = pcall(client.decoding.headers, headers)
-		local s,r = pcall(callback, client, subject, callback, payload, headers)
-		if s then return r end
-	end, payload, headers)
+	return cm.request(client, subject, function(payload, reply, subject, sid, headers)
+		payload = ec_decode_payload(client, payload)
+		headers = ec_decode_headers(client, headers)
+		local _,r = pcall(callback, payload, reply, subject, sid, headers)
+		return r
+	end,
+	ec_encode_payload(client, payload),
+	ec_encode_headers(client, headers))
+end
+
+function ec.get(client, subject, payload, headers)
+	client = rawget(client, "client")
+	local data = cm.get(client, subject, ec_encode_payload(client, payload), ec_encode_headers(client, headers))
+	data.payload = ec_decode_payload(client, data.payload)
+	data.headers = ec_decode_headers(client, data.headers)
+	return data
 end
 
 function ec.subscribe(client, subject, callback, queue)
-	cm.subscribe(getraw(client, "client"), subject, function(payload, reply, subject, sid, headers)
-		_, payload = pcall(client.decoding.payload, payload)
-		_, headers = pcall(client.decoding.headers, headers)
+	cm.subscribe(rawget(client, "client"), subject, function(payload, reply, subject, sid, headers)
+		payload = ec_decode_payload(client, payload)
+		headers = ec_decode_headers(client, headers)
 		local s,r = pcall(callback, payload, reply, subject, sid, headers)
-		if s then return r end
+		if s then return r else print("ec:sub:err " .. r) end
 	end, queue)
 end
 

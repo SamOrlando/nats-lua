@@ -153,4 +153,3 @@ function js.purge(stream)
 	if msg.error then return false, msg end
 	return true, msg
 end
-
