@@ -3,8 +3,8 @@ local nats = nats or require('nats')
 nats.jetstream = {}
 
 -- ### Library requirements ###
-local cjson  = require('cjson')
-local uuid   = require('uuid')
+local cjson = require('cjson')
+local uuid = require('uuid')
 
 -- ### Local properties ### speed and neet laziness ftw
 local encode,decode = cjson.encode, cjson.decode

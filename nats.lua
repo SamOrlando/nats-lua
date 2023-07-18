@@ -8,10 +8,6 @@ local nats = {
 	response = {}, -- response handing (from server to client)
 }
 
--- fix options to be pure in submit to server CONNECT
--- todo - make encoded connection a seperate object
--- todo - support verbose mode natively to nats-lua
--- todo - header encoding and decoding options
 -- todo - protocol setting in CONNECT (confirm dynamic INFO adjustments in client)
 
 nats.client_metatable = {
@@ -36,7 +32,7 @@ local type, pcall, rawget, setmetatable = type, pcall, rawget, setmetatable
 local floor, tonumber = math.floor, tonumber
 local encode, decode = cjson.encode, cjson.decode
 
-local client_metatable = nats.client_metatable -- !!!!!!
+local client_metatable = nats.client_metatable -- expose for other extended modules (jetstream)
 
 local valid_config_toggles = {headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true,verbose=true}
 local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true,protocol=true}
@@ -51,7 +47,7 @@ local connect_defaults = {
 }
 
 -- ### Local Functions
-local function merge_connect_defaults(ct)
+local function merge_connect_defaults(ct) -- this is broken as fuck due to or statement in false condition
 	ct = ct or {}
 	for k, v in pairs(connect_defaults) do ct[k] = ct[k] or connect_defaults[k] end
 	return ct
@@ -571,38 +567,37 @@ function cm.wait(client, sid, maxcount, timeout)
 		if timeout_t then socket:settimeout(timeout_t,'t') end
 	end
 	
-	local toe, loop_run_start = 0, gettime(), loop_run_start
+	local toe, loop_run_start = 0, gettime(), loop_run_start -- this toe thing has gone too far... blame you anon
 	while true do
+		if toe >= 100 then
+			local current_time = gettime()
+			if timeout_b and timeout_b <= (current_time - loop_run_start) then
+				print("timeout on " .. count .. " nats:cm.wait loop " .. (current_time - loop_run_start))
+				return
+			end
+			toe = 0	
+		else toe = toe + 1 end
+		
 		data = response_read(client)
 		if not data then return end
 		local op = data.op
 		
-		-- add header decode and encode option
 		if op == 'MSG' or op == 'HMSG' then
 			for k,v in pairs(client.subscriptions[data.sid](data.payload, data.reply, data.subject, data.sid, data.headers) or {}) do
 				data[k] = v
 			end
 			if sid and sid == data.sid then break end
-			count = count + 1
-			if maxcount and count >= maxcount then
-				print("maxcount:" .. maxcount .. ":" .. count)
-				break
-			end
+			count = count + 1 -- keeping count +1 outof loop for timeout checks information
+			if maxcount and count >= maxcount then break end
 		elseif op == 'PING' then cm.pong(client)
 		elseif op == 'INFO' then
-			-- client.information = decode(data.payload) -- notsure if this will overwrite, so lets be safe...
-			for k,v in pairs(decode(data.payload) or {}) do client.information[k] = v end
-		end
-		
-		if timeout_b then
-			toe = toe + 1
-			if toe >= 100 then
-				local current_time = gettime()
-				if timeout_b <= (current_time - loop_run_start) then
-					print("timeout on " .. count .. " nats:cm.wait loop " .. (current_time - loop_run_start))
-					return
+			-- client.information = decode(data.payload) -- notsure if this will overwrite and untested, so lets be safe..
+			for k,v in pairs(decode(data.payload) or {}) do 
+				if k == "no_responders" and v == true then
+					print("no_responders caught")
+				else
+					client.information[k] = v
 				end
-				toe = 0	
 			end
 		end
 	end
