@@ -30,10 +30,11 @@ local con = consumer_metatable.methods -- consumer
 
 -- add configuration option or shared subjects table option?
 function cm.stream(client, stream_name, subjects)
-	-- test and adjust subjects ; leaky part is 'true' being converted but meh.
-	if subjects and type(subject) ~= "table" then subjects = {tostring(subjects)} end
+	if client.is_ec then client = client.client end
+	
+	if subjects and type(subject) ~= "table" then subjects = {tostring(subjects)} end -- test and adjust subjects ; leaky part is 'true' being converted but meh.
 
-	local msg = cm.get(client, '$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects })).payload
+	local msg = decode(cm.get(client, '$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects })).payload)
 	if msg.error then return false, msg end
 
 	-- create and set stream object
@@ -62,7 +63,9 @@ function js.delete(stream) -- we will need two of them for cm and js
 end
 
 function js.consumer(stream, consumer_name, config)
-	local msg = decode(stream.client:get('$JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name})).payload)
+	local msg = stream.client:get('$JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name})).payload
+	printTable(msg)
+	msg = decode(msg)
 	if msg.error then return false, msg end
 
 	-- create and set consumer object
