@@ -569,7 +569,7 @@ function cm.unsubscribe(client, sid)
 	client.subscriptions[sid] = nil
 end
 
-function cm.auth(client, user, pass)
+function cm.auth(client, user, pass) -- crap
 	client.config.user = user or client.config.user
 	client.config.pass = pass or client.config.pass
 	return {user=client.config.user,pass=client.config.pass}
@@ -648,7 +648,10 @@ end
 --
 -- nats msg methods
 local mm = nats.msg_metatable.methods
-function mm.repl
+function mm.respond(m, data, header, reply)
+	if m.reply then m.client:publish(m.reply, data, header, reply) end
+end
+
 
 --
 -- client configuration handling - client:option(value)
