@@ -207,7 +207,6 @@ local function create_msg(mt)
 	return setmetatable(mt, nats.msg_metatable)
 end
 
-
 function nats.is_msg(m)
 	if type(m) == "table" and rawget(getmetatable(m), "is_msg") then return m end
 	return nil
@@ -483,7 +482,7 @@ function cm.pong(client) request_write(client, 'PONG\r\n') end
 
 function cm.publish(client, subject, data, reply, header)
 	local st -- send_table to request_write
-	local msg = is_msg(subject) or create_msg({subject=subject, data=data, reply=reply, header=header, sid=sid, client=client}) -- confirm or create msg object
+	local msg = is_msg(subject) or create_msg({subject=subject, data=data, reply=reply, header=header, client=client}) -- confirm or create msg object
 	header = msg.header -- local for multiple calls - set from msg
 	data = msg.data or '' -- local for multiple and placing '' if nil - set from msg
 	
@@ -651,7 +650,6 @@ local mm = nats.msg_metatable.methods
 function mm.respond(m, data, header, reply)
 	if m.reply then m.client:publish(m.reply, data, header, reply) end
 end
-
 
 --
 -- client configuration handling - client:option(value)
