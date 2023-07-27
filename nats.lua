@@ -17,6 +17,7 @@ local nats = {
 		host = '127.0.0.1',
 		port = 4222,
 		url = 'nats://127.0.0.1:4222',
+		timeout = 2,
 	},
 }
 nats.errors = {
@@ -118,8 +119,10 @@ local function decode_headers(s)
 end
 nats.decode_headers = decode_headers
 
-local function passthru_func(...) return unpack({...}) end
-nats.passthru_func = passthru_func
+function nats.passthru_func(...) return unpack({...}) end
+local passthru_func = nats.passthru_func
+nats.empty_func = function() end
+local empty_func = nats.empty_func
 
 --
 -- nats client/conn object
@@ -200,16 +203,16 @@ nats.msg_metatable = {
 }
 local msg_metatable = nats.msg_metatable
 
-local function create_msg(subject, data, reply, header, sid, client)
-	return setmetatable({
-		subject = subject,
-		reply = reply,
-		header = header,
-		data = data,
-		sid = sid,
-		client = client,
-	}, nats.msg_metatable)
+local function create_msg(mt)
+	return setmetatable(mt, nats.msg_metatable)
 end
+
+
+function nats.is_msg(m)
+	if type(m) == "table" and rawget(getmetatable(m), "is_msg") then return m end
+	return nil
+end
+local is_msg = nats.is_msg
 
 --
 -- network methods
@@ -478,33 +481,35 @@ end
 
 function cm.pong(client) request_write(client, 'PONG\r\n') end
 
-function cm.publish(client, subject, data, reply, headers)
-	local st
-	data = data or ''
+function cm.publish(client, subject, data, reply, header)
+	local st -- send_table to request_write
+	local msg = is_msg(subject) or create_msg({subject=subject, data=data, reply=reply, header=header, sid=sid, client=client}) -- confirm or create msg object
+	header = msg.header -- local for multiple calls - set from msg
+	data = msg.data or '' -- local for multiple and placing '' if nil - set from msg
 	
-	if headers and #headers > 0 then
-		st = {'HPUB ', subject}
+	if header and #header > 0 then
+		st = {'HPUB ', msg.subject}
 	else
-		st = {'PUB ', subject}
-		headers = nil
+		st = {'PUB ', msg.subject}
+		header = nil
 	end
 	
 	-- if reply insert
-	if reply then
+	if msg.reply then
 		insert(st, ' ')
-		insert(st, reply)
+		insert(st, msg.reply)
 	end
 	
-	-- headers add size and to total size
-	if headers then
-		headers = 'NATS/1.0\r\n' .. headers .. '\r\n'
+	-- header add size and to total size
+	if header then
+		header = 'NATS/1.0\r\n' .. header .. '\r\n'
 		insert(st, ' ')
-		insert(st, #headers)
+		insert(st, #header)
 		insert(st, ' ')
-		insert(st, (#headers + #data))
+		insert(st, (#header + #data))
 		insert(st, '\r\n')
-		-- insert the headers 
-		insert(st, headers)
+		-- insert the header 
+		insert(st, header)
 	else
 		-- insert data size
 		insert(st, ' ')
@@ -518,36 +523,29 @@ function cm.publish(client, subject, data, reply, headers)
 
 	request_write(client, st)
 end
-function cm.publish_msg(client, msg) cm.publish(client, msg.subject, msg.data, msg.reply, msg.header) end
 
-function cm.request(client, subject, callback, data, headers)
-	local inbox = create_inbox() 
-	local sid = cm.subscribe(client, inbox, function(data, reply, subject, sid, headers)
-		cm.unsubscribe(client, sid)
+function cm.request(client, subject, callback, data, header)
+	local msg = is_msg(subject) or create_msg({subject=subject, reply=create_inbox(), data=data, header=header, client=client})
+	msg.sid = cm.subscribe(client, msg.reply, function(m)
+		cm.unsubscribe(client, m.sid)
 		if callback then
-			local s, d = pcall(callback, data, reply, subject, sid, headers)
-			if s then return d end
+			local s, rm = pcall(callback, m)
+			if s then return rm end
 		end
 	end)
 
-	cm.publish(client, subject, data, inbox, headers)
-	
-	return sid
+	cm.publish(client, msg)
+
+	return msg
 end
-function cm.request_msg(client, msg, callback) return cm.request(client, msg.subject, callback, msg.data, msg.header) end
 
-function cm.get(client, subject, data, headers)
-
-	local sid = cm.request(client, subject, nil, data, headers)
-	local msg = cm.wait(client, sid, nil, 2) -- add timeout config here
-	
-	if msg then return msg
-	else cm.unsubscribe(client, sid) end
-
+function cm.get(client, subject, data, header)
+	local msg = is_msg(subject) or create_msg({subject=subject, data=data, header=header, client=client})
+	msg.sid = cm.request(client, msg)
+	local r_msg = cm.wait(client, msg.sid, nil, nats.defaults.timeout) -- add timeout config here
+	return r_msg or cm.unsubscribe(client, sid) -- return results or unsubscribe as its too late
 end
-function cm.get_msg(client, msg) return cm.get(client, msg.subject, msg.data, msg.header) end
 
-local function subscribe_passthru(m) return m end
 function cm.subscribe(client, subject, callback, queue)
 	local sid = uuid()
 	
@@ -560,7 +558,7 @@ function cm.subscribe(client, subject, callback, queue)
 	insert(st, '\r\n')
 	
 	request_write(client, st)
-	client.subscriptions[sid] = {subject=subject, queue=queue, callback=callback or subscribe_passthru}
+	client.subscriptions[sid] = {subject=subject, queue=queue, callback=callback or passthru_func}
 	return sid
 end
 
@@ -615,12 +613,14 @@ function cm.wait(client, sid, maxcount, timeout)
 			toe = 0	
 		else toe = toe + 1 end
 		
+		msg = nil
 		msg_t = response_read(client)
 		if not msg_t then return end
-		local op = msg_t.op		
+		local op = msg_t.op
 		
 		if op == 'MSG' or op == 'HMSG' then
-			msg = create_msg(msg_t.subject, msg_t.data, msg_t.reply, msg_t.header, msg_t.sid, client)
+			msg_t.client = client
+			msg = create_msg(msg_t)
 			local st = client.subscriptions[msg.sid]
 			if st then msg = st.callback(msg) or msg end
 			if sid and sid == msg.sid then break end
