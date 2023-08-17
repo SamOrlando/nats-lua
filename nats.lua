@@ -100,11 +100,8 @@ local function encode_header(t)
 	if type(t) == "table" then
 		local tht = {}
 		for k,v in pairs(t) do
-			if type(v) == "table" then
-                insert(tht, concat({k, ': ', concat(v, ', '), '\r\n'}))
-            else
-                insert(tht, concat({k, ': ', v, '\r\n'}))
-            end
+			if type(v) == "table" then insert(tht, concat({k, ': ', concat(v, ', '), '\r\n'}))
+			else insert(tht, concat({k, ': ', v, '\r\n'})) end
 		end
 		return concat(tht)
 	end
@@ -118,9 +115,9 @@ local function decode_header(s)
 	for line in s:gmatch("(.-)\r\n") do
 		local k,v = line:match("(.-):%s*(.*)")
 		if k then
-            if tbl[k] then tbl[k] = {unpack(tbl[k]), v}
-            else tbl[k] = v end
-        end
+			if tbl[k] then tbl[k] = {unpack(tbl[k]), v}
+			else tbl[k] = v end
+		end
 	end
 	return tbl
 end

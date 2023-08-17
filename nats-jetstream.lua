@@ -78,11 +78,14 @@ function js.consumer(stream, consumer_name, config)
 	local consumer = setmetatable({
 		name = consumer_name,
 		stream = stream,
-		config = config or msg.data,
+		config = msg.data.config,
+		cluster = msg.data.cluster,
 	}, consumer_metatable)
 
-	-- insert consumer info into stream table
-	rawset(rawget(stream, "consumers"), consumer_name, consumer.config)
+	-- insert consumer info into stream table and client 
+	stream.consumers[consumer_name] = consumer.config
+	stream.client.streams[stream.name].consumers = stream.client.streams[stream.name].consumers or {}
+	stream.client.streams[stream.name].consumers[consumer_name] = consumer.config
 	return consumer, msg
 end
 
@@ -91,7 +94,9 @@ function con.delete(consumer)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	-- delete references
+	
 	consumer.stream.consumers[consumer.name] = nil
+	consumer.stream.client.streams[consumer.stream.name].consumers[consumer.name] = nil
 	consumer = nil
 	return true, msg
 end
