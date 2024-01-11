@@ -81,6 +81,7 @@ nats.client_metatable = {
 }
 local client_metatable = nats.client_metatable
 
+uuid.seed() -- kick the seed a little
 local function create_client(config, n_opts) -- fix default checks
 	local client = setmetatable({
 		connected = false,
@@ -129,7 +130,6 @@ local function create_client(config, n_opts) -- fix default checks
 	local conf_t = rawget(client, "config")
 	for k,v in pairs(config or {}) do conf_t[k] = v end
 
-	uuid.seed()
 	return client
 end
 
@@ -514,7 +514,7 @@ function cm.subscribe(client, subject, callback, queue)
 	local sid = uuid()
 
 	local st = {'SUB ', subject, ' '}
-	if queue then
+	if queue and queue ~= "" then
 		insert(st, queue)
 		insert(st, ' ')
 	end
@@ -632,15 +632,6 @@ function mm.publish(m, subject, data, reply, header)
 		data or m.data,
 		reply or m.reply,
 		header or m.header)
-	return m
-end
-
-function mm.forward(m, subject)
-	m.client:publish(
-		subject,
-		m.data,
-		m.reply,
-		m.header)
 	return m
 end
 
