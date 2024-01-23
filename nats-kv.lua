@@ -22,7 +22,10 @@ local kv = nats.jetstream.kv
 	-- // WatchAll will invoke the callback for all updates.
 	-- WatchAll(opts ...WatchOpt) (KeyWatcher, error)
 	-- // Keys will return all keys.
+	-- // DEPRECATED: Use ListKeys instead to avoid memory issues.
 	-- Keys(opts ...WatchOpt) ([]string, error)
+	-- // ListKeys will return all keys in a channel.
+	-- ListKeys(opts ...WatchOpt) (KeyLister, error)
 	-- // History will return all historical values for the key.
 	-- History(key string, opts ...WatchOpt) ([]KeyValueEntry, error)
 	-- // Bucket returns the current bucket name.

@@ -3,12 +3,12 @@ local nats = {
 	_DESCRIPTION = 'LUA client for NATS w/header, tls - https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2023 - MIT Cheese Please',
 	--
-	verbose = false,
+	verbose = false, -- use properly in relation to commands and +OK response
 	defaults = {
 		host = '127.0.0.1',
 		port = 4222,
 		url = 'nats://127.0.0.1:4222',
-		timeout = 2,
+		timeout = 5,
 	},
 	network = {}, -- network functions
 	request = {}, -- request handling (from client to server)
@@ -35,18 +35,20 @@ local encode, decode = cjson.encode, cjson.decode
 local valid_config_toggles = {headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true,verbose=true}
 local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true,protocol=true}
 
+-- common meh functions
+local passthru_func = function(...) return unpack({...}) end
+nats.passthru_func = passthru_func
+local empty_func = function() end
+nats.empty_func = empty_func
 
--- built in lua native <-> http_header encoding and passthru function
+-- built in lua native <-> nats header encoding and passthru function
 local function encode_header(t)
-	if type(t) == "table" then
-		local tht = {}
-		for k,v in pairs(t) do
-			if type(v) == "table" then insert(tht, concat({k, ': ', concat(v, ', '), CRLF}))
-			else insert(tht, concat({k, ': ', v, CRLF})) end
-		end
-		return concat(tht)
+	local tht = {}
+	for k,v in pairs(t or {}) do
+		if type(v) == "table" then insert(tht, concat({k, ': ', concat(v, ', '), CRLF}))
+		else insert(tht, concat({k, ': ', v, CRLF})) end
 	end
-	return t or "" -- anything else? user error or compiled their own header string?
+	return concat(tht)
 end
 nats.encode_header = encode_header
 
@@ -63,11 +65,6 @@ local function decode_header(s)
 	return tbl
 end
 nats.decode_header = decode_header
-
-local passthru_func = function(...) return unpack({...}) end
-nats.passthru_func = passthru_func
-local empty_func = function() end
-nats.empty_func = empty_func
 
 --
 -- nats client/conn object
@@ -158,7 +155,6 @@ local encoded_client_metatable = nats.encoded_client_metatable
 
 function nats.is_encoded(m)
 	if type(m) == "table" and rawget(getmetatable(m), "is_encoded") then return m end
-	return nil
 end
 local is_encoded = nats.is_encoded
 
@@ -166,7 +162,7 @@ local is_encoded = nats.is_encoded
 -- nats msg object
 nats.msg_metatable = {
 	__index = function(self, key) return rawget(self, key) or rawget(getmetatable(self), "methods")[key] or rawget(getmetatable(self), key) end,
-	--__newindex = function(self, key, value) print("__newindex msg: " .. key .. " with a value of " .. (value or "nil")) end,
+	__newindex = function(self, key, value) print("__newindex msg: " .. key .. " with a value of " .. (value or "nil")) end,
 	methods = {},
 	is_msg = true,
 }
@@ -193,10 +189,10 @@ local is_msg = nats.is_msg
 --
 -- network methods
 function network.write(client, buffer)
-	if #buffer > (client.server_information.max_payload or 1024000) then
+	if #buffer > (client.server_information.max_payload or 1024000) then -- long var in heavy call
 		client.error("buffer write error: payload too large at " .. #buffer .. " : max_payload is " .. client.server_information.max_payload)
 	end
-	if verbose and verbose > 3 then print('->> '..buffer:sub(1,-3)) end
+	if verbose and verbose > 5 then print('->> '..buffer:sub(1,-3)) end
 	local _, err = client.network.socket:send(buffer)
 	if err then
 		client.connected = false
@@ -216,7 +212,7 @@ function network.read(client, len)
 		client.error('connection error: ' .. err)
 	else
 		client.network.lread = line
-		if verbose and verbose > 3 then print('<<- '..line) end
+		if verbose and verbose > 5 then print('<<- '..line) end
 		return line
 	end
 end
@@ -500,13 +496,13 @@ function cm.request(client, subject, callback, data, header)
 	end)
 
 	local msg = cm.publish(client, subject, data, reply, header)
-	msg.sid = sid
+	rawset(msg, "sid", sid)
 	return msg
 end
 
 function cm.get(client, subject, data, header)
-	local msg = cm.request(client, subject, callback, data, header)
-	local r_msg = cm.wait(client, msg.sid, nil, nats.defaults.timeout) -- add timeout config here
+	local msg = cm.request(client, subject, nil, data, header)
+	local r_msg = cm.wait(client, msg.sid, nil, client.config.timeout) -- add timeout config here
 	return r_msg or cm.unsubscribe(client, msg.sid) -- return results or unsubscribe as its too late
 end
 
@@ -645,10 +641,13 @@ end
 
 function mm.get(m, subject, data, header)
 	return m.client:get(
-		subject or m.subject,
-		data or m.data,
-		header or m.header)
+		subject,
+		data,
+		header)
 end
+
+-- mm.size
+
 
 -- I hate everything about
 -- encoded connection / client
