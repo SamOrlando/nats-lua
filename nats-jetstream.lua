@@ -5,11 +5,13 @@ nats.jetstream = {}
 -- ### Library requirements ###
 local cjson = require('cjson')
 local uuid = require('uuid')
+local nuid = require('nuid')
 
 -- ### Local properties ### speed and neet laziness ftw
 local encode,decode = cjson.encode, cjson.decode
 local json_error_true = '{\"error\":true}'
 local rawset, rawget = rawset, rawget
+local tonumber = tonumber
 
 local stream_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
@@ -179,23 +181,15 @@ function js.purge(stream)
 	return true, msg
 end
 
-mm.get(m, subject, data, header)
 -- modify and make msg objects jetstream enabled
-local function ack_msg(m, t, d, ack) -- msg, type, delay
+local function ack_msg(m, t, d, ack) -- msg, type, delay, wait for ack?
 	if m.ackd then return false, "Message already acknolwedged." end
-	if not (t and t == "+WIP") then rawset(m, "ackd", true) end
+	if t and t ~= "+WIP" then rawset(m, "ackd", true) end
 	if d then t = (t or "-NAK") .. " {\"delay\": " .. ((tonumber(d) or 0)*1000) .. "}" end
-	if ack and m.reply then
-		local r = m:get(m.reply, t)
-		return r and true or false
-	else
-		m:respond(t)
-		return true
-	end
+	if t == "+NXT" or (ack and m.reply) then return m.new():get(m.reply, t)
+	else return m:respond(t) end
 end
 function mm.is_ackd(m) return m.ackd end
--- TODO DoubleAck?
--- AckNext = []byte("+NXT")
 function mm.ack(m) return ack_msg(m) end
 function mm.ack_next(m) return ack_msg(m, "+NXT") end
 function mm.ack_ack(m, rib) return ack_msg(m, "+ACK", nil, true) end
@@ -203,6 +197,51 @@ function mm.nak(m, d) return ack_msg(m, "-NAK", d) end
 function mm.term(m) return ack_msg(m, "+TERM") end
 function mm.in_progress(m) return ack_msg(m, "+WIP") end
 mm.wip = mm.in_progress
+
+local str_gmatch = string.gmatch
+local function str_explode(s, ss, p)
+    if type(ss) ~= "string" or #ss == 0 then return error("Invalid separator.") end
+    local t, i = {}, 1
+    for sub in str_gmatch(s, p and ss or "([^" .. ss .. "]+)") do
+        t[i] = sub
+        i = i + 1
+    end
+    return t, i-1
+end
+
+function mm.metafields(m)
+	local s, tc = str_explode(m.reply, ".") -- string, token count
+	if s[1] == "$JS" and s[2] == "ACK" then
+		if tc == 12 then
+			return {
+				domain = s[3],
+				account_hash = s[4],
+				stream = s[5],
+				consumer = s[6],
+				delivered = tonumber(s[7]),
+				stream_sequence = tonumber(s[8]),
+				consumer_sequence = tonumber(s[9]),
+				timestamp = tonumber(s[10]),
+				pending = tonumber(s[11]),
+				token = tonumber(s[12]),
+			}
+		elseif tc == 9 then
+			return {
+				--domain = "", -- duplicated behavior of go client
+				--account_hash = "", -- same
+				stream = s[3],
+				consumer = s[4],
+				delivered = tonumber(s[5]),
+				stream_sequence = tonumber(s[6]),
+				consumer_sequence = tonumber(s[7]),
+				timestamp = tonumber(s[8]),
+				pending = tonumber(s[9]),
+			}
+		end
+	else return {} end
+end
+
+return nats
 
 -- -- All API endpoints.
 -- jsAllAPI = "$JS.API.>"
@@ -218,7 +257,7 @@ mm.wip = mm.in_progress
 -- JSApiTemplateCreateT = "$JS.API.STREAM.TEMPLATE.CREATE.%s"
 -- -- JSApiTemplates is the endpoint to list all stream template names for this account.
 -- -- Will return JSON response.
--- JSApiTemplates = "$JS.API.STREAM.TEMPLATE.NAMES"
+-- JSApiTemplates = "$JS.API.STREAM.TEMPLATE.NAMES"0
 -- -- JSApiTemplateInfo is for obtaining general information about a named stream template.
 -- -- Will return JSON response.
 -- JSApiTemplateInfo  = "$JS.API.STREAM.TEMPLATE.INFO.*"

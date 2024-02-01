@@ -35,3 +35,18 @@ local objs = nats.jetstream.objs
 	-- List(opts ...ListObjectsOpt) ([]*ObjectInfo, error)
 	-- // Status retrieves run-time status about the backing store of the bucket.
 	-- Status() (ObjectStoreStatus, error)
+	
+	-- objNameTmpl         = "OBJ_%s"     // OBJ_<bucket> // stream name
+	-- objAllChunksPreTmpl = "$O.%s.C.>"  // $O.<bucket>.C.> // chunk stream subject
+	-- objAllMetaPreTmpl   = "$O.%s.M.>"  // $O.<bucket>.M.> // meta stream subject
+	-- objChunksPreTmpl    = "$O.%s.C.%s" // $O.<bucket>.C.<object-nuid> // chunk message subject
+	-- objMetaPreTmpl      = "$O.%s.M.%s" // $O.<bucket>.M.<name-encoded> // meta message subject
+	-- objNoPending        = "0"
+	-- objDefaultChunkSize = uint32(128 * 1024) // 128k
+	-- objDigestType       = "SHA-256="
+	-- objDigestTmpl       = objDigestType + "%s"
+
+-- require("basexx")
+-- func encodeName(name string) string {
+	-- return base64.URLEncoding.EncodeToString([]byte(name))
+-- }

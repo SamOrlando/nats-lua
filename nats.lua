@@ -1,6 +1,6 @@
 local nats = {
 	_VERSION	 = 'lua-nats-nx 0.0.1',
-	_DESCRIPTION = 'LUA client for NATS w/header, tls - https://nats.io',
+	_DESCRIPTION = 'Lua client for NATS w/header, tls - https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2023 - MIT Cheese Please',
 	--
 	verbose = false, -- use properly in relation to commands and +OK response
@@ -16,24 +16,28 @@ local nats = {
 }
 
 -- todo - protocol setting in CONNECT (confirm dynamic INFO adjustments in client)
-local cjson  = require('cjson')
-local uuid   = require('uuid')
+local nuid = require("nuid")
+local cjson = require('cjson')
+local uuid = require('uuid')
 local socket = require('socket')
 local ssl = require('ssl') -- place with tls_required checks
-local CRLF = '\r\n'
+local crlf = '\r\n'
+local hdrLine = 'NATS/1.0\r\n'
+local max_payload = 1024000
 
 -- local vars, shortcuts, speed
 local network, response, request = nats.network, nats.response, nats.request -- Shortcuts
 local verbose = nats.verbose -- (false or nil for off) levels 1-5
 local insert, concat = table.insert, table.concat
 local gettime = socket.gettime
-local type, pcall, rawget, setmetatable, getmetatable = type, pcall, rawget, setmetatable, getmetatable
-local floor, tonumber = math.floor, tonumber
+local type, pcall, rawset, rawget, setmetatable, getmetatable = type, pcall, rawset, rawget, setmetatable, getmetatable
+local floor, tonumber, tostring = math.floor, tonumber, tostring
 local encode, decode = cjson.encode, cjson.decode
 
--- list of valid configuration options
+-- list of valid configuration options, etc.
 local valid_config_toggles = {headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true,verbose=true}
 local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true,protocol=true}
+
 
 -- common meh functions
 local passthru_func = function(...) return unpack({...}) end
@@ -41,20 +45,21 @@ nats.passthru_func = passthru_func
 local empty_func = function() end
 nats.empty_func = empty_func
 
+-- MIMEHeader
 -- built in lua native <-> nats header encoding and passthru function
 local function encode_header(t)
 	local tht = {}
 	for k,v in pairs(t or {}) do
-		if type(v) == "table" then insert(tht, concat({k, ': ', concat(v, ', '), CRLF}))
-		else insert(tht, concat({k, ': ', v, CRLF})) end
+		if type(v) == "table" then insert(tht, concat({k, ': ', concat(v, ', '), crlf}))
+		else insert(tht, concat({k, ': ', v, crlf})) end
 	end
 	return concat(tht)
 end
 nats.encode_header = encode_header
 
 local function decode_header(s)
-	local tbl = {}
 	if not s then return end
+	local tbl = {}
 	for line in s:gmatch("(.-)\r\n") do
 		local k,v = line:match("(.-):%s*(.*)")
 		if k then
@@ -73,7 +78,7 @@ nats.client_metatable = {
 	__newindex = function(self, key, value) print("__newindex client: " .. key .. " with a value of " .. tostring(value)) end,
 	methods = {},
 	is_client = true,
-	lang = 'lua',
+	lang = 'LuaJIT',
 	version = '0.0.1',
 }
 local client_metatable = nats.client_metatable
@@ -108,7 +113,6 @@ local function create_client(config, n_opts) -- fix default checks
 			jwt = nats.defaults.jwt,
 			nkey = nats.defaults.nkey,
 		},
-		servers = {}, -- for expanding servers found
 		network = {
 			read   = nats.network.read,
 			write  = nats.network.write,
@@ -131,17 +135,9 @@ local function create_client(config, n_opts) -- fix default checks
 end
 
 function nats.is_client(c)
-	if type(c) == "table" and rawget(getmetatable(c), "is_client") then return c end
-	return nil
+	if rawget(getmetatable(c), "is_client") then return c end
 end
 local is_client = nats.is_client
-
-function nats.get_client(c)
-	if type(c) == "table" then
-		return rawget(c, "client") or rawget(getmetatable(c), "is_client") and c
-	end
-end
-local get_client = nats.get_client
 
 --
 -- nats encoded client/connection support
@@ -149,12 +145,13 @@ nats.encoded_client_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or self.client[key] or rawget(getmetatable(self), key) end,
 	__newindex = function(_, key, value) print("__newindex encoded client: " .. key .. " with a value of " .. value) end,
 	methods = {},
+	is_client = true,
 	is_encoded = true,
 }
 local encoded_client_metatable = nats.encoded_client_metatable
 
-function nats.is_encoded(m)
-	if type(m) == "table" and rawget(getmetatable(m), "is_encoded") then return m end
+function nats.is_encoded(c)
+	if rawget(getmetatable(c), "is_encoded") then return c end
 end
 local is_encoded = nats.is_encoded
 
@@ -163,6 +160,7 @@ local is_encoded = nats.is_encoded
 nats.msg_metatable = {
 	__index = function(self, key) return rawget(self, key) or rawget(getmetatable(self), "methods")[key] or rawget(getmetatable(self), key) end,
 	__newindex = function(self, key, value) print("__newindex msg: " .. key .. " with a value of " .. (value or "nil")) end,
+	__tostring = function(self) return concat(msg_stringtable(self.subject, self.data, self.reply, self.header)) end, -- does not plan for encoding!
 	methods = {},
 	is_msg = true,
 }
@@ -181,15 +179,14 @@ end
 local create_msg = nats.msg
 
 function nats.is_msg(m)
-	if type(m) == "table" and rawget(getmetatable(m), "is_msg") then return m end
-	return nil
+	if rawget(getmetatable(m), "is_msg") then return m end
 end
 local is_msg = nats.is_msg
 
 --
 -- network methods
 function network.write(client, buffer)
-	if #buffer > (client.server_information.max_payload or 1024000) then -- long var in heavy call
+	if #buffer > max_payload then
 		client.error("buffer write error: payload too large at " .. #buffer .. " : max_payload is " .. client.server_information.max_payload)
 	end
 	if verbose and verbose > 5 then print('->> '..buffer:sub(1,-3)) end
@@ -272,6 +269,7 @@ end
 response.methods = {
 	INFO = function(s) return {op=s[1],data=s[2]} end,
 	PING = function(s) return {op=s[1]} end,
+	PONG = function(s) return {op=s[1]} end,
 	MSG = function(s, client)
 		local msg_t
 		if #s > 4 then
@@ -315,15 +313,16 @@ response.methods = {
 			}
 		end
 
-		local dheader = ''
-		if tonumber(msg_t.header_size) > 0 and network_read(client) == "NATS/1.0" then
+		local dheader = {}
+		if tonumber(msg_t.header_size) > 0 and network_read(client) == "NATS/1.0" then -- fix for var ref?
 		  local hread
 		  repeat
 			hread = network_read(client)
-			dheader = hread .. CRLF .. dheader
+			insert(dheader, hread)
+			insert(dheader, crlf)
 		  until #hread == 0
 		end
-		msg_t.header = dheader
+		msg_t.header = concat(dheader)
 
 		msg_t.data = network_read(client)
 		return msg_t
@@ -337,13 +336,10 @@ function response.read(client)
 	local payload = network_read(client)
 	if not payload then return end -- nonblocking move on
 
-	local slices  = {}
+	local slices = {}
 	for slice in payload:gmatch('[^%s]+') do insert(slices, slice) end
-	if slices[1] and response_methods[slices[1]] then
-		return response_methods[slices[1]](slices, client)
-	else
-		return {op = "-ERR", data = payload}
-	end
+	if slices[1] and response_methods[slices[1]] then return response_methods[slices[1]](slices, client) end
+	return {op = "-ERR", data = payload}
 end
 local response_read = response.read
 
@@ -357,7 +353,7 @@ function request.write(client, buffer)
 end
 local request_write = request.write
 
---
+-- 
 -- nats module core functions
 function nats.error(message, level)
 	error(message, (level or 1) + 1)
@@ -387,7 +383,7 @@ end
 
 function nats.verbose_level(v)
 	if v ~= nil then
-		nats.verbose = tonumber(v) or nil
+		nats.verbose = tonumber(v)
 		verbose = nats.verbose -- local var reassign
 	else return nats.verbose end
 end
@@ -404,32 +400,37 @@ function nats.connect(...) -- i hate this thing - please rewrite it!
 	client:connect()
 end
 
-function nats.create_inbox() return '_INBOX.' .. uuid() end
+local mailbox_nuid = nuid()
+local mailbox_nuid_tail = nuid({preLen=8,seqLen=0})
+function nats.create_inbox() return concat({'_INBOX.', mailbox_nuid(),".",mailbox_nuid_tail()}) end
 local create_inbox = nats.create_inbox -- vroom
 
 --
 -- nats client methods
 local cm = nats.client_metatable.methods
-local client_info_response = {"verbose","pedantic","jwt","nkey","sig","user","pass","auth_token","tls_required","name","lang","version","protocol","echo","headers","no_responders"}
+local client_info_response = {"verbose","pedantic","jwt","nkey","sig","user","pass","auth_token","tls_required","name","protocol","echo","headers","no_responders"}
 
 function cm.connect(client)
-	--client = get_client(client)
 	if client.connected and client.network.socket then return true end --review - how do we handle reconnect? do we need to redo all?
 
 	client.network.socket = client.network.socket or create_connection(client.network.opts)
 	if not client.network.socket then client.error("Unable to connect socket.") end
 
-	local ct = {}
-	for _,v in ipairs(client_info_response) do
-		ct[v] = rawget(client, "config")[v]
-	end
+	local ct = {
+		lang = nats.client_metatable.lang,
+		version = nats.client_metatable.version,
+	}
 
-	request_write(client, {'CONNECT ', encode(ct), CRLF})
+	local cfg = rawget(client, "config")
+	for _,v in ipairs(client_info_response) do ct[v] = cfg[v] end
+
+	request_write(client, {'CONNECT ', encode(ct), crlf})
 
 	-- gather the server information
 	local msg_t = response_read(client)
 	if msg_t.op == 'INFO' then
 		client.server_information = decode(msg_t.data)
+		max_payload = client.server_information.max_payload -- set nats local max_payload to limit buffersize in network write check
 	end
 	client.connected = cm.ping(client)
 end
@@ -443,8 +444,8 @@ end
 
 function cm.pong(client) request_write(client, 'PONG\r\n') end
 
-function cm.publish(client, subject, data, reply, header)
-	local st -- send_table to request_write
+local function msg_stringtable(subject, data, reply, header)
+	local st -- send_table
 	if data == nil then data = "" end
 
 	if header and #header > 0 then
@@ -462,31 +463,35 @@ function cm.publish(client, subject, data, reply, header)
 
 	-- header add size and to total size
 	if header then
-		header = 'NATS/1.0\r\n' .. header .. CRLF
+		header = concat({hdrLine, header, crlf})
 		insert(st, ' ')
 		insert(st, #header)
 		insert(st, ' ')
 		insert(st, (#header + #data))
-		insert(st, CRLF)
+		insert(st, crlf)
 		-- insert the header
 		insert(st, header)
 	else
 		-- insert data size
 		insert(st, ' ')
 		insert(st, #data)
-		insert(st, CRLF)
+		insert(st, crlf)
 	end
 
 	-- insert data
 	insert(st, data)
-	insert(st, CRLF)
+	insert(st, crlf)
+	
+	return st
+end
 
-	request_write(client, st)
+function cm.publish(client, subject, data, reply, header)
+	request_write(client, msg_stringtable(subject, data, reply, header))
 	return create_msg(subject, data, reply, header, client)
 end
 
 function cm.request(client, subject, callback, data, header)
-	local reply = uuid()
+	local reply = create_inbox()
 	local sid = cm.subscribe(client, reply, function(m)
 		cm.unsubscribe(client, m.sid)
 		if callback then
@@ -500,14 +505,21 @@ function cm.request(client, subject, callback, data, header)
 	return msg
 end
 
+-- // Check for no responder status.
+-- if err == nil && len(m.Data) == 0 && m.Header.Get(statusHdr) == noResponders {
+	-- m, err = nil, ErrNoResponders
+-- }
+-- return m, err
+
 function cm.get(client, subject, data, header)
 	local msg = cm.request(client, subject, nil, data, header)
 	local r_msg = cm.wait(client, msg.sid, nil, client.config.timeout) -- add timeout config here
 	return r_msg or cm.unsubscribe(client, msg.sid) -- return results or unsubscribe as its too late
 end
 
+local sub_nuid = nuid()
 function cm.subscribe(client, subject, callback, queue)
-	local sid = uuid()
+	local sid = sub_nuid()
 
 	local st = {'SUB ', subject, ' '}
 	if queue and queue ~= "" then
@@ -515,7 +527,7 @@ function cm.subscribe(client, subject, callback, queue)
 		insert(st, ' ')
 	end
 	insert(st, sid)
-	insert(st, CRLF)
+	insert(st, crlf)
 
 	request_write(client, st)
 	client.subscriptions[sid] = {subject=subject, queue=queue, callback=callback or passthru_func}
@@ -523,7 +535,7 @@ function cm.subscribe(client, subject, callback, queue)
 end
 
 function cm.unsubscribe(client, sid)
-	request_write(client, {'UNSUB ', sid, CRLF})
+	request_write(client, {'UNSUB ', sid, crlf})
 	client.subscriptions[sid] = nil
 end
 
@@ -537,6 +549,7 @@ function cm.server_info(client) return client.server_information end
 
 function cm.shutdown(client) client.network.socket:shutdown() end
 
+-- consider ripping out the fat... make wait calls less checky 
 function cm.wait(client, sid, maxcount, timeout)
 	local nc, ec = client
 	if is_encoded(client) then
@@ -618,21 +631,24 @@ function cm.msg(client, subject, data, reply, header, sid)
 	return create_msg(subject, data, reply, header, client, sid)
 end
 
+function mm.new(m, subject, data, reply, header, sid)
+	return create_msg(subject, data, reply, header, m.client, sid)
+end
+
 function mm.respond(m, data, reply, header)
 	if m.reply then return m.client:publish(m.reply, data, reply, header) end
 end
 
 function mm.publish(m, subject, data, reply, header)
-	m.client:publish(
+	return m.client and m.client:publish(
 		subject or m.subject,
 		data or m.data,
 		reply or m.reply,
 		header or m.header)
-	return m
 end
 
 function mm.request(m, subject, callback, data, header)
-	return m.client:request(
+	return m.client and m.client:request(
 		subject or m.subject,
 		callback,
 		data or m.data,
@@ -640,83 +656,92 @@ function mm.request(m, subject, callback, data, header)
 end
 
 function mm.get(m, subject, data, header)
-	return m.client:get(
-		subject,
-		data,
-		header)
+	return m.client and m.client:get(
+		subject or m.subject,
+		data or m.data,
+		header or m.header)
 end
 
--- mm.size
-
+function mm.size(m) -- yuk
+	local client, ss, rs, hs, ds = m.client, #m.subject, #(m.reply or ""), 0, 0
+	local enc_data, enc_header = client and client.encode_data_func, client and client.encode_header_func
+	
+	if enc_data then ds = #(enc_data(client, m.data) or "")
+	else ds = #tostring(m.data or "") end
+	if enc_header then hs = #(enc_header(client, m.header) or "")
+	else hs = #tostring(m.header or "") end
+	return ss + rs + hs + ds
+end
 
 -- I hate everything about
 -- encoded connection / client
-function cm.encoded_client(client, encode_data_func, decode_data_func, encode_header_func, decode_header_func ) -- passthru_func removed for obvious json and http header support.
+function cm.encoded_client(client, encode_data_func, decode_data_func, encode_header_func, decode_header_func )
 	return setmetatable({
 		client = client,
-		encode_data = encode_data_func or encode,
-		decode_data = decode_data_func or decode,
-		encode_header = encode_header_func or nats.encode_header,
-		decode_header = decode_header_func or nats.decode_header,
+		encode_data_func = encode_data_func or encode,
+		decode_data_func = decode_data_func or decode,
+		encode_header_func = encode_header_func or nats.encode_header,
+		decode_header_func = decode_header_func or nats.decode_header,
 	}, encoded_client_metatable)
 end
 
 local ec = encoded_client_metatable.methods
 function ec.encode_data(client, data)
 	if not data then return end
-	local s, r = pcall(client.encode_data, data)
+	local s, r = pcall(client.encode_data_func, data)
 	if s then return r else print("encode_data error: " .. r .. " : " .. tostring(data)) end
 end
 local ec_encode_data = ec.encode_data
 
 function ec.decode_data(client, data)
 	if not data or data == '' then return end
-	local s, r = pcall(client.decode_data, data)
+	local s, r = pcall(client.decode_data_func, data)
 	if s then return r else print("decode_data error: " .. r .. " : " .. tostring(data)) end
 end
 local ec_decode_data = ec.decode_data
 
 function ec.encode_header(client, header)
 	if not header then return end
-	local s, r = pcall(client.encode_header, header)
+	local s, r = pcall(client.encode_header_func, header)
 	if s then return r else print("encode_header error: " .. r .. " : " .. tostring(header)) end
 end
 local ec_encode_header = ec.encode_header
 
 function ec.decode_header(client, header)
 	if not header then return end
-	local s, r = pcall(client.decode_header, header)
+	local s, r = pcall(client.decode_header_func, header)
 	if s then return r else print("decode_header error: " .. r .. " : "  .. tostring(header)) end
 end
 local ec_decode_header = ec.decode_header
 
 function ec.publish(client, subject, data, reply, header)
-	cm.publish(client.client, subject, ec_encode_data(client, data), reply, ec_encode_header(client, header))
+	return cm.publish(client.client, subject, ec_encode_data(client, data), reply, ec_encode_header(client, header))
 end
 
 function ec.request(client, subject, callback, data, header)
-	return cm.request(client.client, subject, function(data, reply, subject, sid, header)
-		data = ec_decode_data(client, data)
-		header = ec_decode_header(client, header)
-		local _,r = pcall(callback, data, reply, subject, sid, header)
-		return r
-	end,
-	ec_encode_data(client, data),
-	ec_encode_header(client, header))
+	return cm.request(client.client, subject,
+		function(data, reply, subject, sid, header)
+			data = ec_decode_data(client, data)
+			header = ec_decode_header(client, header)
+			local _,r = pcall(callback, data, reply, subject, sid, header)
+			return r
+		end,
+		ec_encode_data(client, data),
+		ec_encode_header(client, header))
 end
 
 function ec.get(client, subject, data, header)
 	local msg = cm.get(client.client, subject, ec_encode_data(client, data), ec_encode_header(client, header))
-	msg.data = ec_decode_data(client, msg.data)
-	msg.header = ec_decode_header(client, msg.header)
+	if msg.data then msg.data = ec_decode_data(client, msg.data) end
+	if msg.header then msg.header = ec_decode_header(client, msg.header) end
 	return msg
 end
 
 function ec.subscribe(client, subject, callback, queue)
 	cm.subscribe(client.client, subject, function(m)
-		m.client = client --ugly af
-		m.data = ec_decode_data(client, m.data)
-		m.header = ec_decode_header(client, m.header)
+		rawset(m, "client", client) -- ugly af takes client arg var from ec.sub to set msg.client
+		if m.data then m.data = ec_decode_data(client, m.data) end
+		if m.header then m.header = ec_decode_header(client, m.header) end
 		local s,r = pcall(callback, m)
 		if s then return r else print("ec:sub:err " .. r) end
 	end, queue)
@@ -744,3 +769,35 @@ for k,_ in pairs(valid_config_strings) do
 end
 
 return nats
+
+-- statusHdr          = "Status"
+-- descrHdr           = "Description"
+-- lastConsumerSeqHdr = "Nats-Last-Consumer"
+-- lastStreamSeqHdr   = "Nats-Last-Stream"
+-- consumerStalledHdr = "Nats-Consumer-Stalled"
+-- noResponders       = "503"
+-- noMessagesSts      = "404"
+-- reqTimeoutSts      = "408"
+-- jetStream409Sts    = "409"
+-- controlMsg         = "100"
+-- statusLen          = 3 // e.g. 20x, 40x, 50x
+	
+-- // badSubject will do quick test on whether a subject is acceptable.
+-- // Spaces are not allowed and all tokens should be > 0 in len.
+-- func badSubject(subj string) bool {
+	-- if strings.ContainsAny(subj, " \t\r\n") {
+		-- return true
+	-- }
+	-- tokens := strings.Split(subj, ".")
+	-- for _, t := range tokens {
+		-- if len(t) == 0 {
+			-- return true
+		-- }
+	-- }
+	-- return false
+-- }
+
+-- // badQueue will check a queue name for whitespace.
+-- func badQueue(qname string) bool {
+	-- return strings.ContainsAny(qname, " \t\r\n")
+-- }
