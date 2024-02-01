@@ -29,6 +29,7 @@ local max_payload = 1024000
 local network, response, request = nats.network, nats.response, nats.request -- Shortcuts
 local verbose = nats.verbose -- (false or nil for off) levels 1-5
 local insert, concat = table.insert, table.concat
+local str_gmatch = string.gmatch
 local gettime = socket.gettime
 local type, pcall, rawset, rawget, setmetatable, getmetatable = type, pcall, rawset, rawget, setmetatable, getmetatable
 local floor, tonumber, tostring = math.floor, tonumber, tostring
@@ -44,6 +45,15 @@ local passthru_func = function(...) return unpack({...}) end
 nats.passthru_func = passthru_func
 local empty_func = function() end
 nats.empty_func = empty_func
+
+local function str_explode(s, ss, p)
+    local t, i = {}, 1
+    for sub in str_gmatch(s, p and ss or "([^" .. ss .. "]+)") do
+        t[i] = sub
+        i = i + 1
+    end
+    return t, i-1
+end
 
 -- MIMEHeader
 -- built in lua native <-> nats header encoding and passthru function
@@ -400,11 +410,6 @@ function nats.connect(...) -- i hate this thing - please rewrite it!
 	client:connect()
 end
 
-local mailbox_nuid = nuid()
-local mailbox_nuid_tail = nuid({preLen=8,seqLen=0})
-function nats.create_inbox() return concat({'_INBOX.', mailbox_nuid(),".",mailbox_nuid_tail()}) end
-local create_inbox = nats.create_inbox -- vroom
-
 --
 -- nats client methods
 local cm = nats.client_metatable.methods
@@ -433,6 +438,7 @@ function cm.connect(client)
 		max_payload = client.server_information.max_payload -- set nats local max_payload to limit buffersize in network write check
 	end
 	client.connected = cm.ping(client)
+	client.inbox_subscribe(client, req_cb)
 end
 
 function cm.ping(client)
@@ -490,33 +496,6 @@ function cm.publish(client, subject, data, reply, header)
 	return create_msg(subject, data, reply, header, client)
 end
 
-function cm.request(client, subject, callback, data, header)
-	local reply = create_inbox()
-	local sid = cm.subscribe(client, reply, function(m)
-		cm.unsubscribe(client, m.sid)
-		if callback then
-			local s, rm = pcall(callback, m)
-			if s then return rm end
-		end
-	end)
-
-	local msg = cm.publish(client, subject, data, reply, header)
-	rawset(msg, "sid", sid)
-	return msg
-end
-
--- // Check for no responder status.
--- if err == nil && len(m.Data) == 0 && m.Header.Get(statusHdr) == noResponders {
-	-- m, err = nil, ErrNoResponders
--- }
--- return m, err
-
-function cm.get(client, subject, data, header)
-	local msg = cm.request(client, subject, nil, data, header)
-	local r_msg = cm.wait(client, msg.sid, nil, client.config.timeout) -- add timeout config here
-	return r_msg or cm.unsubscribe(client, msg.sid) -- return results or unsubscribe as its too late
-end
-
 local sub_nuid = nuid()
 function cm.subscribe(client, subject, callback, queue)
 	local sid = sub_nuid()
@@ -534,9 +513,63 @@ function cm.subscribe(client, subject, callback, queue)
 	return sid
 end
 
+-- create into options
+local mailbox_prefix = "_INBOX"
+local mailbox_nuid = nuid({preLen=10,seqLen=0})() -- calling var! we only do ONCE to make a client static inbox --FUTURE: Option for old and new style
+local mailbox_nuid_lid = nuid({preLen=2,seqLen=10})
+local mailbox_table = {}
+
+function nats.create_inbox()
+	local lid = mailbox_nuid_lid()
+	return concat({mailbox_prefix, '.', mailbox_nuid, '.', lid}), lid
+end
+local create_inbox = nats.create_inbox -- vroom
+
 function cm.unsubscribe(client, sid)
 	request_write(client, {'UNSUB ', sid, crlf})
 	client.subscriptions[sid] = nil
+end
+
+function cm.inbox_subscribe(client, callback)
+	local st = {'SUB ', mailbox_prefix .. '.' .. mailbox_nuid .. '.>', ' '}
+	insert(st, mailbox_nuid)
+	insert(st, crlf)
+
+	request_write(client, st)
+	client.subscriptions[mailbox_nuid] = {subject=concat(st), callback=callback or passthru_func}
+	return mailbox_nuid
+end
+
+local function req_cb(m)
+	local lid = str_explode(m.subject or "", '.')[3]
+	if lid and mailbox_table[lid] then
+		local s, rm = pcall(mailbox_table[lid], m)
+		mailbox_table[lid] = nil
+		if s then return rm end
+	end
+end
+
+function cm.request(client, subject, callback, data, header)
+	local reply, lid = create_inbox()
+	mailbox_table[lid] = callback
+	local msg = cm.publish(client, subject, data, reply, header)
+	rawset(msg, "sid", mailbox_nuid)
+	return msg
+end
+
+-- // Check for no responder status.
+-- if err == nil && len(m.Data) == 0 && m.Header.Get(statusHdr) == noResponders {
+	-- m, err = nil, ErrNoResponders
+-- }
+-- return m, err
+
+-- TODO: cm.collect(client, subject, data, header, wait, count) -- blocking
+-- TODO: cm.poll(client, subject, callback, data, header, wait, count) -- nonblocking with callback
+
+function cm.get(client, subject, data, header)
+	local msg = cm.request(client, subject, nil, data, header)
+	local r_msg = cm.wait(client, msg.sid, nil, client.config.timeout) -- add timeout config here
+	return r_msg or cm.unsubscribe(client, msg.sid) -- return results or unsubscribe as its too late
 end
 
 function cm.auth(client, user, pass) -- crap

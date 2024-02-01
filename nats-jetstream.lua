@@ -125,9 +125,11 @@ end
 
 function con.nextmsg(consumer)
 	local msg = consumer.stream.client:get('$JS.API.CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name)
-	msg.data = decode(msg.data or json_error_true)
-	if msg.data.error then return false, msg end
-	return msg
+	if msg then
+		msg.data = decode(msg.data or json_error_true)
+		if msg.data.error then return false, msg end
+		return msg
+	else return end
 end
 
 function cm.stream_list(client)
