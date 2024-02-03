@@ -77,12 +77,19 @@ function js.consumer(stream, consumer_name, config)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 
+	-- consumers assigned subscription
+	local sid = cm.subscribe(stream.client, "_INBOX." .. stream.name .. "." .. consumer_name, function(m)
+		print("got stream msg")
+		return m
+	end)
+
 	-- create and set consumer object
 	local consumer = setmetatable({
 		name = consumer_name,
 		stream = stream,
 		config = msg.data.config,
 		cluster = msg.data.cluster,
+		sid = sid,
 	}, consumer_metatable)
 
 	-- insert consumer info into stream table and client 
@@ -96,11 +103,11 @@ function con.delete(consumer)
 	local msg = consumer.stream.client:get('$JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
+	-- remove assigned sub
+	cm.unsubscribe(consumer.stream.client, consumer.sid)
 	-- delete references
-	
 	consumer.stream.consumers[consumer.name] = nil
 	consumer.stream.client.streams[consumer.stream.name].consumers[consumer.name] = nil
-	consumer = nil
 	return true, msg
 end
 
@@ -124,7 +131,7 @@ function con.info(consumer)
 end
 
 function con.nextmsg(consumer)
-	local msg = consumer.stream.client:get('$JS.API.CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name)
+	local msg = consumer.stream.client:get('$JS.API.CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name, nil, nil, consumer.sid)
 	if msg then
 		msg.data = decode(msg.data or json_error_true)
 		if msg.data.error then return false, msg end
@@ -136,14 +143,14 @@ function cm.stream_list(client)
 	local msg = client:get("$JS.API.STREAM.LIST")
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
-	return msg
+	return msg.data
 end
 
 function js.consumer_list(stream)
 	local msg = stream.client:get('$JS.API.CONSUMER.LIST.' .. stream.name)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
-	return msg
+	return msg.data
 end
 
 function js.update(stream, configuration)

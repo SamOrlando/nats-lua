@@ -170,7 +170,7 @@ local is_encoded = nats.is_encoded
 nats.msg_metatable = {
 	__index = function(self, key) return rawget(self, key) or rawget(getmetatable(self), "methods")[key] or rawget(getmetatable(self), key) end,
 	__newindex = function(self, key, value) print("__newindex msg: " .. key .. " with a value of " .. (value or "nil")) end,
-	__tostring = function(self) return concat(msg_stringtable(self.subject, self.data, self.reply, self.header)) end, -- does not plan for encoding!
+	--__tostring = function(self) return concat({self.subject, ' ', self.reply, ' ', self.sid}) end, -- does not plan for encoding!
 	methods = {},
 	is_msg = true,
 }
@@ -438,7 +438,7 @@ function cm.connect(client)
 		max_payload = client.server_information.max_payload -- set nats local max_payload to limit buffersize in network write check
 	end
 	client.connected = cm.ping(client)
-	client.inbox_subscribe(client, req_cb)
+	client.inbox_subscribe(client)
 end
 
 function cm.ping(client)
@@ -496,7 +496,7 @@ function cm.publish(client, subject, data, reply, header)
 	return create_msg(subject, data, reply, header, client)
 end
 
-local sub_nuid = nuid()
+local sub_nuid = nuid({preLen=10,seqLen=0})
 function cm.subscribe(client, subject, callback, queue)
 	local sid = sub_nuid()
 
@@ -513,47 +513,95 @@ function cm.subscribe(client, subject, callback, queue)
 	return sid
 end
 
--- create into options
-local mailbox_prefix = "_INBOX"
-local mailbox_nuid = nuid({preLen=10,seqLen=0})() -- calling var! we only do ONCE to make a client static inbox --FUTURE: Option for old and new style
-local mailbox_nuid_lid = nuid({preLen=2,seqLen=10})
-local mailbox_table = {}
-
-function nats.create_inbox()
-	local lid = mailbox_nuid_lid()
-	return concat({mailbox_prefix, '.', mailbox_nuid, '.', lid}), lid
-end
-local create_inbox = nats.create_inbox -- vroom
-
 function cm.unsubscribe(client, sid)
 	request_write(client, {'UNSUB ', sid, crlf})
 	client.subscriptions[sid] = nil
 end
 
-function cm.inbox_subscribe(client, callback)
-	local st = {'SUB ', mailbox_prefix .. '.' .. mailbox_nuid .. '.>', ' '}
-	insert(st, mailbox_nuid)
-	insert(st, crlf)
+-- create into options
+local inbox_prefix = "_INBOX"
+local inbox_nuid = nuid({preLen=10,seqLen=0})() -- calling var! we only do ONCE to make a client static inbox --FUTURE: Option for old and new style
+local inbox_lid_nuid = nuid({preLen=8,seqLen=2}) -- want some change but not too often
+local inbox_table = {}
 
-	request_write(client, st)
-	client.subscriptions[mailbox_nuid] = {subject=concat(st), callback=callback or passthru_func}
-	return mailbox_nuid
+function nats.create_inbox()
+	local lid = inbox_lid_nuid()
+	return concat({inbox_prefix, '.', inbox_nuid, '.', lid}), lid
 end
+local create_inbox = nats.create_inbox -- vroom
 
-local function req_cb(m)
-	local lid = str_explode(m.subject or "", '.')[3]
-	if lid and mailbox_table[lid] then
-		local s, rm = pcall(mailbox_table[lid], m)
-		mailbox_table[lid] = nil
+local function inbox_req_cb(m)
+	local lid = str_explode(m.subject or "", '.')[3] -- letter id
+	local ibt = lid and inbox_table[lid] -- inbox table
+
+	if ibt then
+		if ibt.expire and ibt.expire < gettime() then
+			inbox_table[lid] = nil
+			return
+		end -- TODO: Remove unanswered inbox entries over time (poll/inbox abs expire timer?)
+
+		rawset(m, "sid", inbox_nuid)
+		rawset(m, "lid", lid)
+		local s, rm = pcall(ibt.callback or passthru_func, m)
+
+		if ibt.count then
+			ibt.run = (ibt.run or 0) + 1
+			if ibt.run >= ibt.count then
+				inbox_table[lid] = nil
+				return
+			end
+		elseif ibt.expire then
+		else inbox_table[lid] = nil end
+	
 		if s then return rm end
 	end
 end
 
-function cm.request(client, subject, callback, data, header)
-	local reply, lid = create_inbox()
-	mailbox_table[lid] = callback
+function cm.inbox_subscribe(client)
+	local subject = inbox_prefix .. '.' .. inbox_nuid .. '.>'
+	local st = {'SUB ', subject, ' '}
+	insert(st, inbox_nuid)
+	insert(st, crlf)
+	request_write(client, st)
+
+	client.subscriptions[inbox_nuid] = {subject=subject, callback=inbox_req_cb} -- not used but put into table for reference
+	return inbox_nuid
+end
+
+function cm.request(client, subject, callback, data, header, sid)
+	local reply, lid = concat({inbox_prefix, '.', sub_nuid()})
+
+	if sid and client.subscriptions[sid] then
+		reply = client.subscriptions[sid].subject
+	elseif subject:sub(1,1) == "$" then
+		sid = cm.subscribe(client, reply, function(m)
+			cm.unsubscribe(client, m.sid) -- this is nasty and should not be done for consumers/streams... fix
+			if callback then
+				local s, rm = pcall(callback, m)
+				if s then return rm end
+			end
+		end)
+	else
+		reply, lid = create_inbox() -- get reply string and letter id for inbox
+		inbox_table[lid] = {created=gettime(), callback=callback}
+	end
+	
 	local msg = cm.publish(client, subject, data, reply, header)
-	rawset(msg, "sid", mailbox_nuid)
+	rawset(msg, "sid", sid or inbox_nuid)
+	if not sid then rawset(msg, "lid", lid) end
+	
+	return msg
+end
+
+-- need to add timer to loop and add callback on termination for wait period
+function cm.poll(client, subject, callback, data, header, wait, count)
+	local reply, lid = create_inbox()
+	inbox_table[lid] = {created=gettime(), callback=callback, wait=wait or 2, expire=gettime() + (wait or 2), count=count}
+
+	local msg = cm.publish(client, subject, data, reply, header)
+	rawset(msg, "sid", inbox_nuid)
+	rawset(msg, "lid", lid)
+
 	return msg
 end
 
@@ -566,10 +614,14 @@ end
 -- TODO: cm.collect(client, subject, data, header, wait, count) -- blocking
 -- TODO: cm.poll(client, subject, callback, data, header, wait, count) -- nonblocking with callback
 
-function cm.get(client, subject, data, header)
-	local msg = cm.request(client, subject, nil, data, header)
-	local r_msg = cm.wait(client, msg.sid, nil, client.config.timeout) -- add timeout config here
-	return r_msg or cm.unsubscribe(client, msg.sid) -- return results or unsubscribe as its too late
+function cm.get(client, subject, data, header, sid)
+	local msg = cm.request(client, subject, nil, data, header, sid)
+	local r_msg = cm.wait(client, {
+		sid=msg.sid,
+		lid=msg.lid,
+		timeout=client.config.timeout}) -- add timeout config here
+	if r_msg.lid then inbox_table[msg.lid] = nil end
+	return r_msg -- return results or nothing from timeout
 end
 
 function cm.auth(client, user, pass) -- crap
@@ -583,36 +635,31 @@ function cm.server_info(client) return client.server_information end
 function cm.shutdown(client) client.network.socket:shutdown() end
 
 -- consider ripping out the fat... make wait calls less checky 
-function cm.wait(client, sid, maxcount, timeout)
+-- client tracking form sid may be required if we handle both at same time?
+function cm.wait(client, opts)
 	local nc, ec = client
 	if is_encoded(client) then
 		ec = client
 		nc = client.client
 	end -- check if we are encoded client - go raw
 
+	opts = opts or {}
+
+	local sid, lid, maxcount, timeout = opts.sid, opts.lid, opts.maxcount, opts.timeout or -1
 	local count, socket, msg_t, msg = 1, nc.network.socket
 	local timeout_b, timeout_t, last_timeout_b, last_timeout_t
-
-	if not sid or type(sid) == "number" then
-		if maxcount then
-			timeout = timeout or maxcount
-		end
-		maxcount = sid
-		sid = nil
+	
+	--ugly
+	local ttyp = type(timeout)
+	if ttyp == "number" then timeout_b = timeout
+	elseif ttyp == "table" then
+		timeout_b = timeout[1]
+		timeout_t = timeout[2]
 	end
 
-	if timeout then
-		local ttyp = type(timeout)
-		if ttyp == "number" then timeout_b = timeout
-		elseif ttyp == "table" then
-			timeout_b = timeout[1]
-			timeout_t = timeout[2]
-		end
-
-		last_timeout_b, last_timeout_t = socket:gettimeout()
-		if timeout_b then socket:settimeout(timeout_b,'b') end
-		if timeout_t then socket:settimeout(timeout_t,'t') end
-	end
+	last_timeout_b, last_timeout_t = socket:gettimeout()
+	if timeout_b then socket:settimeout(timeout_b,'b') end
+	if timeout_t then socket:settimeout(timeout_t,'t') end
 
 	local toe, loop_run_start = 0, gettime() -- this toe thing has gone too far... blame you looneytunes
 	while true do
@@ -631,11 +678,15 @@ function cm.wait(client, sid, maxcount, timeout)
 		local op = msg_t.op
 
 		if op == 'MSG' or op == 'HMSG' then
-			msg_t.client = ec or nc
-			msg = create_msg(msg_t.subject, msg_t.data, msg_t.reply, msg_t.header, msg_t.client, msg_t.sid)
-			local st = nc.subscriptions[msg.sid]
-			if st then msg = st.callback(msg) or msg end
-			if sid and sid == msg.sid then break end
+			msg = create_msg(msg_t.subject, msg_t.data, msg_t.reply, msg_t.header, client, msg_t.sid)
+			if msg.sid == inbox_nuid then
+				msg = inbox_req_cb(msg) or msg
+				if lid and msg.lid == lid then break end
+			else
+				local st = nc.subscriptions[msg.sid]
+				if st then msg = st.callback(msg) or msg end --pcall future
+				if sid and sid == msg.sid then break end
+			end
 			count = count + 1 -- keeping count +1 outof loop for timeout checks information
 			if maxcount and count >= maxcount then break end
 		elseif op == 'PING' then cm.pong(nc)
@@ -680,19 +731,21 @@ function mm.publish(m, subject, data, reply, header)
 		header or m.header)
 end
 
-function mm.request(m, subject, callback, data, header)
+function mm.request(m, subject, callback, data, header, sid)
 	return m.client and m.client:request(
 		subject or m.subject,
 		callback,
 		data or m.data,
-		header or m.header)
+		header or m.header,
+		sid or m.sid)
 end
 
-function mm.get(m, subject, data, header)
+function mm.get(m, subject, data, header, sid)
 	return m.client and m.client:get(
 		subject or m.subject,
 		data or m.data,
-		header or m.header)
+		header or m.header,
+		sid or m.sid)
 end
 
 function mm.size(m) -- yuk
@@ -720,28 +773,28 @@ end
 
 local ec = encoded_client_metatable.methods
 function ec.encode_data(client, data)
-	if not data then return end
+	if not data then return nil end
 	local s, r = pcall(client.encode_data_func, data)
 	if s then return r else print("encode_data error: " .. r .. " : " .. tostring(data)) end
 end
 local ec_encode_data = ec.encode_data
 
 function ec.decode_data(client, data)
-	if not data or data == '' then return end
+	if not data or data == '' then return nil end
 	local s, r = pcall(client.decode_data_func, data)
 	if s then return r else print("decode_data error: " .. r .. " : " .. tostring(data)) end
 end
 local ec_decode_data = ec.decode_data
 
 function ec.encode_header(client, header)
-	if not header then return end
+	if not header then return nil end
 	local s, r = pcall(client.encode_header_func, header)
 	if s then return r else print("encode_header error: " .. r .. " : " .. tostring(header)) end
 end
 local ec_encode_header = ec.encode_header
 
 function ec.decode_header(client, header)
-	if not header then return end
+	if not header then return nil end
 	local s, r = pcall(client.decode_header_func, header)
 	if s then return r else print("decode_header error: " .. r .. " : "  .. tostring(header)) end
 end
@@ -751,33 +804,45 @@ function ec.publish(client, subject, data, reply, header)
 	return cm.publish(client.client, subject, ec_encode_data(client, data), reply, ec_encode_header(client, header))
 end
 
-function ec.request(client, subject, callback, data, header)
+function ec.request(client, subject, callback, data, header, sid)
 	return cm.request(client.client, subject,
-		function(data, reply, subject, sid, header)
-			data = ec_decode_data(client, data)
-			header = ec_decode_header(client, header)
-			local _,r = pcall(callback, data, reply, subject, sid, header)
-			return r
+		function(m)
+			if m.data then rawset(m, "data", ec_decode_data(client, m.data)) end
+			if m.header then rawset(m, "header", ec_decode_header(client, m.header)) end
+			local s,r = pcall(callback or passthru_func, m)
+			return s and r
 		end,
 		ec_encode_data(client, data),
-		ec_encode_header(client, header))
+		ec_encode_header(client, header), sid)
 end
 
-function ec.get(client, subject, data, header)
-	local msg = cm.get(client.client, subject, ec_encode_data(client, data), ec_encode_header(client, header))
-	if msg.data then msg.data = ec_decode_data(client, msg.data) end
-	if msg.header then msg.header = ec_decode_header(client, msg.header) end
+function ec.get(client, subject, data, header, sid)
+	local msg = cm.get(client.client, subject, ec_encode_data(client, data), ec_encode_header(client, header), sid)
+	if msg.data then rawset(msg, "data", ec_decode_data(client, msg.data)) end
+	if msg.header then rawset(msg, "header", ec_decode_header(client, msg.header)) end
 	return msg
 end
 
 function ec.subscribe(client, subject, callback, queue)
-	cm.subscribe(client.client, subject, function(m)
-		rawset(m, "client", client) -- ugly af takes client arg var from ec.sub to set msg.client
-		if m.data then m.data = ec_decode_data(client, m.data) end
-		if m.header then m.header = ec_decode_header(client, m.header) end
+	return cm.subscribe(client.client, subject, function(m)
+		rawset(m, "client", client) -- takes client from ec.sub call .. meh
+		if m.data then rawset(m, "data", ec_decode_data(client, m.data) or nil) end
+		if m.header then rawset(m, "header", ec_decode_header(client, m.header) or nil) end
 		local s,r = pcall(callback, m)
 		if s then return r else print("ec:sub:err " .. r) end
 	end, queue)
+end
+
+function ec.poll(client, subject, callback, data, header, wait, count)
+	return cm.poll(client.client, subject,
+		function(m)
+			if m.data then rawset(m, "data", ec_decode_data(client, m.data) or nil) end
+			if m.header then rawset(m, "header", ec_decode_header(client, m.header) or nil) end
+			local s,r = pcall(callback, m)
+			if s then return r else print("ec:sub:err " .. r) end
+		end,
+		ec_encode_data(client, data),
+		ec_encode_header(client, header), wait, count)
 end
 
 --
