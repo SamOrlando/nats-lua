@@ -3,8 +3,8 @@ local nats = {
 	_DESCRIPTION = 'Lua client for NATS w/header, tls - https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2023 - MIT Cheese Please',
 	--
-	verbose = false, -- use properly in relation to commands and +OK response
-	defaults = {
+	verbose = false, -- NOT RELATED TO CLIENT VERBOSE OPTION
+	defaults = { -- related to client connection options
 		host = '127.0.0.1',
 		port = 4222,
 		url = 'nats://127.0.0.1:4222',
@@ -100,7 +100,7 @@ local function create_client(config, n_opts) -- fix default checks
 		subscriptions = {},
 		server_information = {},
 		config = {
-			reconnect = nats.defaults.reconnect and nats.defaults.reconnect or true,
+			reconnect = nats.defaults.reconnect and nats.defaults.reconnect or false,
 			max_reconnect = nats.defaults.max_reconnect or 60,
 			reconnect_wait = nats.defaults.reconnect_wait or 2,
 			reconnect_jitter = nats.defaults.reconnect_jitter or .1,
@@ -415,40 +415,12 @@ end
 local cm = nats.client_metatable.methods
 local client_info_response = {"verbose","pedantic","jwt","nkey","sig","user","pass","auth_token","tls_required","name","protocol","echo","headers","no_responders"}
 
-function cm.connect(client)
-	if client.connected and client.network.socket then return true end --review - how do we handle reconnect? do we need to redo all?
-
-	client.network.socket = client.network.socket or create_connection(client.network.opts)
-	if not client.network.socket then client.error("Unable to connect socket.") end
-
-	local ct = {
-		lang = nats.client_metatable.lang,
-		version = nats.client_metatable.version,
-	}
-
-	local cfg = rawget(client, "config")
-	for _,v in ipairs(client_info_response) do ct[v] = cfg[v] end
-
-	request_write(client, {'CONNECT ', encode(ct), crlf})
-
-	-- gather the server information
-	local msg_t = response_read(client)
-	if msg_t.op == 'INFO' then
-		client.server_information = decode(msg_t.data)
-		max_payload = client.server_information.max_payload -- set nats local max_payload to limit buffersize in network write check
-	end
-	client.connected = cm.ping(client)
-	client.inbox_subscribe(client)
-end
-
-function cm.ping(client)
-	request_write(client, 'PING\r\n')
-	local msg_t = response_read(client)
-	if msg_t.op == 'PONG' then return true end
-	return false
-end
-
-function cm.pong(client) request_write(client, 'PONG\r\n') end
+-- create into options but dedicated to all clients at moment which does not work long term.
+local inbox_prefix = "_INBOX"
+local inbox_nuid = nuid({preLen=10,seqLen=0})() -- calling var! we only do ONCE to make a client static inbox --FUTURE: Option for old and new style
+local inbox_lid_nuid = nuid({preLen=8,seqLen=2}) -- want some change but not too often
+local inbox_table = {}
+local sub_nuid = nuid({preLen=10,seqLen=0})
 
 local function msg_stringtable(subject, data, reply, header)
 	local st -- send_table
@@ -491,46 +463,7 @@ local function msg_stringtable(subject, data, reply, header)
 	return st
 end
 
-function cm.publish(client, subject, data, reply, header)
-	request_write(client, msg_stringtable(subject, data, reply, header))
-	return create_msg(subject, data, reply, header, client)
-end
-
-local sub_nuid = nuid({preLen=10,seqLen=0})
-function cm.subscribe(client, subject, callback, queue)
-	local sid = sub_nuid()
-
-	local st = {'SUB ', subject, ' '}
-	if queue and queue ~= "" then
-		insert(st, queue)
-		insert(st, ' ')
-	end
-	insert(st, sid)
-	insert(st, crlf)
-
-	request_write(client, st)
-	client.subscriptions[sid] = {subject=subject, queue=queue, callback=callback or passthru_func}
-	return sid
-end
-
-function cm.unsubscribe(client, sid)
-	request_write(client, {'UNSUB ', sid, crlf})
-	client.subscriptions[sid] = nil
-end
-
--- create into options
-local inbox_prefix = "_INBOX"
-local inbox_nuid = nuid({preLen=10,seqLen=0})() -- calling var! we only do ONCE to make a client static inbox --FUTURE: Option for old and new style
-local inbox_lid_nuid = nuid({preLen=8,seqLen=2}) -- want some change but not too often
-local inbox_table = {}
-
-function nats.create_inbox()
-	local lid = inbox_lid_nuid()
-	return concat({inbox_prefix, '.', inbox_nuid, '.', lid}), lid
-end
-local create_inbox = nats.create_inbox -- vroom
-
-local function inbox_req_cb(m)
+local function inbox_req_cb(m) -- inbox request callback and handling for wait function
 	local lid = str_explode(m.subject or "", '.')[3] -- letter id
 	local ibt = lid and inbox_table[lid] -- inbox table
 
@@ -557,7 +490,74 @@ local function inbox_req_cb(m)
 	end
 end
 
-function cm.inbox_subscribe(client)
+function cm.connect(client)
+	if client.connected and client.network.socket then return true end --review - how do we handle reconnect? do we need to redo all?
+
+	client.network.socket = client.network.socket or create_connection(client.network.opts)
+	if not client.network.socket then client.error("Unable to connect socket.") end
+
+	local ct = {
+		lang = nats.client_metatable.lang,
+		version = nats.client_metatable.version,
+	}
+
+	local cfg = rawget(client, "config")
+	for _,v in ipairs(client_info_response) do ct[v] = cfg[v] end
+
+	request_write(client, {'CONNECT ', encode(ct), crlf})
+
+	-- gather the server information
+	local msg_t = response_read(client)
+	if msg_t.op == 'INFO' then
+		client.server_information = decode(msg_t.data)
+		max_payload = client.server_information.max_payload -- set nats local max_payload to limit buffersize in network write check
+	end
+	client.connected = cm.ping(client)
+	client.inbox_subscribe(client)
+end
+
+function cm.ping(client)
+	request_write(client, 'PING\r\n')
+	local msg_t = response_read(client)
+	if msg_t.op == 'PONG' then return true end
+	return false
+end
+
+function cm.pong(client) request_write(client, 'PONG\r\n') end
+
+function cm.publish(client, subject, data, reply, header)
+	request_write(client, msg_stringtable(subject, data, reply, header))
+	return create_msg(subject, data, reply, header, client)
+end
+
+function cm.subscribe(client, subject, callback, queue)
+	local sid = sub_nuid()
+
+	local st = {'SUB ', subject, ' '}
+	if queue and queue ~= "" then
+		insert(st, queue)
+		insert(st, ' ')
+	end
+	insert(st, sid)
+	insert(st, crlf)
+
+	request_write(client, st)
+	client.subscriptions[sid] = {subject=subject, queue=queue, callback=callback or passthru_func}
+	return sid
+end
+
+function cm.unsubscribe(client, sid)
+	request_write(client, {'UNSUB ', sid, crlf})
+	client.subscriptions[sid] = nil
+end
+
+function nats.create_inbox() -- belongs to client and not all. dependent on moving opts to client and not env locals
+	local lid = inbox_lid_nuid()
+	return concat({inbox_prefix, '.', inbox_nuid, '.', lid}), lid
+end
+local create_inbox = nats.create_inbox -- vroom
+
+function cm.inbox_subscribe(client) -- create and maintain a subscription just for inbox requests
 	local subject = inbox_prefix .. '.' .. inbox_nuid .. '.>'
 	local st = {'SUB ', subject, ' '}
 	insert(st, inbox_nuid)
@@ -568,19 +568,24 @@ function cm.inbox_subscribe(client)
 	return inbox_nuid
 end
 
+-- // Check for no responder status.
+-- if err == nil && len(m.Data) == 0 && m.Header.Get(statusHdr) == noResponders {
+	-- m, err = nil, ErrNoResponders
+-- }
+-- return m, err
 function cm.request(client, subject, callback, data, header, sid)
 	local reply, lid = concat({inbox_prefix, '.', sub_nuid()})
 
 	if sid and client.subscriptions[sid] then
 		reply = client.subscriptions[sid].subject
-	elseif subject:sub(1,1) == "$" then
-		sid = cm.subscribe(client, reply, function(m)
-			cm.unsubscribe(client, m.sid) -- this is nasty and should not be done for consumers/streams... fix
-			if callback then
-				local s, rm = pcall(callback, m)
-				if s then return rm end
-			end
-		end)
+	-- elseif subject:sub(1,1) == "$" then
+		-- sid = cm.subscribe(client, reply, function(m)
+			-- cm.unsubscribe(client, m.sid) -- this is nasty and should not be done for consumers/streams... fix
+			-- if callback then
+				-- local s, rm = pcall(callback, m)
+				-- if s then return rm end
+			-- end
+		-- end)
 	else
 		reply, lid = create_inbox() -- get reply string and letter id for inbox
 		inbox_table[lid] = {created=gettime(), callback=callback}
@@ -593,7 +598,18 @@ function cm.request(client, subject, callback, data, header, sid)
 	return msg
 end
 
+function cm.get(client, subject, data, header, sid)
+	local msg = cm.request(client, subject, nil, data, header, sid)
+	local r_msg = cm.wait(client, {
+		sid=msg.sid,
+		lid=msg.lid,
+		timeout=client.config.timeout}) -- add timeout config here
+	if r_msg and r_msg.lid then inbox_table[msg.lid] = nil end
+	return r_msg -- return results or nothing from timeout
+end
+
 -- need to add timer to loop and add callback on termination for wait period
+-- add closing func or option to call each or at complete
 function cm.poll(client, subject, callback, data, header, wait, count)
 	local reply, lid = create_inbox()
 	inbox_table[lid] = {created=gettime(), callback=callback, wait=wait or 2, expire=gettime() + (wait or 2), count=count}
@@ -605,24 +621,7 @@ function cm.poll(client, subject, callback, data, header, wait, count)
 	return msg
 end
 
--- // Check for no responder status.
--- if err == nil && len(m.Data) == 0 && m.Header.Get(statusHdr) == noResponders {
-	-- m, err = nil, ErrNoResponders
--- }
--- return m, err
-
 -- TODO: cm.collect(client, subject, data, header, wait, count) -- blocking
--- TODO: cm.poll(client, subject, callback, data, header, wait, count) -- nonblocking with callback
-
-function cm.get(client, subject, data, header, sid)
-	local msg = cm.request(client, subject, nil, data, header, sid)
-	local r_msg = cm.wait(client, {
-		sid=msg.sid,
-		lid=msg.lid,
-		timeout=client.config.timeout}) -- add timeout config here
-	if r_msg.lid then inbox_table[msg.lid] = nil end
-	return r_msg -- return results or nothing from timeout
-end
 
 function cm.auth(client, user, pass) -- crap
 	client.config.user = user or client.config.user
@@ -645,27 +644,31 @@ function cm.wait(client, opts)
 
 	opts = opts or {}
 
-	local sid, lid, maxcount, timeout = opts.sid, opts.lid, opts.maxcount, opts.timeout or -1
+	local sid, lid, maxcount, timeout = opts.sid, opts.lid, opts.maxcount, opts.timeout
 	local count, socket, msg_t, msg = 1, nc.network.socket
 	local timeout_b, timeout_t, last_timeout_b, last_timeout_t
 	
 	--ugly
-	local ttyp = type(timeout)
-	if ttyp == "number" then timeout_b = timeout
-	elseif ttyp == "table" then
-		timeout_b = timeout[1]
-		timeout_t = timeout[2]
+	if timeout then
+		local ttyp = type(timeout)
+		if ttyp == "number" then timeout_b = timeout
+		elseif ttyp == "table" then
+			timeout_b = timeout[1]
+			timeout_t = timeout[2]
+		elseif ttyp == "string" then timeout_b = tonumber(timeout) or -1 end
+	else
+		timeout_b = -1
 	end
 
 	last_timeout_b, last_timeout_t = socket:gettimeout()
 	if timeout_b then socket:settimeout(timeout_b,'b') end
 	if timeout_t then socket:settimeout(timeout_t,'t') end
 
-	local toe, loop_run_start = 0, gettime() -- this toe thing has gone too far... blame you looneytunes
+	local toe, loop_run_start, op = 0, gettime() -- this toe thing has gone too far... blame you looneytunes
 	while true do
 		if toe >= 100 then
 			local current_time = gettime()
-			if timeout_b and timeout_b <= (current_time - loop_run_start) then
+			if timeout_b and timeout_b > -1 and timeout_b <= (current_time - loop_run_start) then
 				print("timeout on " .. count .. " nats:cm.wait loop " .. (current_time - loop_run_start))
 				return
 			end
@@ -675,7 +678,7 @@ function cm.wait(client, opts)
 		msg = nil -- i like to rinse my hands every cycle because of return
 		msg_t = response_read(nc)
 		if not msg_t then return end
-		local op = msg_t.op
+		op = msg_t.op
 
 		if op == 'MSG' or op == 'HMSG' then
 			msg = create_msg(msg_t.subject, msg_t.data, msg_t.reply, msg_t.header, client, msg_t.sid)
@@ -684,7 +687,10 @@ function cm.wait(client, opts)
 				if lid and msg.lid == lid then break end
 			else
 				local st = nc.subscriptions[msg.sid]
-				if st then msg = st.callback(msg) or msg end --pcall future
+				if st then
+					local s,r = pcall(st.callback or passthru_func, msg)
+					msg = s and r or msg
+				end
 				if sid and sid == msg.sid then break end
 			end
 			count = count + 1 -- keeping count +1 outof loop for timeout checks information
@@ -818,8 +824,10 @@ end
 
 function ec.get(client, subject, data, header, sid)
 	local msg = cm.get(client.client, subject, ec_encode_data(client, data), ec_encode_header(client, header), sid)
-	if msg.data then rawset(msg, "data", ec_decode_data(client, msg.data)) end
-	if msg.header then rawset(msg, "header", ec_decode_header(client, msg.header)) end
+	if msg then
+		if msg.data then rawset(msg, "data", ec_decode_data(client, msg.data)) end
+		if msg.header then rawset(msg, "header", ec_decode_header(client, msg.header)) end
+	end
 	return msg
 end
 

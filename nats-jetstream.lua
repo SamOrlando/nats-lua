@@ -11,6 +11,7 @@ local nuid = require('nuid')
 local encode,decode = cjson.encode, cjson.decode
 local json_error_true = '{\"error\":true}'
 local rawset, rawget = rawset, rawget
+local getmetatable = getmetatable
 local tonumber = tonumber
 
 local stream_metatable = {
@@ -33,29 +34,35 @@ local js = stream_metatable.methods -- stream meta methods
 local con = consumer_metatable.methods -- consumer meta methods
 local mm = nats.msg_metatable.methods -- msg meta methods 
 
--- add configuration option or shared subjects table option?
-function cm.stream(client, stream_name, subjects)
-	local nc = client.client or client -- encoded connections and feels bad
-	if subjects and type(subject) ~= "table" then subjects = {tostring(subjects)} end -- test and adjust subjects ; leaky part is 'true' being converted but meh.
+function cm.stream(client, stream_name, scfg)
+	-- test args and clear if needed
+	if scfg and type(scfg) == "table" and scfg.name then stream_name = nil
+	elseif type(stream_name) == "table" then
+		scfg = stream_name
+		stream_name = nil
+	else return false, 'no name provided for stream create' end
 
-	local msg = nc:get('$JS.API.STREAM.CREATE.' .. stream_name, encode({ name = stream_name, subjects = subjects }))
+	local nc = client.client or client -- encoded connections and feels bad
+
+	local msg = nc:get('$JS.API.STREAM.CREATE.' .. scfg.name, encode(scfg))
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 
-	-- create and set stream object
+	local data = msg.data
 	local stream = setmetatable({
-		name = stream_name,
-		client = nc,
-		subjects = subjects,
+		name = data.config.name,
+		client = nc, -- we forcing base client as we are doing our own encoding with-in jetstream module
 		consumers = {},
-		state = msg.data.state or {},
-		config = msg.data.config or {},
-		cluster = msg.data.cluster or {},
+		state = data.state,
+		config = data.config,
+		cluster = data.cluster,
+		created = data.created,
+		ts = data.ts,
 	}, stream_metatable)
-
+	
 	-- insert stream info into client table
-	rawset(nc, "streams", nc.streams or {})
-	rawset(nc.streams, stream_name, stream.config)
+	if not rawget(nc, "streams") then rawset(nc, "streams", {}) end
+	nc.streams[stream.config.name] = stream
 	
 	return stream, msg
 end
@@ -176,7 +183,7 @@ function js.replay(stream, msg_sequence)
 	return msg
 end
 
-function js.remove(stream, msg_sequence)
+function js.remove(stream, msg_sequence) -- msg:remove or delete()? conflict need to resolve in msg and own tables
 	local msg = stream.client:get('$JS.API.STREAM.MSG.DELETE.' .. stream.name, msg_sequence)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
@@ -195,7 +202,7 @@ local function ack_msg(m, t, d, ack) -- msg, type, delay, wait for ack?
 	if m.ackd then return false, "Message already acknolwedged." end
 	if t and t ~= "+WIP" then rawset(m, "ackd", true) end
 	if d then t = (t or "-NAK") .. " {\"delay\": " .. ((tonumber(d) or 0)*1000) .. "}" end
-	if t == "+NXT" or (ack and m.reply) then return m.new():get(m.reply, t)
+	if t == "+NXT" or (ack and m.reply) then return m.new():get(m.reply, t) -- unsure what to do here...
 	else return m:respond(t) end
 end
 function mm.is_ackd(m) return m.ackd end
@@ -250,7 +257,45 @@ function mm.metafields(m)
 	else return {} end
 end
 
+-- TODO mm.delete for removing in streams (js.remove)
+
 return nats
+
+
+-- local stream_conf = {
+	-- name = nil,
+	-- description = nil,
+	-- subjects = nil,
+	-- retention = nil,
+	-- max_consumers = nil,
+	-- max_msgs = nil,
+	-- max_bytes = nil,
+	-- discard = nil,
+	-- discard_new_per_subject = nil,
+	-- max_age = nil,
+	-- max_msgs_per_subject = nil,
+	-- max_msg_size = nil,
+	-- storage = nil,
+	-- num_replicas = nil,
+	-- no_ack = nil,
+	-- duplicate_window = nil,
+	-- Placement = nil,
+	-- mirror = nil,
+	-- sources = nil,
+	-- sealed = nil,
+	-- deny_delete = nil,
+	-- deny_purge = nil,
+	-- allow_rollup_hdrs = nil,
+	-- compression = nil,
+	-- first_seq = nil,
+	-- subject_transform = nil,
+	-- republish = nil,
+	-- allow_direct = nil,
+	-- mirror_direct = nil,
+	-- consumer_limits = nil,
+	-- metadata = nil,
+	-- template_owner = nil,
+-- }
 
 -- -- All API endpoints.
 -- jsAllAPI = "$JS.API.>"
