@@ -4,15 +4,20 @@ nats.jetstream = {}
 
 -- ### Library requirements ###
 local cjson = require('cjson')
-local uuid = require('uuid')
 local nuid = require('nuid')
 
 -- ### Local properties ### speed and neet laziness ftw
 local encode,decode = cjson.encode, cjson.decode
 local json_error_true = '{\"error\":true}'
 local rawset, rawget = rawset, rawget
-local getmetatable = getmetatable
+local getmetatable, setmetatable = getmetatable, setmetatable
 local tonumber = tonumber
+local format = string.format
+
+local defaultAPIPrefix = "$JS.API."
+local jsDomainT = "$JS.%s.API."
+local jsExtDomainT = "$JS.%s.API"
+local jsAPIPrefix = "%s."
 
 local stream_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
@@ -34,22 +39,25 @@ local js = stream_metatable.methods -- stream meta methods
 local con = consumer_metatable.methods -- consumer meta methods
 local mm = nats.msg_metatable.methods -- msg meta methods 
 
-function cm.stream(client, stream_name, scfg)
+function cm.stream(client, scfg, opts)
 	-- test args and clear if needed
-	if scfg and type(scfg) == "table" and scfg.name then stream_name = nil
-	elseif type(stream_name) == "table" then
-		scfg = stream_name
-		stream_name = nil
-	else return false, 'no name provided for stream create' end
+	opts = opts or {}
+	if type(scfg) == 'string' then scfg = {name=scfg}
+	elseif type(scfg) == 'table' and scfg.name then
+	else return false, 'no stream name provided' end
 
 	local nc = client.client or client -- encoded connections and feels bad
 
-	local msg = nc:get('$JS.API.STREAM.CREATE.' .. scfg.name, encode(scfg))
+	local stream_api = opts.domain and format(jsDomainT, opts.domain)
+		or opts.pre	or defaultAPIPrefix
+
+	local msg = nc:get(stream_api .. 'STREAM.CREATE.' .. scfg.name, encode(scfg))
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 
 	local data = msg.data
 	local stream = setmetatable({
+		api = stream_api,
 		name = data.config.name,
 		client = nc, -- we forcing base client as we are doing our own encoding with-in jetstream module
 		consumers = {},
@@ -58,7 +66,21 @@ function cm.stream(client, stream_name, scfg)
 		cluster = data.cluster,
 		created = data.created,
 		ts = data.ts,
+		opts = { -- this is sloppy alignment
+			pre = opts.pre and format(jsAPIPrefix, opts.pre),
+			maxpa = opts.maxpa or 4000, -- stupid var whats it for?
+			wait = opts.wait,
+			aecb = nil,
+			domain = opts.domain,
+			purge_opts = nil, -- table,
+			stream_list_subject = nil, --?
+			direct_get = nil,
+			feature_flags = nil, -- table
+		},
 	}, stream_metatable)
+	
+	-- TODO: MIRROR CHECK AND CONFIGURATION
+	-- TODO: SOURCE CHECK AND CONFIGURATION
 	
 	-- insert stream info into client table
 	if not rawget(nc, "streams") then rawset(nc, "streams", {}) end
@@ -69,7 +91,7 @@ end
 
 function js.delete(stream)
 	-- make request
-	local msg = stream.client:get('$JS.API.STREAM.DELETE.' .. stream.name)
+	local msg = stream.client:get(stream.api .. 'STREAM.DELETE.' .. stream.name)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	
@@ -80,7 +102,7 @@ function js.delete(stream)
 end
 
 function js.consumer(stream, consumer_name, config)
-	local msg = stream.client:get('$JS.API.CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name}))
+	local msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name}))
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 
@@ -107,14 +129,15 @@ function js.consumer(stream, consumer_name, config)
 end
 
 function con.delete(consumer)
-	local msg = consumer.stream.client:get('$JS.API.CONSUMER.DELETE.' .. consumer.stream.name .. '.' .. consumer.name)
+	local stream = consumer.stream
+	local msg = stream.client:get(stream.api .. 'CONSUMER.DELETE.' .. stream.name .. '.' .. consumer.name)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	-- remove assigned sub
-	cm.unsubscribe(consumer.stream.client, consumer.sid)
+	cm.unsubscribe(stream.client, consumer.sid)
 	-- delete references
-	consumer.stream.consumers[consumer.name] = nil
-	consumer.stream.client.streams[consumer.stream.name].consumers[consumer.name] = nil
+	stream.consumers[consumer.name] = nil
+	stream.client.streams[stream.name].consumers[consumer.name] = nil
 	return true, msg
 end
 
@@ -124,21 +147,21 @@ function js.publish(stream, subject, data, reply, header)
 end
 
 function js.info(stream)
-	local msg = stream.client:get('$JS.API.STREAM.INFO.' .. stream.name)
+	local msg = stream.client:get(stream.api .. 'STREAM.INFO.' .. stream.name)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return msg
 end
 
 function con.info(consumer)
-	local msg = consumer.stream.client:get('$JS.API.CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name)
+	local msg = consumer.stream.client:get(consumer.stream.api .. 'CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return msg
 end
 
 function con.nextmsg(consumer)
-	local msg = consumer.stream.client:get('$JS.API.CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name, nil, nil, consumer.sid)
+	local msg = consumer.stream.client:get(consumer.stream.api .. 'CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name, nil, nil, consumer.sid)
 	if msg then
 		msg.data = decode(msg.data or json_error_true)
 		if msg.data.error then return false, msg end
@@ -154,7 +177,7 @@ function cm.stream_list(client)
 end
 
 function js.consumer_list(stream)
-	local msg = stream.client:get('$JS.API.CONSUMER.LIST.' .. stream.name)
+	local msg = stream.client:get(stream.api .. 'CONSUMER.LIST.' .. stream.name)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return msg.data
@@ -162,7 +185,7 @@ end
 
 function js.update(stream, configuration)
 	local configJson = encode(configuration or {})
-	local msg = stream.client:get('$JS.API.STREAM.UPDATE.' .. stream.name, configJson)
+	local msg = stream.client:get(stream.api .. 'STREAM.UPDATE.' .. stream.name, configJson)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return true, msg
@@ -170,28 +193,28 @@ end
 
 function con.update(consumer, configuration)
 	local configJson = encode(configuration)
-	local msg = consumer.client:get('$JS.API.CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name, configJson)
+	local msg = consumer.client:get(consumer.stream.api .. 'CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name, configJson)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return true, msg
 end
 
 function js.replay(stream, msg_sequence)
-	local msg = stream.client:get('$JS.API.STREAM.MSG.GET.' .. stream.name, msg_sequence)
+	local msg = stream.client:get(stream.api .. 'STREAM.MSG.GET.' .. stream.name, msg_sequence)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return msg
 end
 
 function js.remove(stream, msg_sequence) -- msg:remove or delete()? conflict need to resolve in msg and own tables
-	local msg = stream.client:get('$JS.API.STREAM.MSG.DELETE.' .. stream.name, msg_sequence)
+	local msg = stream.client:get(stream.api .. 'STREAM.MSG.DELETE.' .. stream.name, msg_sequence)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return true, msg
 end
 
 function js.purge(stream)
-	local msg = stream.client:get('$JS.API.STREAM.PURGE.' .. stream.name)
+	local msg = stream.client:get(stream.api .. 'STREAM.PURGE.' .. stream.name)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return true, msg

@@ -1,17 +1,19 @@
+-- TODO: Handling of MIRROR, SOURCES, Externals, API Prefix and wtfs
+
 -- ### NATS-LUA Table
-local nats = require('nats'), require('nats-jetstream')
+local nats = require('nats-jetstream')
 
 -- ### Library requirements ###
 local cjson = require('cjson')
-local uuid = require('uuid')
 local nuid = require('nuid')
 
 -- ### Local properties ### speed and neet laziness ftw
 local encode,decode = cjson.encode, cjson.decode
 local json_error_true = '{\"error\":true}'
 local rawset, rawget = rawset, rawget
+local getmetatable, setmetatable = getmetatable, setmetatable
 local tonumber = tonumber
-local smatch, sformat = string.match, string.format
+local match, format = string.match, string.format
 
 -- constants defined by nats go team and will continue to use
 local kvBucketNamePre = "KV_"
@@ -42,6 +44,7 @@ nats.kve = {
 		}
 }
 local kve_metatable = nats.kve.metatable
+local kvem = nats.kve.metatable.methods -- kve methods table for easy ref
 
 function cm.kve(t)
 	if type(t) ~= "table" then t = {} end
@@ -60,23 +63,24 @@ end
 nats.kvs = {
 	metatable = {
 		__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
-		__newindex = function(self, key, value) print("__newindex kvs: " .. key .. " with a value of " .. tostring(value)) end,
+		--__newindex = function(self, key, value) print("__newindex kvs: " .. key .. " with a value of " .. tostring(value)) end,
 		methods = {},
 	}
 }
 local kvs_metatable = nats.kvs.metatable
+local kvsm = nats.kvs.metatable.methods -- kvs methods table for easy ref(lol)
+
 local kvs_table = {} -- table of all the keyvalue stores by name
 
-local function valid_bucket_name(s) return smatch(s, "^[%w%-_]+$") end
-local function valid_key_name(s) return smatch(s, "^[-/_=.%a%d]+$") end
+local function valid_bucket_name(s) return match(s, "^[%w%-_]+$") end
+local function valid_key_name(s) return match(s, "^[-/_=.%a%d]+$") end
 
-function cm.kvs(client, kvs_name, kvs_cfg) --kvs:(string or obj)
+function cm.kvs(client, kvs_cfg, opts) --kvs:(string or obj)
 	-- test args and clear if needed
-	if kvs_cfg and type(kvs_cfg) == "table" and kvs_cfg.bucket then kvs_name = nil
-	elseif type(kvs_name) == "table" then
-		kvs_cfg = kvs_name
-		kvs_name = nil
+	if type(kvs_cfg) == "table" and kvs_cfg.bucket then
+	elseif type(kvs_cfg) == "string" then kvs_cfg = {bucket=kvs_cfg}
 	else return false, 'no name provided for stream create' end
+	opts = type(opts) == 'table' and opts or {}
 	
 	if not valid_bucket_name(kvs_cfg.bucket) then return false, 'bad bucket name' end
 	
@@ -95,13 +99,13 @@ function cm.kvs(client, kvs_name, kvs_cfg) --kvs:(string or obj)
 		max_age = kvs_cfg.ttl,
 		max_bytes = (kvs_cfg.max_bytes and (kvs_cfg.max_bytes > 0)) and kvs_cfg.max_bytes or -1,
 		max_consumers = -1,
-		max_msg_size = (kvs_cfg.max_value_size and (kvs_cfg.max_value_size > 0)) and max_value_size or -1,,
+		max_msg_size = (kvs_cfg.max_value_size and (kvs_cfg.max_value_size > 0)) and max_value_size or -1,
 		max_msgs = -1,
 		max_msgs_per_subject = (kvs_cfg.history and ((kvs_cfg.history > 0) and (kvs_cfg.history <= KeyValueMaxHistory))) and kvs_cfg.history or 1,
 		--metadata = nil,
 		mirror = kvs_cfg.mirror,
 		mirror_direct = kvs_cfg.mirror and true,
-		name = sformat(kvBucketNameTmpl, kvs_cfg.bucket),
+		name = format(kvBucketNameTmpl, kvs_cfg.bucket),
 		--no_ack = nil,
 		num_replicas = (kvs_cfg.replicas and (kvs_cfg.replicas > 0)) and kvs_cfg.replicas or 1,
 		placement = kvs_cfg.placement,
@@ -111,24 +115,20 @@ function cm.kvs(client, kvs_name, kvs_cfg) --kvs:(string or obj)
 		sources = kvs_cfg.sources, -- not sure what to do here but its not simple...
 		storage = kvs_cfg.storage,
 		subject_transform = nil, -- ss.SubjectTransforms = []SubjectTransformConfig{{Source: fmt.Sprintf(kvSubjectsTmpl, sourceBucketName), Destination: fmt.Sprintf(kvSubjectsTmpl, cfg.Bucket)}}
-		subjects = kvs_cfg.subjects, -- related to subjects from bucket/stream name.
+		subjects = {format(kvSubjectsTmpl, kvs_cfg.bucket)}, -- related to subjects from bucket/stream name.
 		--template_owner = nil,
 	}
 	
-	local stream, msg = client:stream(scfg)
-	if not stream then return false, 'oh snap' end
+	local stream, msg = client:stream(stream_cfg, opts)
+	if not stream then return false, msg end
 	
 	-- create and set stream object
 	local kvs = setmetatable({
-		js = nil, -- jetstream
-		name = scfg.name,
-		pre = nil,
-		pushJS = nil,
+		js = stream, -- jetstream ??? no idea what they want here
+		name = kvs_cfg.bucket,
+		pre = format(kvSubjectsPreTmpl, kvs_cfg.bucket),
 		putPre = nil,
 		stream = stream, -- strem obj
-		stream_name = stream.name, -- stream name in full, string
-		useDirect = false, -- use JS direct?
-		useJSPfx = false, -- use JSPrefixing
 	}, kvs_metatable)
 	
 	kvs_table[kvs.name] = kvs
@@ -136,77 +136,88 @@ function cm.kvs(client, kvs_name, kvs_cfg) --kvs:(string or obj)
 	return kvs, msg
 end
 
-	-- scfg := &StreamConfig{
-		-- Name:              fmt.Sprintf(kvBucketNameTmpl, cfg.Bucket),
-		-- Description:       cfg.Description,
-		-- MaxMsgsPerSubject: history,
-		-- MaxBytes:          maxBytes,
-		-- MaxAge:            cfg.TTL,
-		-- MaxMsgSize:        maxMsgSize,
-		-- Storage:           cfg.Storage,
-		-- Replicas:          replicas,
-		-- Placement:         cfg.Placement,
-		-- AllowRollup:       true,
-		-- DenyDelete:        true,
-		-- Duplicates:        duplicateWindow,
-		-- MaxMsgs:           -1,
-		-- MaxConsumers:      -1,
-		-- AllowDirect:       true,
-		-- RePublish:         cfg.RePublish,
-		-- Compression:       compression,
-	-- }
-
-local stream_conf = {
-	name = nil,
-	description = nil,
-	subjects = nil,
-	retention = nil,
-	max_consumers = nil,
-	max_msgs = nil,
-	max_bytes = nil,
-	discard = nil,
-	discard_new_per_subject = nil,
-	max_age = nil,
-	max_msgs_per_subject = nil,
-	max_msg_size = nil,
-	storage = nil,
-	num_replicas = nil,
-	no_ack = nil,
-	duplicate_window = nil,
-	Placement = nil,
-	mirror = nil,
-	sources = nil,
-	sealed = nil,
-	deny_delete = nil,
-	deny_purge = nil,
-	allow_rollup_hdrs = nil,
-	compression = nil,
-	first_seq = nil,
-	subject_transform = nil,
-	republish = nil,
-	allow_direct = nil,
-	mirror_direct = nil,
-	consumer_limits = nil,
-	metadata = nil,
-	template_owner = nil,
-}
-
 -- Adding KVS Interface Methods
-local kvs = nats.kvs.metatable.methods
-function kvs:get(key, rev) end
-function kvs:put(key, value, rev) end
-function kvs:create(key, value, rev) end
-function kvs:update(key, value, rev) end
-function kvs:delete(key, opts) end
-function kvs:purge(key, opts) end
-function kvs:watch(key, opts) end
-function kvs:watchall(opts) end
-function kvs:keys(opts) end
-function kvs:list_keys(opts) end
-function kvs:history(key, opts) end
-function kvs:bucket() end
-function kvs:purge_deletes(opts) end
-function kvs:status() end
+local kvsm = nats.kvs.metatable.methods
+function kvsm:get(key, rev)
+	if not valid_key_name(key) then return nil, 'invalid key name' end
+	local s = self.pre .. key .. '.' .. (rev and rev or '0')
+	return self.stream.client:get(s)
+	-- setup string with pre and stuff for subject
+	-- use direct check
+	-- if not rev, get last msg of topic, if rev then get that.
+	-- get result and create kve
+	-- wtf is this? // Double check here that this is not a DEL Operation marker.
+	-- return kve
+end
+
+
+    -- local entry = {
+        -- bucket = kv.name,
+        -- key = key,
+        -- value = m.Data,
+        -- revision = m.Sequence,
+        -- created = m.Time,
+    -- }
+
+    -- -- Double check here that this is not a DEL Operation marker.
+    -- if #m.Header > 0 then
+        -- local kvop_value = m.Header:Get(kvop)
+        -- if kvop_value == kvdel then
+            -- entry.op = KeyValueDelete
+            -- return entry, ErrKeyDeleted
+        -- elseif kvop_value == kvpurge then
+            -- entry.op = KeyValuePurge
+            -- return entry, ErrKeyDeleted
+        -- end
+    -- end
+
+    -- return entry, nil
+-- end
+
+function kvsm:put(key, value, rev)
+	if not valid_key_name(key) then return nil, 'invalid key name' end
+	local s = self.pre .. key .. (rev and '.' or '') .. (rev and rev or '')
+	self.stream.client:publish(s, value)
+	-- validate key name
+	-- check if we use JSPfx
+	-- check if putPre or pre (wtf..)
+	-- revision?
+	-- publish to correct subject
+end
+
+-- function kvsm:put(key, value)
+    -- if not keyValid(key) then return nil, 'invalid key name' end
+
+    -- local s = ''
+    -- if self.useJSPfx then s = s .. self.js.opts.pre end
+    -- if self.putPre then s = s .. self.putPre
+    -- elseif self.pre then s = s .. self.pre end
+    
+	-- s = s .. key
+
+    -- local pa, err = self.js:Publish(b, value)
+    -- if err then
+        -- return 0, err
+    -- end
+    -- return pa.Sequence, err
+-- end
+
+
+function kvsm:create(key, value, rev) end
+function kvsm:update(key, value, rev) end
+function kvsm:delete(key, opts) end
+function kvsm:purge_deletes(opts) end
+function kvsm:purge(key, opts) end
+function kvsm:watch(key, opts) end
+function kvsm:watchall(opts) end
+function kvsm:keys(opts) end
+function kvsm:list_keys(opts) end
+function kvsm:history(key, opts) end
+function kvsm:bucket() end
+function kvsm:bucket_delete() end
+function kvsm:status() end
+
+return nats
 
 
 

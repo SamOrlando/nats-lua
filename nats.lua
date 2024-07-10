@@ -3,7 +3,7 @@ local nats = {
 	_DESCRIPTION = 'Lua client for NATS w/header, tls - https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) Sam Orlando 2023 - MIT Cheese Please',
 	--
-	verbose = false, -- NOT RELATED TO CLIENT VERBOSE OPTION
+	verbose = false, -- NOT RELATED TO CLIENT VERBOSE OPTION, local output and debugs
 	defaults = { -- related to client connection options
 		host = '127.0.0.1',
 		port = 4222,
@@ -13,32 +13,30 @@ local nats = {
 	network = {}, -- network functions
 	request = {}, -- request handling (from client to server)
 	response = {}, -- response handing (from server to client)
+	nuid = require('nuid'),
 }
-
--- todo - protocol setting in CONNECT (confirm dynamic INFO adjustments in client)
-local nuid = require("nuid")
-local cjson = require('cjson')
-local uuid = require('uuid')
-local socket = require('socket')
-local ssl = require('ssl') -- place with tls_required checks
-local crlf = '\r\n'
-local hdrLine = 'NATS/1.0\r\n'
-local max_payload = 1024000
-
--- local vars, shortcuts, speed
 local network, response, request = nats.network, nats.response, nats.request -- Shortcuts
 local verbose = nats.verbose -- (false or nil for off) levels 1-5
-local insert, concat = table.insert, table.concat
-local str_gmatch = string.gmatch
-local gettime = socket.gettime
+
+local cjson = require('cjson')
+local socket = require('socket')
+local ssl = require('ssl') -- place with tls_required checks
 local type, pcall, rawset, rawget, setmetatable, getmetatable = type, pcall, rawset, rawget, setmetatable, getmetatable
 local floor, tonumber, tostring = math.floor, tonumber, tostring
 local encode, decode = cjson.encode, cjson.decode
+
+local insert, concat = table.insert, table.concat
+local str_gmatch = string.gmatch
+local gettime = socket.gettime
+
 
 -- list of valid configuration options, etc.
 local valid_config_toggles = {headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true,verbose=true}
 local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=true,jwt=true,nkey=true,protocol=true}
 
+local crlf = '\r\n'
+local hdrLine = 'NATS/1.0\r\n'
+local max_payload = 1024000
 
 -- common meh functions
 local passthru_func = function(...) return unpack({...}) end
@@ -93,7 +91,6 @@ nats.client_metatable = {
 }
 local client_metatable = nats.client_metatable
 
-uuid.seed() -- kick the seed a little
 local function create_client(config, n_opts) -- fix default checks
 	local client = setmetatable({
 		connected = false,
@@ -199,7 +196,7 @@ function network.write(client, buffer)
 	if #buffer > max_payload then
 		client.error("buffer write error: payload too large at " .. #buffer .. " : max_payload is " .. client.server_information.max_payload)
 	end
-	if verbose and verbose > 5 then print('->> '..buffer:sub(1,-3)) end
+	if verbose then print('->> '..buffer:sub(1,-3)) end
 	local _, err = client.network.socket:send(buffer)
 	if err then
 		client.connected = false
@@ -219,7 +216,7 @@ function network.read(client, len)
 		client.error('connection error: ' .. err)
 	else
 		client.network.lread = line
-		if verbose and verbose > 5 then print('<<- '..line) end
+		if verbose then print('<<- '..line) end
 		return line
 	end
 end
@@ -391,11 +388,11 @@ function nats.client(opts, host, port, timeout)
 	return create_client(c_opts, n_opts)
 end
 
-function nats.verbose_level(v)
-	if v ~= nil then
-		nats.verbose = tonumber(v)
+function nats.verbose(b)
+	if b ~= nil then
+		nats.verbose = b and true or false
 		verbose = nats.verbose -- local var reassign
-	else return nats.verbose end
+	else return verbose end
 end
 
 function nats.connect(...) -- i hate this thing - please rewrite it!
@@ -417,10 +414,10 @@ local client_info_response = {"verbose","pedantic","jwt","nkey","sig","user","pa
 
 -- create into options but dedicated to all clients at moment which does not work long term.
 local inbox_prefix = "_INBOX"
-local inbox_nuid = nuid({preLen=10,seqLen=0})() -- calling var! we only do ONCE to make a client static inbox --FUTURE: Option for old and new style
-local inbox_lid_nuid = nuid({preLen=8,seqLen=2}) -- want some change but not too often
+local inbox_nuid = nats.nuid({preLen=10,seqLen=0})() -- calling var! we only do ONCE to make a client static inbox --FUTURE: Option for old and new style
+local inbox_lid_nuid = nats.nuid({preLen=8,seqLen=2}) -- want some change but not too often
 local inbox_table = {}
-local sub_nuid = nuid({preLen=10,seqLen=0})
+local sub_nuid = nats.nuid({preLen=10,seqLen=0})
 
 local function msg_stringtable(subject, data, reply, header)
 	local st -- send_table
