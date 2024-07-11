@@ -101,7 +101,7 @@ function cm.kvs(client, kvs_cfg, opts) --kvs:(string or obj)
 		max_consumers = -1,
 		max_msg_size = (kvs_cfg.max_value_size and (kvs_cfg.max_value_size > 0)) and max_value_size or -1,
 		max_msgs = -1,
-		max_msgs_per_subject = (kvs_cfg.history and ((kvs_cfg.history > 0) and (kvs_cfg.history <= KeyValueMaxHistory))) and kvs_cfg.history or 1,
+		max_msgs_per_subject = (kvs_cfg.history and ((kvs_cfg.history > 0) and (kvs_cfg.history <= KeyValueMaxHistory))) and kvs_cfg.history or 3,
 		--metadata = nil,
 		mirror = kvs_cfg.mirror,
 		mirror_direct = kvs_cfg.mirror and true,
@@ -140,8 +140,8 @@ end
 local kvsm = nats.kvs.metatable.methods
 function kvsm:get(key, rev)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
-	local s = self.pre .. key .. '.' .. (rev and rev or '0')
-	return self.stream.client:get(s)
+	local s = self.pre .. key
+	return self.stream:getmsg(rev, s)
 	-- setup string with pre and stuff for subject
 	-- use direct check
 	-- if not rev, get last msg of topic, if rev then get that.
@@ -174,37 +174,22 @@ end
     -- return entry, nil
 -- end
 
-function kvsm:put(key, value, rev)
+
+function kvsm:update(key, value, rev)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
-	local s = self.pre .. key .. (rev and '.' or '') .. (rev and rev or '')
-	self.stream.client:publish(s, value)
-	-- validate key name
-	-- check if we use JSPfx
-	-- check if putPre or pre (wtf..)
-	-- revision?
-	-- publish to correct subject
+	local s = self.pre .. key
+	if rev then
+		return self.stream.client:get(s, value, nats.encode_header({['Nats-Expected-Last-Subject-Sequence'] = tonumber(rev)}))
+	else
+		return self.stream.client:get(s, value)
+	end
+end
+kvsm.put = kvsm.update
+
+function kvsm:create(key, value)
+	return self:update(key, value, 0)
 end
 
--- function kvsm:put(key, value)
-    -- if not keyValid(key) then return nil, 'invalid key name' end
-
-    -- local s = ''
-    -- if self.useJSPfx then s = s .. self.js.opts.pre end
-    -- if self.putPre then s = s .. self.putPre
-    -- elseif self.pre then s = s .. self.pre end
-    
-	-- s = s .. key
-
-    -- local pa, err = self.js:Publish(b, value)
-    -- if err then
-        -- return 0, err
-    -- end
-    -- return pa.Sequence, err
--- end
-
-
-function kvsm:create(key, value, rev) end
-function kvsm:update(key, value, rev) end
 function kvsm:delete(key, opts) end
 function kvsm:purge_deletes(opts) end
 function kvsm:purge(key, opts) end

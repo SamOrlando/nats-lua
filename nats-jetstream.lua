@@ -8,6 +8,7 @@ local nuid = require('nuid')
 
 -- ### Local properties ### speed and neet laziness ftw
 local encode,decode = cjson.encode, cjson.decode
+local encode_header, decode_header = nats.encode_header, nats.decode_header
 local json_error_true = '{\"error\":true}'
 local rawset, rawget = rawset, rawget
 local getmetatable, setmetatable = getmetatable, setmetatable
@@ -101,6 +102,41 @@ function js.delete(stream)
 	return true, msg
 end
 
+	-- // apiMsgDeleteT is the endpoint to remove a message.
+	-- apiMsgDeleteT = "STREAM.MSG.DELETE.%s"
+
+function js.getmsg(stream, seq, subject)
+	local msg = ''
+	if not subject and type(seq) == 'string' then
+		subject = seq
+		seq = nil
+	end
+
+	local data = {
+		seq = seq and seq > 0 and seq
+	}
+	
+	if subject then
+		if data.seq then data.next_by_subj = subject
+		else data.last_by_subj = subject end
+	end
+
+	if stream.config.allow_direct then
+		if data.last_by_subj then
+			msg = stream.client:get(stream.api .. format('DIRECT.GET.%s.%s', stream.name, subject))
+		else
+			msg = stream.client:get(stream.api .. format('DIRECT.GET.%s', stream.name), encode(data))
+		end
+	else
+		msg = stream.client:get(stream.api .. format('STREAM.MSG.GET.%s', stream.name), encode(data))
+	end
+	
+	return msg
+end
+
+function js.lastmsg(stream, subject) return js.getmsg(stream, nil, subject) end
+function js.nextmsg(stream, subject) return js.getmsg(stream, 0, subject) end -- does this work?
+
 function js.consumer(stream, consumer_name, config)
 	local msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name}))
 	msg.data = decode(msg.data or json_error_true)
@@ -183,31 +219,31 @@ function js.consumer_list(stream)
 	return msg.data
 end
 
-function js.update(stream, configuration)
-	local configJson = encode(configuration or {})
+function js.update(stream, config)
+	local configJson = encode(config or {})
 	local msg = stream.client:get(stream.api .. 'STREAM.UPDATE.' .. stream.name, configJson)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return true, msg
 end
 
-function con.update(consumer, configuration)
-	local configJson = encode(configuration)
+function con.update(consumer, config)
+	local configJson = encode(config)
 	local msg = consumer.client:get(consumer.stream.api .. 'CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name, configJson)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return true, msg
 end
 
-function js.replay(stream, msg_sequence)
-	local msg = stream.client:get(stream.api .. 'STREAM.MSG.GET.' .. stream.name, msg_sequence)
+function js.replay(stream, seq)
+	local msg = stream.client:get(stream.api .. 'STREAM.MSG.GET.' .. stream.name, seq)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return msg
 end
 
-function js.remove(stream, msg_sequence) -- msg:remove or delete()? conflict need to resolve in msg and own tables
-	local msg = stream.client:get(stream.api .. 'STREAM.MSG.DELETE.' .. stream.name, msg_sequence)
+function js.remove(stream, seq) -- msg:remove or delete()? conflict need to resolve in msg and own tables
+	local msg = stream.client:get(stream.api .. 'STREAM.MSG.DELETE.' .. stream.name, seq)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return true, msg
@@ -237,11 +273,11 @@ function mm.term(m) return ack_msg(m, "+TERM") end
 function mm.in_progress(m) return ack_msg(m, "+WIP") end
 mm.wip = mm.in_progress
 
-local str_gmatch = string.gmatch
+local gmatch = string.gmatch
 local function str_explode(s, ss, p)
     if type(ss) ~= "string" or #ss == 0 then return error("Invalid separator.") end
     local t, i = {}, 1
-    for sub in str_gmatch(s, p and ss or "([^" .. ss .. "]+)") do
+    for sub in gmatch(s, p and ss or "([^" .. ss .. "]+)") do
         t[i] = sub
         i = i + 1
     end
