@@ -22,6 +22,7 @@ local cjson = require('cjson')
 local socket = require('socket')
 local ssl = require('ssl') -- place with tls_required checks
 local type, pcall, rawset, rawget, setmetatable, getmetatable = type, pcall, rawset, rawget, setmetatable, getmetatable
+local pairs, ipairs = pairs, ipairs
 local floor, tonumber, tostring = math.floor, tonumber, tostring
 local encode, decode = cjson.encode, cjson.decode
 

@@ -13,6 +13,7 @@ local json_error_true = '{\"error\":true}'
 local rawset, rawget = rawset, rawget
 local getmetatable, setmetatable = getmetatable, setmetatable
 local tonumber = tonumber
+local pairs, ipairs, type = pairs, ipairs, type
 local format = string.format
 
 local defaultAPIPrefix = "$JS.API."
@@ -80,8 +81,9 @@ function cm.stream(client, scfg, opts)
 		},
 	}, stream_metatable)
 	
-	-- TODO: MIRROR CHECK AND CONFIGURATION
-	-- TODO: SOURCE CHECK AND CONFIGURATION
+	-- TODO: MIRROR CHECK AND CONFIGURATION // If we have a mirror and an external domain, convert to ext.APIPrefix.
+	-- TODO: SOURCE CHECK AND CONFIGURATION // Check sources for the same.
+	-- TODO: // check that input subject transform (if used) is reflected in the returned StreamInfo
 	
 	-- insert stream info into client table
 	if not rawget(nc, "streams") then rawset(nc, "streams", {}) end
@@ -112,13 +114,14 @@ function js.getmsg(stream, seq, subject)
 		seq = nil
 	end
 
-	local data = {
-		seq = seq and seq > 0 and seq
-	}
-	
+	local data = { seq = seq }
 	if subject then
-		if data.seq then data.next_by_subj = subject
-		else data.last_by_subj = subject end
+		if data.seq and data.seq > 1 then
+			data.next_by_subj = subject
+		else
+			data.last_by_subj = subject
+			data.seq = nil
+		end
 	end
 
 	if stream.config.allow_direct then
@@ -134,8 +137,8 @@ function js.getmsg(stream, seq, subject)
 	return msg
 end
 
-function js.lastmsg(stream, subject) return js.getmsg(stream, nil, subject) end
-function js.nextmsg(stream, subject) return js.getmsg(stream, 0, subject) end -- does this work?
+function js.lastmsg(stream, subject) return js.getmsg(stream, 0, subject) end
+function js.nextmsg(stream, subject) return js.getmsg(stream, nil, subject) end -- does this work?
 
 function js.consumer(stream, consumer_name, config)
 	local msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name}))
@@ -319,242 +322,3 @@ end
 -- TODO mm.delete for removing in streams (js.remove)
 
 return nats
-
-
--- local stream_conf = {
-	-- name = nil,
-	-- description = nil,
-	-- subjects = nil,
-	-- retention = nil,
-	-- max_consumers = nil,
-	-- max_msgs = nil,
-	-- max_bytes = nil,
-	-- discard = nil,
-	-- discard_new_per_subject = nil,
-	-- max_age = nil,
-	-- max_msgs_per_subject = nil,
-	-- max_msg_size = nil,
-	-- storage = nil,
-	-- num_replicas = nil,
-	-- no_ack = nil,
-	-- duplicate_window = nil,
-	-- Placement = nil,
-	-- mirror = nil,
-	-- sources = nil,
-	-- sealed = nil,
-	-- deny_delete = nil,
-	-- deny_purge = nil,
-	-- allow_rollup_hdrs = nil,
-	-- compression = nil,
-	-- first_seq = nil,
-	-- subject_transform = nil,
-	-- republish = nil,
-	-- allow_direct = nil,
-	-- mirror_direct = nil,
-	-- consumer_limits = nil,
-	-- metadata = nil,
-	-- template_owner = nil,
--- }
-
--- -- All API endpoints.
--- jsAllAPI = "$JS.API.>"
--- -- For constructing JetStream domain prefixes.
--- jsDomainAPI = "$JS.%s.API.>"
--- JSApiPrefix = "$JS.API"
--- -- JSApiAccountInfo is for obtaining general information about JetStream for this account.
--- -- Will return JSON response.
--- JSApiAccountInfo = "$JS.API.INFO"
--- -- JSApiTemplateCreate is the endpoint to create new stream templates.
--- -- Will return JSON response.
--- JSApiTemplateCreate  = "$JS.API.STREAM.TEMPLATE.CREATE.*"
--- JSApiTemplateCreateT = "$JS.API.STREAM.TEMPLATE.CREATE.%s"
--- -- JSApiTemplates is the endpoint to list all stream template names for this account.
--- -- Will return JSON response.
--- JSApiTemplates = "$JS.API.STREAM.TEMPLATE.NAMES"0
--- -- JSApiTemplateInfo is for obtaining general information about a named stream template.
--- -- Will return JSON response.
--- JSApiTemplateInfo  = "$JS.API.STREAM.TEMPLATE.INFO.*"
--- JSApiTemplateInfoT = "$JS.API.STREAM.TEMPLATE.INFO.%s"
--- -- JSApiTemplateDelete is the endpoint to delete stream templates.
--- -- Will return JSON response.
--- JSApiTemplateDelete  = "$JS.API.STREAM.TEMPLATE.DELETE.*"
--- JSApiTemplateDeleteT = "$JS.API.STREAM.TEMPLATE.DELETE.%s"
--- -- JSApiStreamCreate is the endpoint to create new streams.
--- -- Will return JSON response.
--- JSApiStreamCreate  = "$JS.API.STREAM.CREATE.*"
--- JSApiStreamCreateT = "$JS.API.STREAM.CREATE.%s"
--- -- JSApiStreamUpdate is the endpoint to update existing streams.
--- -- Will return JSON response.
--- JSApiStreamUpdate  = "$JS.API.STREAM.UPDATE.*"
--- JSApiStreamUpdateT = "$JS.API.STREAM.UPDATE.%s"
--- -- JSApiStreams is the endpoint to list all stream names for this account.
--- -- Will return JSON response.
--- JSApiStreams = "$JS.API.STREAM.NAMES"
--- -- JSApiStreamList is the endpoint that will return all detailed stream information
--- JSApiStreamList = "$JS.API.STREAM.LIST"
--- -- JSApiStreamInfo is for obtaining general information about a named stream.
--- -- Will return JSON response.
--- JSApiStreamInfo  = "$JS.API.STREAM.INFO.*"
--- JSApiStreamInfoT = "$JS.API.STREAM.INFO.%s"
--- -- JSApiStreamDelete is the endpoint to delete streams.
--- -- Will return JSON response.
--- JSApiStreamDelete  = "$JS.API.STREAM.DELETE.*"
--- JSApiStreamDeleteT = "$JS.API.STREAM.DELETE.%s"
--- -- JSApiStreamPurge is the endpoint to purge streams.
--- -- Will return JSON response.
--- JSApiStreamPurge  = "$JS.API.STREAM.PURGE.*"
--- JSApiStreamPurgeT = "$JS.API.STREAM.PURGE.%s"
--- -- JSApiStreamSnapshot is the endpoint to snapshot streams.
--- -- Will return a stream of chunks with a nil chunk as EOF to
--- -- the deliver subject. Caller should respond to each chunk
--- -- with a nil body response for ack flow.
--- JSApiStreamSnapshot  = "$JS.API.STREAM.SNAPSHOT.*"
--- JSApiStreamSnapshotT = "$JS.API.STREAM.SNAPSHOT.%s"
--- -- JSApiStreamRestore is the endpoint to restore a stream from a snapshot.
--- -- Caller should respond to each chunk with a nil body response.
--- JSApiStreamRestore  = "$JS.API.STREAM.RESTORE.*"
--- JSApiStreamRestoreT = "$JS.API.STREAM.RESTORE.%s"
--- -- JSApiMsgDelete is the endpoint to delete messages from a stream.
--- -- Will return JSON response.
--- JSApiMsgDelete  = "$JS.API.STREAM.MSG.DELETE.*"
--- JSApiMsgDeleteT = "$JS.API.STREAM.MSG.DELETE.%s"
--- -- JSApiMsgGet is the template for direct requests for a message by its stream sequence number.
--- -- Will return JSON response.
--- JSApiMsgGet  = "$JS.API.STREAM.MSG.GET.*"
--- JSApiMsgGetT = "$JS.API.STREAM.MSG.GET.%s"
--- -- JSDirectMsgGet is the template for non-api layer direct requests for a message by its stream sequence number or last by subject.
--- -- Will return the message similar to how a consumer receives the message, no JSON processing.
--- -- If the message can not be found we will use a status header of 404. If the stream does not exist the client will get a no-responders or timeout.
--- JSDirectMsgGet  = "$JS.API.DIRECT.GET.*"
--- JSDirectMsgGetT = "$JS.API.DIRECT.GET.%s"
--- -- This is a direct version of get last by subject, which will be the dominant pattern for KV access once 2.9 is released.
--- -- The stream and the key will be part of the subject to allow for no-marshal payloads and subject based security permissions.
--- JSDirectGetLastBySubject  = "$JS.API.DIRECT.GET.*.>"
--- JSDirectGetLastBySubjectT = "$JS.API.DIRECT.GET.%s.%s"
--- -- jsDirectGetPre
--- jsDirectGetPre = "$JS.API.DIRECT.GET"
--- -- JSApiConsumerCreate is the endpoint to create consumers for streams.
--- -- This was also the legacy endpoint for ephemeral consumers.
--- -- It now can take consumer name and optional filter subject, which when part of the subject controls access.
--- -- Will return JSON response.
--- JSApiConsumerCreate    = "$JS.API.CONSUMER.CREATE.*"
--- JSApiConsumerCreateT   = "$JS.API.CONSUMER.CREATE.%s"
--- JSApiConsumerCreateEx  = "$JS.API.CONSUMER.CREATE.*.>"
--- JSApiConsumerCreateExT = "$JS.API.CONSUMER.CREATE.%s.%s.%s"
--- -- JSApiDurableCreate is the endpoint to create durable consumers for streams.
--- -- You need to include the stream and consumer name in the subject.
--- JSApiDurableCreate  = "$JS.API.CONSUMER.DURABLE.CREATE.*.*"
--- JSApiDurableCreateT = "$JS.API.CONSUMER.DURABLE.CREATE.%s.%s"
--- -- JSApiConsumers is the endpoint to list all consumer names for the stream.
--- -- Will return JSON response.
--- JSApiConsumers  = "$JS.API.CONSUMER.NAMES.*"
--- JSApiConsumersT = "$JS.API.CONSUMER.NAMES.%s"
--- -- JSApiConsumerList is the endpoint that will return all detailed consumer information
--- JSApiConsumerList  = "$JS.API.CONSUMER.LIST.*"
--- JSApiConsumerListT = "$JS.API.CONSUMER.LIST.%s"
--- -- JSApiConsumerInfo is for obtaining general information about a consumer.
--- -- Will return JSON response.
--- JSApiConsumerInfo  = "$JS.API.CONSUMER.INFO.*.*"
--- JSApiConsumerInfoT = "$JS.API.CONSUMER.INFO.%s.%s"
--- -- JSApiConsumerDelete is the endpoint to delete consumers.
--- -- Will return JSON response.
--- JSApiConsumerDelete  = "$JS.API.CONSUMER.DELETE.*.*"
--- JSApiConsumerDeleteT = "$JS.API.CONSUMER.DELETE.%s.%s"
--- -- JSApiRequestNextT is the prefix for the request next message(s) for a consumer in worker/pull mode.
--- JSApiRequestNextT = "$JS.API.CONSUMER.MSG.NEXT.%s.%s"
--- -- jsRequestNextPre
--- jsRequestNextPre = "$JS.API.CONSUMER.MSG.NEXT."
--- -- For snapshots and restores. The ack will have additional tokens.
--- jsSnapshotAckT    = "$JS.SNAPSHOT.ACK.%s.%s"
--- jsRestoreDeliverT = "$JS.SNAPSHOT.RESTORE.%s.%s"
--- -- JSApiStreamRemovePeer is the endpoint to remove a peer from a clustered stream and its consumers.
--- -- Will return JSON response.
--- JSApiStreamRemovePeer  = "$JS.API.STREAM.PEER.REMOVE.*"
--- JSApiStreamRemovePeerT = "$JS.API.STREAM.PEER.REMOVE.%s"
--- -- JSApiStreamLeaderStepDown is the endpoint to have stream leader stepdown.
--- -- Will return JSON response.
--- JSApiStreamLeaderStepDown  = "$JS.API.STREAM.LEADER.STEPDOWN.*"
--- JSApiStreamLeaderStepDownT = "$JS.API.STREAM.LEADER.STEPDOWN.%s"
--- -- JSApiConsumerLeaderStepDown is the endpoint to have consumer leader stepdown.
--- -- Will return JSON response.
--- JSApiConsumerLeaderStepDown  = "$JS.API.CONSUMER.LEADER.STEPDOWN.*.*"
--- JSApiConsumerLeaderStepDownT = "$JS.API.CONSUMER.LEADER.STEPDOWN.%s.%s"
--- -- JSApiLeaderStepDown is the endpoint to have our metaleader stepdown.
--- -- Only works from system account.
--- -- Will return JSON response.
--- JSApiLeaderStepDown = "$JS.API.META.LEADER.STEPDOWN"
--- -- JSApiRemoveServer is the endpoint to remove a peer server from the cluster.
--- -- Only works from system account.
--- -- Will return JSON response.
--- JSApiRemoveServer = "$JS.API.SERVER.REMOVE"
--- -- JSApiAccountPurge is the endpoint to purge the js content of an account
--- -- Only works from system account.
--- -- Will return JSON response.
--- JSApiAccountPurge  = "$JS.API.ACCOUNT.PURGE.*"
--- JSApiAccountPurgeT = "$JS.API.ACCOUNT.PURGE.%s"
--- -- JSApiServerStreamMove is the endpoint to move streams off a server
--- -- Only works from system account.
--- -- Will return JSON response.
--- JSApiServerStreamMove  = "$JS.API.ACCOUNT.STREAM.MOVE.*.*"
--- JSApiServerStreamMoveT = "$JS.API.ACCOUNT.STREAM.MOVE.%s.%s"
--- -- JSApiServerStreamCancelMove is the endpoint to cancel a stream move
--- -- Only works from system account.
--- -- Will return JSON response.
--- JSApiServerStreamCancelMove  = "$JS.API.ACCOUNT.STREAM.CANCEL_MOVE.*.*"
--- JSApiServerStreamCancelMoveT = "$JS.API.ACCOUNT.STREAM.CANCEL_MOVE.%s.%s"
--- -- The prefix for system level account API.
--- jsAPIAccountPre = "$JS.API.ACCOUNT."
--- -- jsAckT is the template for the ack message stream coming back from a consumer
--- -- when they ACK/NAK, etc a message.
--- jsAckT      = "$JS.ACK.%s.%s"
--- jsAckPre    = "$JS.ACK."
--- jsAckPreLen = len(jsAckPre)
--- -- jsFlowControl is for flow control subjects.
--- jsFlowControlPre = "$JS.FC."
--- -- jsFlowControl is for FC responses.
--- jsFlowControl = "$JS.FC.%s.%s.*"
--- -- JSAdvisoryPrefix is a prefix for all JetStream advisories.
--- JSAdvisoryPrefix = "$JS.EVENT.ADVISORY"
--- -- JSMetricPrefix is a prefix for all JetStream metrics.
--- JSMetricPrefix = "$JS.EVENT.METRIC"
--- -- JSMetricConsumerAckPre is a metric containing ack latency.
--- JSMetricConsumerAckPre = "$JS.EVENT.METRIC.CONSUMER.ACK"
--- -- JSAdvisoryConsumerMaxDeliveryExceedPre is a notification published when a message exceeds its delivery threshold.
--- JSAdvisoryConsumerMaxDeliveryExceedPre = "$JS.EVENT.ADVISORY.CONSUMER.MAX_DELIVERIES"
--- -- JSAdvisoryConsumerMsgNakPre is a notification published when a message has been naked
--- JSAdvisoryConsumerMsgNakPre = "$JS.EVENT.ADVISORY.CONSUMER.MSG_NAKED"
--- -- JSAdvisoryConsumerMsgTerminatedPre is a notification published when a message has been terminated.
--- JSAdvisoryConsumerMsgTerminatedPre = "$JS.EVENT.ADVISORY.CONSUMER.MSG_TERMINATED"
--- -- JSAdvisoryStreamCreatedPre notification that a stream was created.
--- JSAdvisoryStreamCreatedPre = "$JS.EVENT.ADVISORY.STREAM.CREATED"
--- -- JSAdvisoryStreamDeletedPre notification that a stream was deleted.
--- JSAdvisoryStreamDeletedPre = "$JS.EVENT.ADVISORY.STREAM.DELETED"
--- -- JSAdvisoryStreamUpdatedPre notification that a stream was updated.
--- JSAdvisoryStreamUpdatedPre = "$JS.EVENT.ADVISORY.STREAM.UPDATED"
--- -- JSAdvisoryConsumerCreatedPre notification that a template created.
--- JSAdvisoryConsumerCreatedPre = "$JS.EVENT.ADVISORY.CONSUMER.CREATED"
--- -- JSAdvisoryConsumerDeletedPre notification that a template deleted.
--- JSAdvisoryConsumerDeletedPre = "$JS.EVENT.ADVISORY.CONSUMER.DELETED"
--- -- JSAdvisoryStreamSnapshotCreatePre notification that a snapshot was created.
--- JSAdvisoryStreamSnapshotCreatePre = "$JS.EVENT.ADVISORY.STREAM.SNAPSHOT_CREATE"
--- -- JSAdvisoryStreamSnapshotCompletePre notification that a snapshot was completed.
--- JSAdvisoryStreamSnapshotCompletePre = "$JS.EVENT.ADVISORY.STREAM.SNAPSHOT_COMPLETE"
--- -- JSAdvisoryStreamRestoreCreatePre notification that a restore was start.
--- JSAdvisoryStreamRestoreCreatePre = "$JS.EVENT.ADVISORY.STREAM.RESTORE_CREATE"
--- -- JSAdvisoryStreamRestoreCompletePre notification that a restore was completed.
--- JSAdvisoryStreamRestoreCompletePre = "$JS.EVENT.ADVISORY.STREAM.RESTORE_COMPLETE"
--- -- JSAdvisoryStreamLeaderElectedPre notification that a replicated stream has elected a leader.
--- JSAdvisoryStreamLeaderElectedPre = "$JS.EVENT.ADVISORY.STREAM.LEADER_ELECTED"
--- -- JSAdvisoryStreamQuorumLostPre notification that a stream and its consumers are stalled.
--- JSAdvisoryStreamQuorumLostPre = "$JS.EVENT.ADVISORY.STREAM.QUORUM_LOST"
--- -- JSAdvisoryConsumerLeaderElectedPre notification that a replicated consumer has elected a leader.
--- JSAdvisoryConsumerLeaderElectedPre = "$JS.EVENT.ADVISORY.CONSUMER.LEADER_ELECTED"
--- -- JSAdvisoryConsumerQuorumLostPre notification that a consumer is stalled.
--- JSAdvisoryConsumerQuorumLostPre = "$JS.EVENT.ADVISORY.CONSUMER.QUORUM_LOST"
--- -- JSAdvisoryServerOutOfStorage notification that a server has no more storage.
--- JSAdvisoryServerOutOfStorage = "$JS.EVENT.ADVISORY.SERVER.OUT_OF_STORAGE"
--- -- JSAdvisoryServerRemoved notification that a server has been removed from the system.
--- JSAdvisoryServerRemoved = "$JS.EVENT.ADVISORY.SERVER.REMOVED"
--- -- JSAuditAdvisory is a notification about JetStream API access.
--- -- FIXME - Add in details about who..
--- JSAuditAdvisory = "$JS.EVENT.ADVISORY.API"
