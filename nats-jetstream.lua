@@ -220,42 +220,53 @@ end
 
 local consumer_nuid = nats.nuid({preLen=8,seqLen=0})
 function js.consumer(stream, consumer_name, config, action)
-	if not action and type(consumer_name) == 'table' then
-		action, config, consumer_name = config, consumer_name, config, nil
+	if action == nil and type(consumer_name) == 'table' then
+		action = config
+		config = consumer_name
+		consumer_name = nil
 	end
 	
 	config = type(config) == 'table' and config or {}
 	config.name = valid_consumer_name(consumer_name) or valid_consumer_name(config.name) or consumer_nuid()
+	config.durable_name = config.durable_name or config.durable and config.name
+	config.durable = nil
 
 	local msg
-	if config.filter_subject or config.filter_subjects then -- fix me
-		msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. config.name, encode({config=config,stream_name=stream.name,action=action}))
+	if valid_subject(config.filter_subject) then -- fix me
+		msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. config.name .. '.' .. config.filter_subject, encode({config=config,stream_name=stream.name,action=action}))
 	else
-		msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. config.name, encode({config=config,stream_name=stream.name,action=action}))
+		msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. (config.name and ('.' .. config.name) or ''), encode({config=config,stream_name=stream.name,action=action}))
 	end
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	local data = msg.data
 
-	-- consumers assigned subscription
-	local sid = cm.subscribe(stream.client, "_INBOX." .. stream.name .. "." .. data.name, function(m)
+	-- create and set consumer object
+	local consumer = stream.consumers[data.name] or {}
+	setmetatable(consumer, nil)
+	consumer.name = data.name
+	consumer.stream = stream
+	consumer.config = data.config
+	consumer.delivered = data.delivered
+	consumer.ack_floor = data.ack_floor
+	consumer.num_ack_pending = data.num_ack_pending
+	consumer.num_redelivered = data.num_redelivered
+	consumer.num_waiting = data.num_waiting
+	consumer.num_pending = data.num_pending
+	consumer.paused = data.paused
+	consumer.pause_remaining = data.pause_remaining
+	consumer.cluster = data.cluster
+	consumer.ts = data.ts
+	consumer.sid = consumer.sid or cm.subscribe(stream.client, "_INBOX." .. stream.name .. "." .. consumer.name, function(m)
 		print("got stream msg")
 		return m
 	end)
+	
+	setmetatable(consumer, consumer_metatable)
+	
+	-- insert consumer info into stream table and client
+	stream.consumers[data.name] = consumer
 
-	-- create and set consumer object
-	local consumer = setmetatable({
-		name = data.name,
-		stream = stream,
-		config = data.config,
-		cluster = data.cluster,
-		sid = sid,
-	}, consumer_metatable)
-
-	-- insert consumer info into stream table and client 
-	stream.consumers[consumer_name] = consumer.config
-	stream.client.streams[stream.name].consumers = stream.client.streams[stream.name].consumers or {}
-	stream.client.streams[stream.name].consumers[consumer_name] = consumer.config
 	return consumer, msg
 end
 
@@ -275,11 +286,10 @@ function con.delete(consumer)
 	cm.unsubscribe(stream.client, consumer.sid)
 	-- delete references
 	stream.consumers[consumer.name] = nil
-	stream.client.streams[stream.name].consumers[consumer.name] = nil
 	return true, msg
 end
 
-function con.info(consumer)
+function con.info(consumer) -- ?
 	local msg = consumer.stream.client:get(consumer.stream.api .. 'CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name)
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
@@ -296,11 +306,10 @@ function con.nextmsg(consumer)
 end
 
 function con.update(consumer, config)
-	local configJson = encode(config)
-	local msg = consumer.client:get(consumer.stream.api .. 'CONSUMER.UPDATE.' .. consumer.stream.name .. '.' .. consumer.name, configJson)
-	msg.data = decode(msg.data or json_error_true)
-	if msg.data.error then return false, msg end
-	return true, msg
+	config = type(config) == 'table' and config or {}
+	if config.durable_name or config.durable then
+	else config.durable_name = consumer.config.durable_name end
+	return js.consumer(consumer.stream, consumer.name, config, 'update')
 end
 
 -- modify and make msg objects jetstream enabled

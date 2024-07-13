@@ -723,6 +723,7 @@ end
 
 --
 -- nats msg methods
+-- TODO equal Compares two msgs, ignores sub but checks all other public fields. 
 local mm = nats.msg_metatable.methods
 function cm.msg(client, subject, data, reply, header, sid)
 	return create_msg(subject, data, reply, header, client, sid)
