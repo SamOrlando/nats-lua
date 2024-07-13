@@ -163,6 +163,15 @@ function nats.is_encoded(c)
 end
 local is_encoded = nats.is_encoded
 
+-- TODO Go through code an clean your inputs!
+-- general check for nats client
+function nats.valid_subject(s)
+    if type(s) ~= 'string' or s == '' then return nil end
+    if s:sub(1, 1) == "." or s:sub(-1) == "." or not s:match('^[^ >]*[>]?$') then return nil end
+    return s
+end
+local valid_subject = nats.valid_subject
+
 --
 -- nats msg object
 nats.msg_metatable = {

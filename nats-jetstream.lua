@@ -16,10 +16,22 @@ local tonumber = tonumber
 local pairs, ipairs, type = pairs, ipairs, type
 local format, gmatch = string.format, string.gmatch
 
+-- copy go vars
 local defaultAPIPrefix = "$JS.API."
 local jsDomainT = "$JS.%s.API."
 local jsExtDomainT = "$JS.%s.API"
 local jsAPIPrefix = "%s."
+
+local valid_subject = nats.valid_subject
+function nats.valid_consumer_name(s)
+    if type(s) ~= 'string' or s == '' or s:find("[>*. /\\]") then return nil end
+    return s
+end
+local valid_consumer_name = nats.valid_consumer_name
+nats.valid_stream_name = nats.valid_consumer_name
+local valid_stream_name = nats.valid_stream_name
+
+
 
 local stream_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
@@ -111,14 +123,14 @@ function cm.stream_list(client)
 	return msg.data
 end
 
-function js.update(stream, scfg, opts)
+function js.update(stream, scfg, opts) -- update server and update obj
 	opts = opts or {}
 	opts.update_only = true
 	return cm.stream(stream.client, scfg, opts)
 end
 
-function js.info(stream, scfg)
-	return cm.stream(stream.client, scfg, {info_only = true})
+function js.info(stream) -- get info from server and update obj
+	return cm.stream(stream.client, nil, {info_only = true})
 end
 
 function js.delete(stream)
@@ -133,8 +145,9 @@ function js.delete(stream)
 	return true, msg
 end
 
-function js.purge(stream, seq, subject)
-	local msg = stream.client:get(stream.api .. 'STREAM.PURGE.' .. stream.name)
+function js.purge(stream, seq, subject, keep) -- support alt (subject, keep)
+	if type(seq) == 'string' and not keep then subject, seq = seq, nil end
+	local msg = stream.client:get(stream.api .. 'STREAM.PURGE.' .. stream.name, {filter=subject,seq=seq,keep=keep})
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
 	return true, msg
@@ -170,6 +183,30 @@ function js.getmsg(stream, seq, subject)
 	return msg
 end
 
+-- TODO Make all options possible.
+-- // JSApiMsgGetRequest get a message request.
+-- type JSApiMsgGetRequest struct {
+	-- Seq     uint64 `json:"seq,omitempty"`
+	-- LastFor string `json:"last_by_subj,omitempty"`
+	-- NextFor string `json:"next_by_subj,omitempty"`
+
+	-- // Batch support. Used to request more then one msg at a time.
+	-- // Can be used with simple starting seq, but also NextFor with wildcards.
+	-- Batch int `json:"batch,omitempty"`
+	-- // This will make sure we limit how much data we blast out. If not set we will
+	-- // inherit the slow consumer default max setting of the server. Default is MAX_PENDING_SIZE.
+	-- MaxBytes int `json:"max_bytes,omitempty"`
+	-- // Return messages as of this start time.
+	-- StartTime *time.Time `json:"start_time,omitempty"`
+
+	-- // Multiple response support. Will get the last msgs matching the subjects. These can include wildcards.
+	-- MultiLastFor []string `json:"multi_last,omitempty"`
+	-- // Only return messages up to this sequence. If not set, will be last sequence for the stream.
+	-- UpToSeq uint64 `json:"up_to_seq,omitempty"`
+	-- // Only return messages up to this time.
+	-- UpToTime *time.Time `json:"up_to_time,omitempty"`
+-- }
+
 function js.lastmsg(stream, subject) return js.getmsg(stream, 0, subject) end
 function js.nextmsg(stream, subject) return js.getmsg(stream, nil, subject) end -- does this work?
 
@@ -181,23 +218,37 @@ function js.delmsg(stream, seq, secure)
 	return true, msg
 end
 
-function js.consumer(stream, consumer_name, config)
-	local msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. consumer_name, encode(config or {stream_name=stream.name,name=consumer_name}))
+local consumer_nuid = nats.nuid({preLen=8,seqLen=0})
+function js.consumer(stream, consumer_name, config, action)
+	if not action and type(consumer_name) == 'table' then
+		action, config, consumer_name = config, consumer_name, config, nil
+	end
+	
+	config = type(config) == 'table' and config or {}
+	config.name = valid_consumer_name(consumer_name) or valid_consumer_name(config.name) or consumer_nuid()
+
+	local msg
+	if config.filter_subject or config.filter_subjects then -- fix me
+		msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. config.name, encode({config=config,stream_name=stream.name,action=action}))
+	else
+		msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. config.name, encode({config=config,stream_name=stream.name,action=action}))
+	end
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
+	local data = msg.data
 
 	-- consumers assigned subscription
-	local sid = cm.subscribe(stream.client, "_INBOX." .. stream.name .. "." .. consumer_name, function(m)
+	local sid = cm.subscribe(stream.client, "_INBOX." .. stream.name .. "." .. data.name, function(m)
 		print("got stream msg")
 		return m
 	end)
 
 	-- create and set consumer object
 	local consumer = setmetatable({
-		name = consumer_name,
+		name = data.name,
 		stream = stream,
-		config = msg.data.config,
-		cluster = msg.data.cluster,
+		config = data.config,
+		cluster = data.cluster,
 		sid = sid,
 	}, consumer_metatable)
 
@@ -206,6 +257,13 @@ function js.consumer(stream, consumer_name, config)
 	stream.client.streams[stream.name].consumers = stream.client.streams[stream.name].consumers or {}
 	stream.client.streams[stream.name].consumers[consumer_name] = consumer.config
 	return consumer, msg
+end
+
+function js.consumer_list(stream)
+	local msg = stream.client:get(stream.api .. 'CONSUMER.LIST.' .. stream.name)
+	msg.data = decode(msg.data or json_error_true)
+	if msg.data.error then return false, msg end
+	return msg.data
 end
 
 function con.delete(consumer)
@@ -235,13 +293,6 @@ function con.nextmsg(consumer)
 		if msg.data.error then return false, msg end
 		return msg
 	else return end
-end
-
-function js.consumer_list(stream)
-	local msg = stream.client:get(stream.api .. 'CONSUMER.LIST.' .. stream.name)
-	msg.data = decode(msg.data or json_error_true)
-	if msg.data.error then return false, msg end
-	return msg.data
 end
 
 function con.update(consumer, config)

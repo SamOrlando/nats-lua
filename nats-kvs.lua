@@ -71,8 +71,10 @@ local kvsm = nats.kvs.metatable.methods -- kvs methods table for easy ref(lol)
 
 local kvs_table = {} -- table of all the keyvalue stores by name
 
-local function valid_bucket_name(s) return match(s, "^[%w%-_]+$") end
-local function valid_key_name(s) return match(s, "^[-/_=.%a%d]+$") end
+function nats.valid_bucket_name(s) return match(s, "^[%w%-_]+$") end
+local valid_bucket_name = nats.valid_bucket_name
+function nats.valid_key_name(s) return match(s, "^[-/_=.%a%d]+$") end
+local valid_key_name = nats.valid_key_name
 
 function cm.kvs(client, kvs_cfg, opts) --kvs:(string or obj)
 	-- test args and clear if needed
@@ -157,11 +159,8 @@ end
 function kvsm:update(key, value, rev)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
 	local s = self.pre .. key
-	if rev then
-		return self.stream.client:get(s, value, nats.encode_header({['Nats-Expected-Last-Subject-Sequence'] = tonumber(rev)}))
-	else
-		return self.stream.client:get(s, value)
-	end
+	local header = rev and nats.encode_header({['Nats-Expected-Last-Subject-Sequence'] = tonumber(rev)})
+	return self.stream.client:get(s, value, header)
 end
 kvsm.put = kvsm.update
 
