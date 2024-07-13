@@ -1,5 +1,3 @@
--- TODO: Handling of MIRROR, SOURCES, Externals, API Prefix and wtfs
-
 -- ### NATS-LUA Table
 local nats = require('nats-jetstream')
 
@@ -112,7 +110,7 @@ function cm.kvs(client, kvs_cfg, opts) --kvs:(string or obj)
 	}
 	
 	local stream, msg = client:stream(stream_cfg, opts)
-	if not stream then return false, msg end
+	if not stream then return nil, msg end
 	
 	-- create and set stream object
 	local kvs = setmetatable({
@@ -127,7 +125,7 @@ function cm.kvs(client, kvs_cfg, opts) --kvs:(string or obj)
 	return kvs, msg
 end
 
--- Adding KVS Interface Methods
+-- KVS Methods
 local kvsm = nats.kvs.metatable.methods
 function kvsm:get(key, rev)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
@@ -175,10 +173,10 @@ function kvsm:delete(key, opts)
 	local header = {}
 	local s = self.pre .. key
 	if opts.purge then
-		header['KV-Operation'] = 'PURGE'
+		header[kvop] = kvpurge
 		header['Nats-Rollup'] = 'sub'
 	else
-		header['KV-Operation'] = 'DEL'
+		header[kvop] = kvpurge
 	end
 	if opts.revision and opts.revision > 0 then 
 		header['Nats-Expected-Last-Subject-Sequence'] = tonumber(opts.revision)

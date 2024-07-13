@@ -752,7 +752,7 @@ function mm.get(m, subject, data, header, sid)
 		sid or m.sid)
 end
 
-function mm.size(m) -- yuk
+function mm.size(m) -- yuk (This is not what I thought it was?)
 	local client, ss, rs, hs, ds = m.client, #m.subject, #(m.reply or ""), 0, 0
 	local enc_data, enc_header = client and client.encode_data_func, client and client.encode_header_func
 	
