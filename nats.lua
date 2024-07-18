@@ -30,6 +30,7 @@ local insert, concat = table.insert, table.concat
 local str_gmatch = string.gmatch
 local gettime = socket.gettime
 
+-- TODO Add hooking to new clients so jetstream can influence model creation
 
 -- list of valid configuration options, etc.
 local valid_config_toggles = {headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true,verbose=true}
