@@ -10,13 +10,8 @@ local nats = {
 		url = 'nats://127.0.0.1:4222',
 		timeout = 5,
 	},
-	network = {}, -- network functions
-	request = {}, -- request handling (from client to server)
-	response = {}, -- response handing (from server to client)
 	nuid = require('nuid'),
 }
-local network, response, request = nats.network, nats.response, nats.request -- Shortcuts
-local verbose = nats.verbose -- (false or nil for off) levels 1-5
 
 local cjson = require('cjson')
 local socket = require('socket')
@@ -24,11 +19,12 @@ local ssl = require('ssl') -- place with tls_required checks
 local type, pcall, rawset, rawget, setmetatable, getmetatable = type, pcall, rawset, rawget, setmetatable, getmetatable
 local pairs, ipairs = pairs, ipairs
 local floor, tonumber, tostring = math.floor, tonumber, tostring
-local encode, decode = cjson.encode, cjson.decode
 local os_date, os_time = os.date, os.time
 local insert, concat = table.insert, table.concat
 local gmatch, match, sub = string.gmatch, string.match, string.sub
+local encode, decode = cjson.encode, cjson.decode
 local gettime = socket.gettime
+local verbose = nats.verbose -- (false or nil for off) levels 1-5
 
 -- list of valid configuration options, etc.
 local valid_config_toggles = {headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true,verbose=true}
@@ -37,11 +33,9 @@ local valid_config_strings = {user=true,pass=true,auth_token=true,name=true,sig=
 -- common vars and constants
 local crlf = '\r\n'
 local hdrLine = 'NATS/1.0\r\n'
-local max_payload = 1024000
 
 -- common functions
 local passthru_func = function(...) return unpack({...}) end
-nats.passthru_func = passthru_func -- remove?
 nats.timestamp = function() return os_date('!%Y-%m-%dT%H:%M:%SZ', os_time()) end -- RFC 3339
 
 local str_explode = function(s, ss, p)
@@ -52,6 +46,13 @@ local str_explode = function(s, ss, p)
     end
     return t, i-1
 end
+
+function nats.valid_subject(s)
+    if type(s) ~= 'string' or s == '' then return nil end
+    if sub(s, 1, 1) == "." or sub(s, -1) == "." or not match(s, '^[^ >]*[>]?$') then return nil end
+    return s
+end
+local valid_subject = nats.valid_subject
 
 -- MIMEHeader
 -- built in lua native <-> nats header encoding and passthru function
@@ -82,20 +83,27 @@ nats.decode_header = decode_header
 --
 -- nats client/conn object
 nats.client_metatable = {
-	__index = function(self, key) return rawget(self, key) or rawget(getmetatable(self), "methods")[key] or rawget(getmetatable(self), key) end,
+	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
 	__newindex = function(self, key, value) print("__newindex client: " .. key .. " with a value of " .. tostring(value)) end,
 	methods = {},
-	is_client = true,
 	lang = 'LuaJIT',
-	version = '0.0.1',
+	version = '0.0.2',
 }
 local client_metatable = nats.client_metatable
+
+-- nats encoded client/connection support
+nats.encoded_client_metatable = {
+	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or self.client[key] end,
+	__newindex = function(_, key, value) print("__newindex encoded client: " .. key .. " with a value of " .. value) end,
+	methods = {},
+}
+local encoded_client_metatable = nats.encoded_client_metatable
 
 local function create_client(config, n_opts) -- fix default checks
 	local client = setmetatable({
 		connected = false,
 		subscriptions = {},
-		server_information = {},
+		server_information = {max_payload = 1048576}, -- placeholder for first connect before info is sent
 		config = {
 			reconnect = nats.defaults.reconnect and nats.defaults.reconnect or false,
 			max_reconnect = nats.defaults.max_reconnect or 60,
@@ -120,17 +128,11 @@ local function create_client(config, n_opts) -- fix default checks
 			jwt = nats.defaults.jwt,
 			nkey = nats.defaults.nkey,
 		},
-		network = {
-			read   = nats.network.read,
-			write  = nats.network.write,
-			lread  = nil,
-			lwrite = nil,
-			opts = n_opts or {
-				host = nats.defaults.host,
-				port = nats.defaults.port,
-				timeout = nats.defaults.tcp_timeout or -1,
-				tls_required = nats.defaults.tls_required,
-			},
+		network = n_opts or {
+			host = nats.defaults.host,
+			port = nats.defaults.port,
+			timeout = nats.defaults.tcp_timeout or -1,
+			tls_required = nats.defaults.tls_required,
 		},
 		error = nats.error,
 	}, client_metatable)
@@ -141,36 +143,6 @@ local function create_client(config, n_opts) -- fix default checks
 	return client
 end
 
-function nats.is_client(c)
-	if rawget(getmetatable(c), "is_client") then return c end
-end
-local is_client = nats.is_client
-
---
--- nats encoded client/connection support
-nats.encoded_client_metatable = {
-	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or self.client[key] or rawget(getmetatable(self), key) end,
-	__newindex = function(_, key, value) print("__newindex encoded client: " .. key .. " with a value of " .. value) end,
-	methods = {},
-	is_client = true,
-	is_encoded = true,
-}
-local encoded_client_metatable = nats.encoded_client_metatable
-
-function nats.is_encoded(c)
-	if rawget(getmetatable(c), "is_encoded") then return c end
-end
-local is_encoded = nats.is_encoded
-
--- TODO Go through code an clean your inputs!
--- general check for nats client
-function nats.valid_subject(s)
-    if type(s) ~= 'string' or s == '' then return nil end
-    if sub(s, 1, 1) == "." or sub(s, -1) == "." or not match(s, '^[^ >]*[>]?$') then return nil end
-    return s
-end
-local valid_subject = nats.valid_subject
-
 --
 -- nats msg object
 nats.msg_metatable = {
@@ -178,7 +150,6 @@ nats.msg_metatable = {
 	__newindex = function(self, key, value) print("__newindex msg: " .. key .. " with a value of " .. (value or "nil")) end,
 	--__tostring = function(self) return concat({self.subject, ' ', self.reply, ' ', self.sid}) end, -- does not plan for encoding!
 	methods = {},
-	is_msg = true,
 }
 local msg_metatable = nats.msg_metatable
 
@@ -194,29 +165,23 @@ function nats.msg(subject, data, reply, header, client, sid)
 end
 local create_msg = nats.msg
 
-function nats.is_msg(m)
-	if rawget(getmetatable(m), "is_msg") then return m end
-end
-local is_msg = nats.is_msg
-
 --
--- network methods
-function network.write(client, buffer)
-	if #buffer > max_payload then
+-- network methods and sockets
+local function network_write(client, buffer)
+	if #buffer > client.server_information.max_payload then
 		client.error("buffer write error: payload too large at " .. #buffer .. " : max_payload is " .. client.server_information.max_payload)
 	end
 	if verbose then print('->> '..sub(buffer,1,-3)) end
-	local _, err = client.network.socket:send(buffer)
+	local _, err = client.socket:send(buffer)
 	if err then
 		client.connected = false
 		client.error('connection error: ' .. err)
-	else client.network.lwrite = buffer end
+	end
 end
-local network_write = network.write
 
-function network.read(client, len)
+local function network_read(client, len)
 	if len == nil then len = '*l' end
-	local line, err = client.network.socket:receive(len)
+	local line, err = client.socket:receive(len)
 	if err then
 		if err == "timeout" then return
 		elseif err == "closed" then
@@ -224,15 +189,11 @@ function network.read(client, len)
 		end
 		client.error('connection error: ' .. err)
 	else
-		client.network.lread = line
 		if verbose then print('<<- '..line) end
 		return line
 	end
 end
-local network_read = network.read
 
---
--- network socket functions
 local function connect_tcp(socket, parms)
 	local host, port = parms.host, tonumber(parms.port)
 	if parms.timeout then socket:settimeout(parms.timeout, 't') end
@@ -282,7 +243,7 @@ end
 
 --
 -- response handling methods (from server)
-response.methods = {
+local response_methods = {
 	INFO = function(s) return {op=s[1],data=s[2]} end,
 	PING = function(s) return {op=s[1]} end,
 	PONG = function(s) return {op=s[1]} end,
@@ -346,9 +307,8 @@ response.methods = {
 	["+OK"] = function(s) return {op=s[1],data=s[2]} end,
 	["-ERR"] = function(s) return {op=s[1],data=s} end,
 }
-local response_methods = response.methods
 
-function response.read(client)
+local function response_read(client)
 	local payload = network_read(client)
 	if not payload then return end -- nonblocking move on
 
@@ -357,23 +317,18 @@ function response.read(client)
 	if slices[1] and response_methods[slices[1]] then return response_methods[slices[1]](slices, client) end
 	return {op = "-ERR", data = payload}
 end
-local response_read = response.read
 
---
 -- request handling methods (to server)
-function request.write(client, buffer)
+local function request_write(client, buffer)
 	local bufferType = type(buffer)
 	if bufferType == 'string' then network_write(client, buffer)
 	elseif bufferType == 'table' then network_write(client, concat(buffer))
 	else client.error('argument error: ' .. bufferType) end
 end
-local request_write = request.write
 
 -- 
 -- nats module core functions
-function nats.error(message, level)
-	error(message, (level or 1) + 1)
-end
+function nats.error(message, level)	error(message, (level or 1) + 1) end
 
 function nats.client(opts, host, port, timeout)
 	local c_opts = {}
@@ -387,21 +342,12 @@ function nats.client(opts, host, port, timeout)
 		if (valid_config_toggles[k] or valid_config_strings[k]) then c_opts[k] = v end
 	end
 
-	local n_opts = {
+	return create_client(c_opts, {
 				host = host or nats.defaults.host,
 				port = port or nats.defaults.port,
 				timeout = timeout or nats.defaults.tcp_timeout or -1,
 				tls_required = nats.defaults.tls_required,
-			}
-
-	return create_client(c_opts, n_opts)
-end
-
-function nats.verbose(b)
-	if b ~= nil then
-		nats.verbose = b and true or false
-		verbose = nats.verbose -- local var reassign
-	else return verbose end
+			})
 end
 
 function nats.connect(...) -- i hate this thing - please rewrite it!
@@ -417,14 +363,10 @@ function nats.connect(...) -- i hate this thing - please rewrite it!
 end
 
 --
--- nats client methods
-local cm = nats.client_metatable.methods
-local client_info_response = {"verbose","pedantic","jwt","nkey","sig","user","pass","auth_token","tls_required","name","protocol","echo","headers","no_responders"}
-
--- create into options but dedicated to all clients at moment which does not work long term.
+-- inbox handling
 local inbox_prefix = "_INBOX"
 local inbox_nuid = nats.nuid({preLen=22,seqLen=0})() -- calling var! we only do ONCE to make a client static inbox --FUTURE: Option for old and new style
-local inbox_lid_nuid = nats.nuid({preLen=8,seqLen=2}) -- want some change but not too often
+local inbox_lid_nuid = nats.nuid({preLen=8,seqLen=0}) -- letter ids are 8 char rendom with no sequence
 local inbox_table = {}
 local sub_nuid = nats.nuid({preLen=22,seqLen=0})
 
@@ -479,8 +421,8 @@ local function inbox_req_cb(m) -- inbox request callback and handling for wait f
 			return
 		end -- TODO: Remove unanswered inbox entries over time (poll/inbox abs expire timer?)
 
-		rawset(m, "sid", inbox_nuid)
-		rawset(m, "lid", lid)
+		rawset(m, 'sid', inbox_nuid)
+		rawset(m, 'lid', lid)
 		local s, rm = pcall(ibt.callback or passthru_func, m)
 
 		if ibt.count then
@@ -496,11 +438,23 @@ local function inbox_req_cb(m) -- inbox request callback and handling for wait f
 	end
 end
 
-function cm.connect(client)
-	if client.connected and client.network.socket then return true end --review - how do we handle reconnect? do we need to redo all?
+function nats.create_inbox() -- belongs to client and not all. dependent on moving opts to client and not env locals
+	local lid = inbox_lid_nuid()
+	return concat({inbox_prefix, '.', inbox_nuid, '.', lid}), lid
+end
+local create_inbox = nats.create_inbox -- vroom
 
-	client.network.socket = client.network.socket or create_connection(client.network.opts)
-	if not client.network.socket then client.error("Unable to connect socket.") end
+--
+-- nats client methods/interface
+local cm = nats.client_metatable.methods
+local client_info_response = {"verbose","pedantic","jwt","nkey","sig","user","pass","auth_token","tls_required","name","protocol","echo","headers","no_responders"}
+
+function cm.connect(client)
+	client = client.client or client -- ugly encoded connection
+	if client.connected and client.socket then return true end --review - how do we handle reconnect? do we need to redo all?
+
+	rawset(client, 'socket', client.socket or create_connection(client.network))
+	if not client.socket then client.error("Unable to connect socket.") end
 
 	local ct = {
 		lang = nats.client_metatable.lang,
@@ -516,7 +470,7 @@ function cm.connect(client)
 	local msg_t = response_read(client)
 	if msg_t.op == 'INFO' then
 		client.server_information = decode(msg_t.data)
-		max_payload = client.server_information.max_payload -- set nats local max_payload to limit buffersize in network write check
+		--max_payload = client.server_information.max_payload -- set nats local max_payload to limit buffersize in network write check
 	end
 	client.connected = cm.ping(client)
 	client.inbox_subscribe(client)
@@ -557,12 +511,6 @@ function cm.unsubscribe(client, sid)
 	client.subscriptions[sid] = nil
 end
 
-function nats.create_inbox() -- belongs to client and not all. dependent on moving opts to client and not env locals
-	local lid = inbox_lid_nuid()
-	return concat({inbox_prefix, '.', inbox_nuid, '.', lid}), lid
-end
-local create_inbox = nats.create_inbox -- vroom
-
 function cm.inbox_subscribe(client) -- create and maintain a subscription just for inbox requests
 	local subject = inbox_prefix .. '.' .. inbox_nuid .. '.>'
 	local st = {'SUB ', subject, ' '}
@@ -574,11 +522,7 @@ function cm.inbox_subscribe(client) -- create and maintain a subscription just f
 	return inbox_nuid
 end
 
--- // Check for no responder status.
--- if err == nil && len(m.Data) == 0 && m.Header.Get(statusHdr) == noResponders {
-	-- m, err = nil, ErrNoResponders
--- }
--- return m, err
+-- TODO // Check for no responder status.
 function cm.request(client, subject, callback, data, header, sid)
 	local reply, lid = concat({inbox_prefix, '.', sub_nuid()})
 
@@ -629,29 +573,24 @@ end
 
 -- TODO: cm.collect(client, subject, data, header, wait, count) -- blocking
 
+-- NOT WORKING!
 function cm.auth(client, user, pass) -- crap
 	client.config.user = user or client.config.user
 	client.config.pass = pass or client.config.pass
 	return {user=client.config.user,pass=client.config.pass}
 end
 
-function cm.server_info(client) return client.server_information end
+function cm.shutdown(client) client.socket:shutdown() end
 
-function cm.shutdown(client) client.network.socket:shutdown() end
-
+-- TODO Optimize and Clean
 -- consider ripping out the fat... make wait calls less checky 
 -- client tracking form sid may be required if we handle both at same time?
 function cm.wait(client, opts)
-	local nc, ec = client
-	if is_encoded(client) then
-		ec = client
-		nc = client.client
-	end -- check if we are encoded client - go raw
-
+	local nc = client.client or client -- encoded client bs
 	opts = opts or {}
 
 	local sid, lid, maxcount, timeout = opts.sid, opts.lid, opts.maxcount, opts.timeout
-	local count, socket, msg_t, msg = 1, nc.network.socket
+	local count, socket, msg_t, msg = 1, nc.socket
 	local timeout_b, timeout_t, last_timeout_b, last_timeout_t
 	
 	--ugly
@@ -772,7 +711,7 @@ function mm.size(m) -- yuk (This is not what I thought it was?)
 	return ss + rs + hs + ds
 end
 
--- I hate everything about
+--
 -- encoded connection / client
 function cm.encoded_client(client, encode_data_func, decode_data_func, encode_header_func, decode_header_func )
 	return setmetatable({
@@ -860,28 +799,31 @@ function ec.poll(client, subject, callback, data, header, wait, count)
 		ec_encode_header(client, header), wait, count)
 end
 
+return nats
+
 --
 -- client configuration handling - client:option(value)
 -- assign functions to handle bool options
-local function config_set(client, k, v)
-	local opt = valid_config_toggles[k] or valid_config_string[k]
-	if opt then
-		if v ~= nil then client.config[k] = v
-		elseif valid_config_toggles[k] then client.config[k] = not client.config[k] end
-		return client.config[k]
-	end
-	return
-end
--- assign methods for all config toggle options
-for k,_ in pairs(valid_config_toggles) do
-	cm[k] = cm[k] or function(client, b) return config_set(client, k, b) end
-end
--- assign methods for all config string options
-for k,_ in pairs(valid_config_strings) do
-	cm[k] = cm[k] or function(client, s) return config_set(client, k, s) end
-end
+-- function cm.config(client, k, v)
+	-- local opt = valid_config_toggles[k] or valid_config_string[k]
+	-- if opt then
+		-- if v ~= nil then client.config[k] = v
+		-- elseif valid_config_toggles[k] then client.config[k] = not client.config[k] end
+		-- return client.config[k]
+	-- end
+-- end
+-- local function config_get(client, k)
+-- end
 
-return nats
+-- -- assign methods for all config toggle options
+-- for k,_ in pairs(valid_config_toggles) do
+	-- cm[k] = cm[k] or function(client, b) return config_set(client, k, b) end
+-- end
+-- -- assign methods for all config string options
+-- for k,_ in pairs(valid_config_strings) do
+	-- cm[k] = cm[k] or function(client, s) return config_set(client, k, s) end
+-- end
+
 
 -- statusHdr          = "Status"
 -- descrHdr           = "Description"
