@@ -4,17 +4,16 @@ nats.jetstream = {}
 
 -- ### Library requirements ###
 local cjson = require('cjson')
-local nuid = require('nuid')
 
 -- ### Local properties ### speed and neet laziness ftw
-local encode, decode = cjson.encode, cjson.decode
-local encode_header, decode_header = nats.encode_header, nats.decode_header
-local json_error_true = '{\"error\":true}'
 local rawset, rawget = rawset, rawget
 local getmetatable, setmetatable = getmetatable, setmetatable
 local tonumber = tonumber
 local pairs, ipairs, type = pairs, ipairs, type
 local format, gmatch = string.format, string.gmatch
+local encode, decode = cjson.encode, cjson.decode
+local encode_header, decode_header = nats.encode_header, nats.decode_header
+local json_error_true = '{\"error\":true}'
 
 -- copy go vars
 local defaultAPIPrefix = "$JS.API."
@@ -30,13 +29,6 @@ end
 local valid_consumer_name = nats.valid_consumer_name
 nats.valid_stream_name = nats.valid_consumer_name
 local valid_stream_name = nats.valid_stream_name
-
-local merge = function(t1, t2)
-    local r = {}
-    for k, v in pairs(t1) do r[k] = v end
-	for k, v in pairs(t2) do r[k] = v end
-    return r
-end
 
 local stream_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
@@ -115,7 +107,7 @@ function cm.stream(client, scfg, opts, action)
 	local msg = {}
 
 	local nc, ec = client.client or client, client.client -- encoded connections and feels bad
-	if not rawget(nc, "streams") then rawset(nc, "streams", {}) end -- insert stream info into client table
+	if not rawget(nc, "streams") then rawset(nc, "streams", {}) end -- insert stream info into client table -- TODO add hook for stream obj?
 	
 	local stream_api = opts.domain and format(jsDomainT, opts.domain)
 		or opts.pre	or defaultAPIPrefix
@@ -150,6 +142,7 @@ function cm.stream(client, scfg, opts, action)
 	return stream, msg
 end
 
+-- TODO paging support for information and not objects
 function cm.stream_list(client)
 	local msg = client:get("$JS.API.STREAM.LIST")
 	msg.data = decode(msg.data or json_error_true)
@@ -161,7 +154,7 @@ function js.update(stream, scfg, opts) -- update server and update obj
 	return cm.stream(stream.client, scfg or self.name, opts, 'update')
 end
 
-function js.info(stream) -- get info from server and update obj
+function js.info(stream) -- get info from server
 	return cm.stream(stream.client, self.name, 'info')
 end
 
@@ -250,6 +243,7 @@ function js.delmsg(stream, seq, secure)
 	return true, msg
 end
 
+-- TODO Redo consumer to seperate info, update and create? Seems NATS decided to make stream and consumer functions ... not similar
 local consumer_nuid = nats.nuid({preLen=8,seqLen=0})
 function js.consumer(stream, consumer_name, config, action)
 	if action == nil and type(consumer_name) == 'table' then
@@ -260,8 +254,6 @@ function js.consumer(stream, consumer_name, config, action)
 	
 	config = type(config) == 'table' and config or {}
 	config.name = valid_consumer_name(consumer_name) or valid_consumer_name(config.name) or consumer_nuid()
-	print(config.name)
-	print(stream.name)
 	config.durable_name = config.durable_name or config.durable and config.name
 	config.durable = nil
 
@@ -362,11 +354,10 @@ function mm.term(m) return ack_msg(m, "+TERM") end
 function mm.in_progress(m) return ack_msg(m, "+WIP") end
 mm.wip = mm.in_progress
 
-local function str_explode(s, ss, p)
-    if type(ss) ~= "string" or #ss == 0 then return error("Invalid separator.") end
+local str_explode = function(s, ss, p)
     local t, i = {}, 1
-    for sub in gmatch(s, p and ss or "([^" .. ss .. "]+)") do
-        t[i] = sub
+    for st in gmatch(s, p and ss or "([^" .. ss .. "]+)") do
+        t[i] = st
         i = i + 1
     end
     return t, i-1

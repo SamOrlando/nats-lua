@@ -4,6 +4,7 @@ local nats = require('nats-jetstream')
 -- ### Library requirements ###
 local cjson = require('cjson')
 local nuid = require('nuid')
+local gettime = require('socket').gettime
 
 -- ### Local properties ### speed and neet laziness ftw
 local encode,decode = cjson.encode, cjson.decode
@@ -34,30 +35,6 @@ local js = nats.jetstream.stream_metatable.methods -- stream meta methods
 local con = nats.jetstream.consumer_metatable.methods -- consumer meta methods
 local mm = nats.msg_metatable.methods -- msg meta methods
 
--- kve is the implementation of KeyValueEntry
-nats.kve = {
-	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
---	__newindex = function(self, key, value) print("__newindex kvs: " .. key .. " with a value of " .. tostring(value)) end,
-	metatable = {
-		methods = {},
-		}
-}
-local kve_metatable = nats.kve.metatable
-local kvem = nats.kve.metatable.methods -- kve methods table for easy ref
-
-function cm.kve(t)
-	if type(t) ~= "table" then t = {} end
-	return setmetatable({
-		bucket = t.bucket,
-		key = t.key,
-		value = t.value,
-		revision = t.revision,
-		delta = t.delta,
-		create = gettime(),
-		op = t.op
-	}, nats.kve.metatable)
-end
-
 -- kvs is the implementation of KeyValueStore
 nats.kvs = {
 	metatable = {
@@ -69,7 +46,7 @@ nats.kvs = {
 local kvs_metatable = nats.kvs.metatable
 local kvsm = nats.kvs.metatable.methods -- kvs methods table for easy ref(lol)
 
-local kvs_table = {} -- table of all the keyvalue stores by name
+--local kvs_table = {} -- table of all the keyvalue stores by name
 
 function nats.valid_bucket_name(s) return match(s, "^[%w%-_]+$") end
 local valid_bucket_name = nats.valid_bucket_name
@@ -122,7 +99,7 @@ function cm.kvs(client, kvs_cfg, opts) --kvs:(string or obj)
 		stream = stream, -- strem obj
 	}, kvs_metatable)
 	
-	kvs_table[kvs.name] = kvs
+	--kvs_table[kvs.name] = kvs
 
 	return kvs, msg
 end
@@ -131,56 +108,46 @@ end
 local kvsm = nats.kvs.metatable.methods
 function kvsm:get(key, rev)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
-	local s = self.pre .. key
-	return self.stream:getmsg(rev, s)
-	-- get result and create kve
-	-- wtf is this? // Double check here that this is not a DEL Operation marker.
-	-- return kve
+	local m = self.stream:getmsg(rev, self.pre .. key) -- msg
+	if m then
+		local header = m.header and nats.decode_header(m.header) or {}
+		local op = header['KV-Operation']
+		if op and (op == 'PURGE' or op == 'DEL') then m.data = nil end
+		return {
+			bucket = self.name,
+			key = key,
+			value = m.data,
+			created = header['Nats-Time-Stamp'], -- or nats.timestamp(),
+			revision = tonumber(header['Nats-Sequence']), --  or rev,
+			delta = nil,
+			op = op or 'PUT',
+		}
+	end
 end
-    -- local entry = {
-        -- bucket = kv.name,
-        -- key = key,
-        -- value = m.Data,
-        -- revision = m.Sequence,
-        -- created = m.Time,
-    -- }
-    -- -- Double check here that this is not a DEL Operation marker.
-    -- if #m.Header > 0 then
-        -- local kvop_value = m.Header:Get(kvop)
-        -- if kvop_value == kvdel then
-            -- entry.op = KeyValueDelete
-            -- return entry, ErrKeyDeleted
-        -- elseif kvop_value == kvpurge then
-            -- entry.op = KeyValuePurge
-            -- return entry, ErrKeyDeleted
-        -- end
-    -- end
 
 function kvsm:update(key, value, rev)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
-	local s = self.pre .. key
 	local header = rev and nats.encode_header({['Nats-Expected-Last-Subject-Sequence'] = tonumber(rev)})
-	return self.stream.client:get(s, value, header)
+	return self.stream.client:get(self.pre .. key, value, header)
 end
 kvsm.put = kvsm.update
 
 function kvsm:create(key, value) return self:update(key, value, 0) end
 
-function kvsm:delete(key, opts)
+function kvsm:delete(key, opts) -- this is not to delete the kvs, that would be destroy.
 	if not valid_key_name(key) then return nil, 'invalid key name' end
 	opts = type(opts) == 'table' and opts or {}
 	local header = {}
-	local s = self.pre .. key
 	if opts.purge then
 		header[kvop] = kvpurge
 		header['Nats-Rollup'] = 'sub'
 	else
-		header[kvop] = kvpurge
+		header[kvop] = kvdel
 	end
 	if opts.revision and opts.revision > 0 then 
 		header['Nats-Expected-Last-Subject-Sequence'] = tonumber(opts.revision)
 	end
-	return self.stream.client:get(s, nil, nats.encode_header(header))
+	return self.stream.client:get(self.pre .. key, nil, nats.encode_header(header))
 end
 
 function kvsm:purge(key, opts)
@@ -189,12 +156,16 @@ function kvsm:purge(key, opts)
 	return self:delete(key, opts)
 end
 
+function kvsm:destroy()	return self.stream:delete() end -- only way to keep function within object and not overlap delete function.
+
 function kvsm:purge_deletes(opts) end
+
+function kvsm:status()
+end
 
 function kvsm:watch(key, opts) end
 function kvsm:watchall(opts) end
 function kvsm:keys(opts) end
 function kvsm:list_keys(opts) end
 function kvsm:history(key, opts) end
-
 return nats
