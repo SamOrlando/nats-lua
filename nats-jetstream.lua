@@ -1,3 +1,7 @@
+-- TODO JetStream Consumer Idle Heartbeats - https://github.com/nats-io/nats-architecture-and-design/blob/main/adr/ADR-9.md
+-- TODO Prove Batch and Consumer Pull Options - https://github.com/nats-io/nats-architecture-and-design/blob/main/adr/ADR-13.md
+
+
 -- ### NATS-LUA Table
 local nats = require('nats')
 nats.jetstream = {}
@@ -106,7 +110,7 @@ function cm.stream(client, scfg, opts, action)
 	opts = opts or {}
 	local msg = {}
 
-	local nc, ec = client.client or client, client.client -- encoded connections and feels bad
+	local nc = client.client or client -- encoded connections and feels bad
 	if not rawget(nc, "streams") then rawset(nc, "streams", {}) end -- insert stream info into client table -- TODO add hook for stream obj?
 	
 	local stream_api = opts.domain and format(jsDomainT, opts.domain)
@@ -124,7 +128,7 @@ function cm.stream(client, scfg, opts, action)
 			msg = nc:get(stream.api .. 'STREAM.UPDATE.' .. stream.name, encode(scfg))
 			msg.data = decode(msg.data or json_error_true)
 			if msg.data.error then return nil, msg end
-		end
+		elseif action == 'create' then return nil, msg end -- stream existed and we are creating
 	elseif action == nil or action == 'create' then
 		msg = nc:get(stream_api .. 'STREAM.CREATE.' .. scfg.name, encode(scfg))
 		msg.data = decode(msg.data or json_error_true)
@@ -142,8 +146,15 @@ function cm.stream(client, scfg, opts, action)
 	return stream, msg
 end
 
+-- per StreamManager interface request
+function cm.create_stream(client, scfg, opts) return cm.stream(client, scfg, opts, 'create') end
+function cm.update_stream(client, scfg, opts) return cm.stream(client, scfg, opts, 'update') end
+function cm.create_update_stream(client, scfg, opts) return cm.stream(client, scfg, opts) end
+function cm.stream_by_subject() end
+function cm.delete_stream() end
+function cm.stream_names() end
 -- TODO paging support for information and not objects
-function cm.stream_list(client)
+function cm.list_streams(client)
 	local msg = client:get("$JS.API.STREAM.LIST")
 	msg.data = decode(msg.data or json_error_true)
 	if msg.data.error then return false, msg end
@@ -208,30 +219,6 @@ function js.getmsg(stream, seq, subject)
 	return msg
 end
 
--- TODO Make all options possible.
--- // JSApiMsgGetRequest get a message request.
--- type JSApiMsgGetRequest struct {
-	-- Seq     uint64 `json:"seq,omitempty"`
-	-- LastFor string `json:"last_by_subj,omitempty"`
-	-- NextFor string `json:"next_by_subj,omitempty"`
-
-	-- // Batch support. Used to request more then one msg at a time.
-	-- // Can be used with simple starting seq, but also NextFor with wildcards.
-	-- Batch int `json:"batch,omitempty"`
-	-- // This will make sure we limit how much data we blast out. If not set we will
-	-- // inherit the slow consumer default max setting of the server. Default is MAX_PENDING_SIZE.
-	-- MaxBytes int `json:"max_bytes,omitempty"`
-	-- // Return messages as of this start time.
-	-- StartTime *time.Time `json:"start_time,omitempty"`
-
-	-- // Multiple response support. Will get the last msgs matching the subjects. These can include wildcards.
-	-- MultiLastFor []string `json:"multi_last,omitempty"`
-	-- // Only return messages up to this sequence. If not set, will be last sequence for the stream.
-	-- UpToSeq uint64 `json:"up_to_seq,omitempty"`
-	-- // Only return messages up to this time.
-	-- UpToTime *time.Time `json:"up_to_time,omitempty"`
--- }
-
 function js.lastmsg(stream, subject) return js.getmsg(stream, 0, subject) end
 function js.nextmsg(stream, subject) return js.getmsg(stream, nil, subject) end -- does this work?
 
@@ -295,6 +282,11 @@ function js.consumer(stream, consumer_name, config, action)
 	return consumer, msg
 end
 
+function js.create_consumer(stream, consumer_name, config) return js.consumer(stream, consumer_name, config, 'create') end
+function js.update_consumer(stream, consumer_name, config) return js.consumer(stream, consumer_name, config, 'update') end
+function js.create_update_consumer(stream, consumer_name, config) return js.consumer(stream, consumer_name, config) end
+function js.delete_consumer(stream, consumer_name) end
+
 function js.consumer_list(stream)
 	local msg = stream.client:get(stream.api .. 'CONSUMER.LIST.' .. stream.name)
 	msg.data = decode(msg.data or json_error_true)
@@ -345,12 +337,12 @@ local function ack_msg(m, t, d, ack) -- msg, type, delay, wait for ack?
 	if t == "+NXT" or (ack and m.reply) then return m.new():get(m.reply, t) -- unsure what to do here...
 	else return m:respond(t) end
 end
-function mm.is_ackd(m) return m.ackd end
 function mm.ack(m) return ack_msg(m) end
 function mm.ack_next(m) return ack_msg(m, "+NXT") end
 function mm.ack_ack(m, rib) return ack_msg(m, "+ACK", nil, true) end
+mm.double_ack = mm.ack_ack
 function mm.nak(m, d) return ack_msg(m, "-NAK", d) end
-function mm.term(m) return ack_msg(m, "+TERM") end
+function mm.term(m) return ack_msg(m, "+TERM") end -- TODO: Add with Reason The provided reason will be included in JetStream advisory event sent by the server.
 function mm.in_progress(m) return ack_msg(m, "+WIP") end
 mm.wip = mm.in_progress
 
@@ -375,7 +367,7 @@ function mm.metafields(m)
 				delivered = tonumber(s[7]),
 				stream_sequence = tonumber(s[8]),
 				consumer_sequence = tonumber(s[9]),
-				timestamp = tonumber(s[10]),
+				timestamp = s[10],
 				pending = tonumber(s[11]),
 				token = tonumber(s[12]),
 			}
@@ -388,7 +380,7 @@ function mm.metafields(m)
 				delivered = tonumber(s[5]),
 				stream_sequence = tonumber(s[6]),
 				consumer_sequence = tonumber(s[7]),
-				timestamp = tonumber(s[8]),
+				timestamp = s[8],
 				pending = tonumber(s[9]),
 			}
 		end
@@ -398,3 +390,89 @@ end
 -- TODO mm.delete for removing in streams (js.remove)
 
 return nats
+
+-- // Headers used when publishing messages.
+-- const (
+	-- // MsgIdHeader is used to specify a user-defined message ID. It can be used
+	-- // e.g. for deduplication in conjunction with the Duplicates duration on
+	-- // ConsumerConfig or to provide optimistic concurrency safety together with
+	-- // [ExpectedLastMsgIDHeader].
+	-- //
+	-- // This can be set when publishing messages using [WithMsgID] option.
+	-- MsgIDHeader = "Nats-Msg-Id"
+
+	-- // ExpectedStreamHeader contains stream name and is used to assure that the
+	-- // published message is received by expected stream. Server will reject the
+	-- // message if it is not the case.
+	-- //
+	-- // This can be set when publishing messages using [WithExpectStream] option.
+	-- ExpectedStreamHeader = "Nats-Expected-Stream"
+
+	-- // ExpectedLastSeqHeader contains the expected last sequence number of the
+	-- // stream and can be used to apply optimistic concurrency control at stream
+	-- // level. Server will reject the message if it is not the case.
+	-- //
+	-- // This can be set when publishing messages using [WithExpectLastSequence]
+	-- // option. option.
+	-- ExpectedLastSeqHeader = "Nats-Expected-Last-Sequence"
+
+	-- // ExpectedLastSubjSeqHeader contains the expected last sequence number on
+	-- // the subject and can be used to apply optimistic concurrency control at
+	-- // subject level. Server will reject the message if it is not the case.
+	-- //
+	-- // This can be set when publishing messages using
+	-- // [WithExpectLastSequencePerSubject] option.
+	-- ExpectedLastSubjSeqHeader = "Nats-Expected-Last-Subject-Sequence"
+
+	-- // ExpectedLastMsgIDHeader contains the expected last message ID on the
+	-- // subject and can be used to apply optimistic concurrency control at
+	-- // stream level. Server will reject the message if it is not the case.
+	-- //
+	-- // This can be set when publishing messages using [WithExpectLastMsgID]
+	-- // option.
+	-- ExpectedLastMsgIDHeader = "Nats-Expected-Last-Msg-Id"
+
+	-- // MsgRollup is used to apply a purge of all prior messages in the stream
+	-- // ("all") or at the subject ("sub") before this message.
+	-- MsgRollup = "Nats-Rollup"
+-- )
+
+-- // Headers for republished messages and direct gets. Those headers are set by
+-- // the server and should not be set by the client.
+-- const (
+	-- // StreamHeader contains the stream name the message was republished from or
+	-- // the stream name the message was retrieved from using direct get.
+	-- StreamHeader = "Nats-Stream"
+
+	-- // SequenceHeader contains the original sequence number of the message.
+	-- SequenceHeader = "Nats-Sequence"
+
+	-- // TimeStampHeader contains the original timestamp of the message.
+	-- TimeStampHeaer = "Nats-Time-Stamp"
+
+	-- // SubjectHeader contains the original subject the message was published to.
+	-- SubjectHeader = "Nats-Subject"
+
+	-- // LastSequenceHeader contains the last sequence of the message having the
+	-- // same subject, otherwise zero if this is the first message for the
+	-- // subject.
+	-- LastSequenceHeader = "Nats-Last-Sequence"
+-- )
+
+-- // Rollups, can be subject only or all messages.
+-- const (
+	-- // MsgRollupSubject is used to purge all messages before this message on the
+	-- // message subject.
+	-- MsgRollupSubject = "sub"
+
+	-- // MsgRollupAll is used to purge all messages before this message on the
+	-- // stream.
+	-- MsgRollupAll = "all"
+-- )
+
+-- var (
+	-- ackAck      ackType = []byte("+ACK")
+	-- ackNak      ackType = []byte("-NAK")
+	-- ackProgress ackType = []byte("+WPI")
+	-- ackTerm     ackType = []byte("+TERM")
+-- )
