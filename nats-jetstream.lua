@@ -41,17 +41,11 @@ local stream_metatable = {
 }
 nats.jetstream.stream_metatable = stream_metatable
 
-local consumer_metatable = {
-	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
-	__newindex = function(self, key, value) print("__newindex consumer: " .. key .. " with a value of " .. tostring(value)) end,
-	methods = {},
-}
-nats.jetstream.consumer_metatable = consumer_metatable
+
 
 -- quick local references to method tables for each object
 local cm = nats.client_metatable.methods -- client meta methods
 local js = stream_metatable.methods -- stream meta methods
-local con = consumer_metatable.methods -- consumer meta methods
 local mm = nats.msg_metatable.methods -- msg meta methods 
 
 local function stream_create(client, scfg, opts) -- create new and return object with metatable attached.
@@ -117,7 +111,7 @@ function cm.stream(client, scfg, opts, action)
 		or opts.pre	or defaultAPIPrefix
 
 	local stream = stream_get(nc, scfg) -- lets find our stream
-	if not stream or action == 'info' then -- if not, lets query server
+	if not stream then -- if not, lets query server
 		msg = nc:get(stream_api .. 'STREAM.INFO.' .. scfg.name)
 		msg.data = decode(msg.data or json_error_true)
 		stream = not msg.data.error and stream_create(nc, msg.data.config, opts) -- if no stream obj for this, lets make an object
@@ -133,7 +127,7 @@ function cm.stream(client, scfg, opts, action)
 		msg = nc:get(stream_api .. 'STREAM.CREATE.' .. scfg.name, encode(scfg))
 		msg.data = decode(msg.data or json_error_true)
 		if msg.data.error then return nil, msg end
-		stream = stream_create(nc, msg.data.config, opt)
+		stream = stream_create(nc, msg.data.config, opts)
 	else
 		return nil, 'stream not found'
 	end
@@ -230,61 +224,94 @@ function js.delmsg(stream, seq, secure)
 	return true, msg
 end
 
--- TODO Redo consumer to seperate info, update and create? Seems NATS decided to make stream and consumer functions ... not similar
+--
+-- Consumers
+local consumer_metatable = {
+	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
+	__newindex = function(self, key, value) print("__newindex consumer: " .. key .. " with a value of " .. tostring(value)) end,
+	methods = {},
+}
+nats.jetstream.consumer_metatable = consumer_metatable
+local con = consumer_metatable.methods -- consumer meta methods
+
 local consumer_nuid = nats.nuid({preLen=8,seqLen=0})
-function js.consumer(stream, consumer_name, config, action)
-	if action == nil and type(consumer_name) == 'table' then
-		action = config
-		config = consumer_name
-		consumer_name = nil
-	end
+
+local function consumer_update(consumer, data, stream)
+	if type(consumer) ~= 'table' or type(data) ~= 'table' then return end
+	stream = stream or consumer.stream
+	if not stream then return end
 	
-	config = type(config) == 'table' and config or {}
-	config.name = valid_consumer_name(consumer_name) or valid_consumer_name(config.name) or consumer_nuid()
-	config.durable_name = config.durable_name or config.durable and config.name
-	config.durable = nil
-
-	local msg
-	if valid_subject(config.filter_subject) then -- fix me
-		msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. config.name .. '.' .. config.filter_subject, encode({config=config,stream_name=stream.name,action=action}))
-	else
-		msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. (config.name and ('.' .. config.name) or ''), encode({config=config,stream_name=stream.name,action=action}))
-	end
-	msg.data = decode(msg.data or json_error_true)
-	if msg.data.error then return false, msg end
-	local data = msg.data
-
-	-- create and set consumer object
-	local consumer = stream.consumers[data.config.name] or {}
 	setmetatable(consumer, nil)
-	consumer.name = data.config.name
-	consumer.stream = stream
-	consumer.config = data.config
-	consumer.delivered = data.delivered
-	consumer.ack_floor = data.ack_floor
-	consumer.num_ack_pending = data.num_ack_pending
-	consumer.num_redelivered = data.num_redelivered
-	consumer.num_waiting = data.num_waiting
-	consumer.num_pending = data.num_pending
-	consumer.paused = data.paused
-	consumer.pause_remaining = data.pause_remaining
-	consumer.cluster = data.cluster
-	consumer.ts = data.ts
-	consumer.sid = consumer.sid or cm.subscribe(stream.client, "_INBOX." .. stream.name .. "." .. consumer.name, function(m)
-		print("got stream msg")
+	consumer.config = data.config or consumer.config
+	consumer.name = data.config.name or data.name or consumer.name
+	consumer.stream = stream or consumer.stream
+	consumer.delivered = data.delivered or consumer.delivered
+	consumer.ack_floor = data.ack_floor or consumer.ack_floor
+	consumer.num_ack_pending = data.num_ack_pending or consumer.num_ack_pending
+	consumer.num_redelivered = data.num_redelivered or consumer.num_redelivered
+	consumer.num_waiting = data.num_waiting or consumer.num_waiting
+	consumer.num_pending = data.num_pending or consumer.num_pending
+	consumer.paused = data.paused or consumer.paused
+	consumer.pause_remaining = data.pause_remaining or consumer.pause_remaining
+	consumer.cluster = data.cluster or consumer.cluster
+	consumer.ts = data.ts or consumer.ts
+	consumer.sid = consumer.sid or cm.subscribe(stream.client, "_INBOX." .. stream.name .. "." .. data.config.name, function(m)
+		print("got consumer sub msg")
 		return m
 	end)
 	setmetatable(consumer, consumer_metatable)
-	
-	-- insert consumer info into stream table and client
 	stream.consumers[consumer.name] = consumer
+	return consumer
+end
+	
+local function consumer_create(stream, data, opts) return consumer_update({}, data, stream) end
 
+function js.consumer(stream, config, opts, action)
+	if not action then
+		if type(opts) == 'string' then
+			action = opts
+			opts = nil
+		end
+		if type(config) == 'string' then
+			config = {name=config}
+		end
+	end
+	opts = opts or {}
+	local msg = {}
+	
+	config = type(config) == 'table' and config or {}
+	config.name = valid_consumer_name(config.name) or consumer_nuid()
+	config.durable_name = config.durable_name or config.durable and config.name
+	config.durable = nil
+
+	local consumer = stream.consumers[config.name]
+	if not consumer or action == 'info' then
+		msg = stream.client:get(stream.api .. 'CONSUMER.INFO.' .. stream.name .. '.' .. config.name)
+		msg.data = decode(msg.data or json_error_true)
+		if msg.data.error then
+			if action == 'info' or action == 'update' then return nil, 'consumer not found' end
+		else
+			consumer = consumer and consumer_update(consumer, msg.data, stream) or consumer_create(stream, msg.data, opts)
+		end
+	end
+	
+	if consumer and action == 'info' then return consumer
+	else -- create (TODO: Should we combine configs for updates if we have a consumer?
+		if valid_subject(config.filter_subject) then
+			msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. '.' .. config.name .. '.' .. config.filter_subject, encode({config=config,stream_name=stream.name,action=action}))
+		else
+			msg = stream.client:get(stream.api .. 'CONSUMER.CREATE.' .. stream.name .. (config.name and ('.' .. config.name) or ''), encode({config=config,stream_name=stream.name,action=action}))
+		end
+		msg.data = decode(msg.data or json_error_true)
+		if msg.data.error then return nil, msg end
+		consumer = consumer and consumer_update(consumer, msg.data, stream) or consumer_create(stream, msg.data, opts)
+	end
 	return consumer, msg
 end
 
-function js.create_consumer(stream, consumer_name, config) return js.consumer(stream, consumer_name, config, 'create') end
-function js.update_consumer(stream, consumer_name, config) return js.consumer(stream, consumer_name, config, 'update') end
-function js.create_update_consumer(stream, consumer_name, config) return js.consumer(stream, consumer_name, config) end
+function js.create_consumer(stream, consumer_name, config) return js.consumer(stream, config, 'create') end
+function js.update_consumer(stream, consumer_name, config) return js.consumer(stream, config, 'update') end
+function js.create_update_consumer(stream, consumer_name, config) return js.consumer(stream, config) end
 function js.delete_consumer(stream, consumer_name) end
 
 function js.consumer_list(stream)
@@ -313,6 +340,13 @@ function con.info(consumer) -- ?
 	return msg
 end
 
+function con.update(consumer, config)
+	config = type(config) == 'table' and config or {}
+	if config.durable_name or config.durable then
+	else config.durable_name = consumer.config.durable_name end
+	return js.consumer(consumer.stream, consumer.name, config, 'update')
+end
+
 function con.nextmsg(consumer)
 	local msg = consumer.stream.client:get(consumer.stream.api .. 'CONSUMER.MSG.NEXT.' .. consumer.stream.name .. '.' .. consumer.name, nil, nil, consumer.sid)
 	if msg then
@@ -320,13 +354,6 @@ function con.nextmsg(consumer)
 		if msg.data.error then return false, msg end
 		return msg
 	else return end
-end
-
-function con.update(consumer, config)
-	config = type(config) == 'table' and config or {}
-	if config.durable_name or config.durable then
-	else config.durable_name = consumer.config.durable_name end
-	return js.consumer(consumer.stream, consumer.name, config, 'update')
 end
 
 -- modify and make msg objects jetstream enabled
@@ -337,6 +364,7 @@ local function ack_msg(m, t, d, ack) -- msg, type, delay, wait for ack?
 	if t == "+NXT" or (ack and m.reply) then return m.new():get(m.reply, t) -- unsure what to do here...
 	else return m:respond(t) end
 end
+
 function mm.ack(m) return ack_msg(m) end
 function mm.ack_next(m) return ack_msg(m, "+NXT") end
 function mm.ack_ack(m, rib) return ack_msg(m, "+ACK", nil, true) end
@@ -345,6 +373,7 @@ function mm.nak(m, d) return ack_msg(m, "-NAK", d) end
 function mm.term(m) return ack_msg(m, "+TERM") end -- TODO: Add with Reason The provided reason will be included in JetStream advisory event sent by the server.
 function mm.in_progress(m) return ack_msg(m, "+WIP") end
 mm.wip = mm.in_progress
+function mm.next(m) end
 
 local str_explode = function(s, ss, p)
     local t, i = {}, 1
