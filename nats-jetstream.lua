@@ -25,6 +25,9 @@ local jsDomainT = "$JS.%s.API."
 local jsExtDomainT = "$JS.%s.API"
 local jsAPIPrefix = "%s."
 
+-- quick local references and functions
+local cm = nats.client_metatable.methods -- client meta methods
+local mm = nats.msg_metatable.methods -- msg meta methods
 local valid_subject = nats.valid_subject
 function nats.valid_consumer_name(s)
     if type(s) ~= 'string' or s == '' or s:find("[>*. /\\]") then return nil end
@@ -34,36 +37,29 @@ local valid_consumer_name = nats.valid_consumer_name
 nats.valid_stream_name = nats.valid_consumer_name
 local valid_stream_name = nats.valid_stream_name
 
+--
+-- Streams
 local stream_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] or rawget(self, key) end,
 	__newindex = function(self, key, value) print("__newindex stream: " .. key .. " with a value of " .. tostring(value)) end,
 	methods = {},
 }
 nats.jetstream.stream_metatable = stream_metatable
-
-
-
--- quick local references to method tables for each object
-local cm = nats.client_metatable.methods -- client meta methods
 local js = stream_metatable.methods -- stream meta methods
-local mm = nats.msg_metatable.methods -- msg meta methods 
 
-local function stream_create(client, scfg, opts) -- create new and return object with metatable attached.
-	scfg, opts = scfg or {}, opts or {}
-	if not scfg.name then return nil, 'name not defined' end
-	
-	local stream_api = opts.domain and format(jsDomainT, opts.domain)
-		or opts.pre	or defaultAPIPrefix
-
-	local stream = {
-		api = stream_api,
-		name = scfg.name,
-		state = {},
-		cluster = {},
-		client = client,
-		consumers = {}, -- place empty consumer table
-		config = scfg,
-		opts = {
+local function stream_update(stream, data, opts, client)
+	opts = opts or {}
+	setmetatable(stream, nil)
+	stream.api = opts.domain and format(jsDomainT, opts.domain)
+		or opts.pre
+		or defaultAPIPrefix
+	stream.state = data.state or stream.state or {}
+	stream.cluster = data.cluster or stream.cluster or {}
+	stream.client = client or stream.client
+	stream.consumers = stream.consumers or {}
+	stream.config = data.config or stream.config
+	stream.name = data.name or data.config.name or stream.name or stream.config.name
+	stream.opts = {
 			pre = opts.pre and format(jsAPIPrefix, opts.pre),
 			maxpa = opts.maxpa or 4000, -- stupid var whats it for?
 			wait = opts.wait,
@@ -74,19 +70,13 @@ local function stream_create(client, scfg, opts) -- create new and return object
 			direct_get = nil,
 			feature_flags = nil, -- table
 		}
-	}
+	stream.ts = data.ts or stream.ts or timestamp() -- TODO needed?
 	setmetatable(stream, stream_metatable)
-	
-	client.streams[stream.name] = stream
-	
+	rawset(stream.client, stream.name, stream)
 	return stream
 end
 
-local function stream_get(client, scfg) -- checks if there is a local entry of the stream, if so return it.
-	local scfg_type = type(scfg)
-	scfg = scfg_type == 'string' and {name=scfg} or scfg_type == 'table' and scfg
-	if client and scfg then return client.streams[scfg.name] end
-end
+local function stream_create(client, data, opts) return stream_update({}, data, opts, client) end
 
 function cm.stream(client, scfg, opts, action)
 	if not scfg then return nil, 'no stream name provided' end
@@ -96,7 +86,6 @@ function cm.stream(client, scfg, opts, action)
 			opts = nil
 		end
 		if type(scfg) == 'string' then
-			print('yea we did our thing')
 			scfg = {name=scfg}
 			action = 'info'
 		end
@@ -104,39 +93,38 @@ function cm.stream(client, scfg, opts, action)
 	opts = opts or {}
 	local msg = {}
 
-	local nc = client.client or client -- encoded connections and feels bad
-	if not rawget(nc, "streams") then rawset(nc, "streams", {}) end -- insert stream info into client table -- TODO add hook for stream obj?
+	local client = client.client or client -- encoded connections and feels bad
+	if not rawget(client, "streams") then rawset(client, "streams", {}) end -- insert stream info into client table -- TODO add hook for stream obj?
 	
 	local stream_api = opts.domain and format(jsDomainT, opts.domain)
 		or opts.pre	or defaultAPIPrefix
 
-	local stream = stream_get(nc, scfg) -- lets find our stream
-	if not stream then -- if not, lets query server
-		msg = nc:get(stream_api .. 'STREAM.INFO.' .. scfg.name)
+	local stream = client.streams[scfg.name] -- lets find our stream
+	if not stream or action == 'info' then -- if not, lets query server
+		msg = client:get(stream_api .. 'STREAM.INFO.' .. scfg.name)
 		msg.data = decode(msg.data or json_error_true)
-		stream = not msg.data.error and stream_create(nc, msg.data.config, opts) -- if no stream obj for this, lets make an object
+		if msg.data.error then
+			if action == 'info' or action == 'update' then return nil, 'stream not found' end
+		end
+		stream = stream and stream_update(stream, msg.data, opts, client) or stream_create(client, msg.data, opts) -- if no stream obj for this, lets make an object
 	end
 	
 	if stream then
 		if action == nil or action == 'update' then
-			msg = nc:get(stream.api .. 'STREAM.UPDATE.' .. stream.name, encode(scfg))
+			msg = client:get(stream.api .. 'STREAM.UPDATE.' .. stream.name, encode(scfg))
 			msg.data = decode(msg.data or json_error_true)
 			if msg.data.error then return nil, msg end
-		elseif action == 'create' then return nil, msg end -- stream existed and we are creating
+			stream = stream_update(stream, msg.data, opts, client)
+		elseif action == 'info' then return stream, msg
+		elseif action == 'create' then return nil, 'stream existed on create' end -- stream existed and we are creating
 	elseif action == nil or action == 'create' then
-		msg = nc:get(stream_api .. 'STREAM.CREATE.' .. scfg.name, encode(scfg))
+		msg = client:get(stream_api .. 'STREAM.CREATE.' .. scfg.name, encode(scfg))
 		msg.data = decode(msg.data or json_error_true)
 		if msg.data.error then return nil, msg end
-		stream = stream_create(nc, msg.data.config, opts)
+		stream = stream_create(client, msg.data, opts)
 	else
 		return nil, 'stream not found'
 	end
-
-	-- TODO make this a function call as we may be doing it often?
-	rawset(stream, 'state', msg.data.state)
-	rawset(stream, 'cluster', msg.data.cluster)
-	rawset(stream, 'ts', msg.data.ts)
-	
 	return stream, msg
 end
 
@@ -237,10 +225,6 @@ local con = consumer_metatable.methods -- consumer meta methods
 local consumer_nuid = nats.nuid({preLen=8,seqLen=0})
 
 local function consumer_update(consumer, data, stream)
-	if type(consumer) ~= 'table' or type(data) ~= 'table' then return end
-	stream = stream or consumer.stream
-	if not stream then return end
-	
 	setmetatable(consumer, nil)
 	consumer.config = data.config or consumer.config
 	consumer.name = data.config.name or data.name or consumer.name
@@ -267,16 +251,12 @@ end
 local function consumer_create(stream, data, opts) return consumer_update({}, data, stream) end
 
 function js.consumer(stream, config, opts, action)
-	if not action then
-		if type(opts) == 'string' then
-			action = opts
-			opts = nil
-		end
-		if type(config) == 'string' then
-			config = {name=config}
-		end
+	if action == nil and type(opts) == 'string' then
+		action = opts
+		opts = nil
 	end
-	opts = opts or {}
+	config = type(config) == 'string' and {name=config} or config or {}
+	opts = type(opts) == 'table' and opts or {}
 	local msg = {}
 	
 	config = type(config) == 'table' and config or {}
@@ -309,11 +289,11 @@ function js.consumer(stream, config, opts, action)
 	return consumer, msg
 end
 
-function js.create_consumer(stream, consumer_name, config) return js.consumer(stream, config, 'create') end
-function js.update_consumer(stream, consumer_name, config) return js.consumer(stream, config, 'update') end
-function js.create_update_consumer(stream, consumer_name, config) return js.consumer(stream, config) end
+function js.create_consumer(stream, config) return js.consumer(stream, config, 'create') end
+function js.update_consumer(stream, config) return js.consumer(stream, config, 'update') end
+function js.create_update_consumer(stream, config) return js.consumer(stream, config) end
 function js.delete_consumer(stream, consumer_name) end
-
+-- TODO paging support for information and not objects
 function js.consumer_list(stream)
 	local msg = stream.client:get(stream.api .. 'CONSUMER.LIST.' .. stream.name)
 	msg.data = decode(msg.data or json_error_true)
@@ -333,18 +313,12 @@ function con.delete(consumer)
 	return true, msg
 end
 
-function con.info(consumer) -- ?
-	local msg = consumer.stream.client:get(consumer.stream.api .. 'CONSUMER.INFO.' .. consumer.stream.name .. '.' .. consumer.name)
-	msg.data = decode(msg.data or json_error_true)
-	if msg.data.error then return false, msg end
-	return msg
+function con.info(consumer)
+	return js.consumer(consumer.stream, consumer.name, 'info')
 end
 
-function con.update(consumer, config)
-	config = type(config) == 'table' and config or {}
-	if config.durable_name or config.durable then
-	else config.durable_name = consumer.config.durable_name end
-	return js.consumer(consumer.stream, consumer.name, config, 'update')
+function con.update(consumer, config, opts)
+	return js.consumer(consumer.stream, config, opts, 'update')
 end
 
 function con.nextmsg(consumer)
@@ -356,7 +330,8 @@ function con.nextmsg(consumer)
 	else return end
 end
 
--- modify and make msg objects jetstream enabled
+--
+-- Message Support
 local function ack_msg(m, t, d, ack) -- msg, type, delay, wait for ack?
 	if m.ackd then return false, "Message already acknolwedged." end
 	if t and t ~= "+WIP" then rawset(m, "ackd", true) end
@@ -415,8 +390,6 @@ function mm.metafields(m)
 		end
 	else return {} end
 end
-
--- TODO mm.delete for removing in streams (js.remove)
 
 return nats
 
