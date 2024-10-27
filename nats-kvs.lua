@@ -14,6 +14,7 @@ local getmetatable, setmetatable = getmetatable, setmetatable
 local tonumber = tonumber
 local pairs, ipairs, type = pairs, ipairs, type
 local match, format = string.match, string.format
+local insert = table.insert
 
 -- constants defined by nats go team and will continue to use
 local kvBucketNamePre = "KV_"
@@ -92,29 +93,26 @@ function cm.kvs(client, kvs_cfg, opts) --kvs:(string or obj)
 	if not stream then return nil, msg end
 	
 	-- create and set stream object
-	local kvs = setmetatable({
+	return setmetatable({
 		name = kvs_cfg.bucket,
 		pre = format(kvSubjectsPreTmpl, kvs_cfg.bucket),
 		--putPre = nil,
 		stream = stream, -- strem obj
-	}, kvs_metatable)
-	
-	--kvs_table[kvs.name] = kvs
-
-	return kvs, msg
+		watcher = {}, -- watcher table
+	}, kvs_metatable), msg
 end
 
 -- KVS Methods
 local kvsm = nats.kvs.metatable.methods
-function kvsm:get(key, rev)
+function kvsm.get(kvs, key, rev)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
-	local m = self.stream:getmsg(rev, self.pre .. key) -- msg
+	local m = kvs.stream:getmsg(rev, kvs.pre .. key) -- msg
 	if m then
 		local header = m.header and nats.decode_header(m.header) or {}
 		local op = header['KV-Operation']
 		if op and (op == 'PURGE' or op == 'DEL') then m.data = nil end
 		return {
-			bucket = self.name,
+			bucket = kvs.name,
 			key = key,
 			value = m.data,
 			created = header['Nats-Time-Stamp'], -- or nats.timestamp(),
@@ -125,16 +123,16 @@ function kvsm:get(key, rev)
 	end
 end
 
-function kvsm:update(key, value, rev)
+function kvsm.update(kvs, key, value, rev)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
 	local header = rev and nats.encode_header({['Nats-Expected-Last-Subject-Sequence'] = tonumber(rev)})
-	return self.stream.client:get(self.pre .. key, value, header)
+	return kvs.stream.client:get(kvs.pre .. key, value, header)
 end
 kvsm.put = kvsm.update
 
-function kvsm:create(key, value) return self:update(key, value, 0) end
+function kvsm.create(kvs, key, value) return kvsm.update(kvs, key, value, 0) end
 
-function kvsm:delete(key, opts) -- this is not to delete the kvs, that would be destroy.
+function kvsm.delete(kvs, key, opts) -- this is not to delete the kvs, that would be destroy.
 	if not valid_key_name(key) then return nil, 'invalid key name' end
 	opts = type(opts) == 'table' and opts or {}
 	local header = {}
@@ -147,25 +145,32 @@ function kvsm:delete(key, opts) -- this is not to delete the kvs, that would be 
 	if opts.revision and opts.revision > 0 then 
 		header['Nats-Expected-Last-Subject-Sequence'] = tonumber(opts.revision)
 	end
-	return self.stream.client:get(self.pre .. key, nil, nats.encode_header(header))
+	return kvs.stream.client:get(kvs.pre .. key, nil, nats.encode_header(header))
 end
 
-function kvsm:purge(key, opts)
+function kvsm.purge(kvs, key, opts)
 	opts = type(opts) == 'table' and opts or {}
 	opts.purge = true
-	return self:delete(key, opts)
+	return kvsm.delete(kvs, key, opts)
 end
 
-function kvsm:destroy()	return self.stream:delete() end -- only way to keep function within object and not overlap delete function.
+function kvsm.destroy(kvs) return kvs.stream:delete() end -- only way to keep function within object and not overlap delete function.
 
-function kvsm:purge_deletes(opts) end
+function kvsm.purge_deletes(kvs, opts) end
+function kvsm.status(kvs) end
 
-function kvsm:status()
+function kvsm.watch(kvs, key, func, opts) -- TODO provide more inclusive wrapper handling opts
+	if not valid_key_name(key) or type(func) ~= 'function' then return end
+	--opts = type(opts) == 'table' and opts or {}
+	return cm.subscribe(kvs.stream.client, kvs.pre .. key, func)
 end
 
-function kvsm:watch(key, opts) end
-function kvsm:watchall(opts) end
-function kvsm:keys(opts) end
-function kvsm:list_keys(opts) end
-function kvsm:history(key, opts) end
+function kvsm.watch_all(kvs, func, opts) -- TODO provide more inclusive wrapper handling opts
+	if type(func) ~= 'function' then return end
+	return cm.subscribe(kvs.stream.client, kvs.pre .. '*', func) -- TODO > or *?
+end
+
+function kvsm.keys(kvs, opts) end
+function kvsm.list_keys(kvs, opts) end
+function kvsm.history(kvs, key, opts) end
 return nats

@@ -24,7 +24,6 @@ local insert, concat = table.insert, table.concat
 local gmatch, match, sub = string.gmatch, string.match, string.sub
 local encode, decode = cjson.encode, cjson.decode
 local gettime = socket.gettime
-local verbose = nats.verbose -- (false or nil for off) levels 1-5
 
 -- list of valid configuration options, etc.
 local valid_config_toggles = {headers=true,pedantic=true,tls_required=true,echo=true,no_responders=true,verbose=true}
@@ -36,7 +35,7 @@ local hdrLine = 'NATS/1.0\r\n'
 
 -- common functions
 local passthru_func = function(...) return unpack({...}) end
-nats.timestamp = function() return os_date('!%Y-%m-%dT%H:%M:%SZ', os_time()) end -- RFC 3339
+nats.timestamp = function(t) return os_date('!%Y-%m-%dT%H:%M:%SZ', t or os_time()) end -- RFC 3339
 
 local str_explode = function(s, ss, p)
     local t, i = {}, 1
@@ -171,7 +170,7 @@ local function network_write(client, buffer)
 	if #buffer > client.server_information.max_payload then
 		client.error("buffer write error: payload too large at " .. #buffer .. " : max_payload is " .. client.server_information.max_payload)
 	end
-	if verbose then print('->> '..sub(buffer,1,-3)) end
+	if nats.verbose then print('->> '..sub(buffer,1,-3)) end
 	local _, err = client.socket:send(buffer)
 	if err then
 		client.connected = false
@@ -189,7 +188,7 @@ local function network_read(client, len)
 		end
 		client.error('connection error: ' .. err)
 	else
-		if verbose then print('<<- '..line) end
+		if nats.verbose then print('<<- '..line) end
 		return line
 	end
 end
@@ -512,7 +511,7 @@ function cm.unsubscribe(client, sid)
 end
 
 function cm.inbox_subscribe(client) -- create and maintain a subscription just for inbox requests
-	local subject = inbox_prefix .. '.' .. inbox_nuid .. '.>'
+	local subject = concat{inbox_prefix,'.',inbox_nuid,'.>'}
 	local st = {'SUB ', subject, ' '}
 	insert(st, inbox_nuid)
 	insert(st, crlf)
@@ -545,6 +544,8 @@ function cm.request(client, subject, callback, data, header, sid)
 	rawset(msg, "sid", sid or inbox_nuid)
 	if not sid then rawset(msg, "lid", lid) end
 	
+	-- No Responders Check
+	if (not msg.data or #msg.data == 0) and msg.header and decode_header(msg.header).Status == "503" then return nil, 'no responders' end
 	return msg
 end
 
@@ -671,6 +672,10 @@ function mm.new(m, subject, data, reply, header, sid)
 	return create_msg(subject, data, reply, header, m.client, sid)
 end
 
+function mm.clone(m, subject, data, reply, header, sid)
+	return create_msg(subject or m.subject, m.data or data, m.reply or reply, m.header or header, m.client, sid or m.sid)
+end
+
 function mm.respond(m, data, reply, header)
 	if m.reply then return m.client:publish(m.reply, data, reply, header) end
 end
@@ -702,7 +707,7 @@ end
 
 function mm.size(m) -- yuk (This is not what I thought it was?)
 	local client, ss, rs, hs, ds = m.client, #m.subject, #(m.reply or ""), 0, 0
-	local enc_data, enc_header = client and client.encode_data_func, client and client.encode_header_func
+	local enc_data, enc_header = client.encode_data_func, client.encode_header_func
 	
 	if enc_data then ds = #(enc_data(client, m.data) or "")
 	else ds = #tostring(m.data or "") end
