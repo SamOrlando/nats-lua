@@ -1,9 +1,9 @@
 rockspec_format = "3.0"
 package = "nats-lua"
-version = "0.3.0-1"
+version = "0.3.1-1"
 source = {
    url = "git+https://git.nodex.net:9002/odi/nats-lua.git",
-   tag = "v0.3.0",
+   tag = "v0.3.1",
 }
 description = {
    summary = "NATS client for Lua with headers, request/reply, reconnect, JetStream, KV, Object Store, services and nkeys",

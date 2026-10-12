@@ -337,6 +337,30 @@ The unit tests (`tests/test_nats.lua`) drive the protocol through a fake
 socket (`tests/fakesock.lua`). The integration tests only use subjects under
 `nats-lua.test.<random>.>` and delete the streams and buckets they create.
 
+## Changes in 0.3.1
+
+- `stream:nextmsg(subject [, seq])` returns the first message on `subject` with
+  sequence `>= seq` (default 1), ADR-31 `next_by_subj`; `nextmsg(seq, subject)` is
+  accepted too. Before it returned the last message (like `lastmsg`).
+- `client:new_inbox()` honours the `inbox_prefix` option; JetStream pull,
+  consume, ordered and push consumer inboxes use it (request/mux, KV, object
+  store and micro replies already did).
+- nkeys xkeys: `create_pair('curve')` makes x25519 keys (`X...` / `SX...`) with
+  `seal`/`open` in the Go nkeys `xkv1` format (x25519 + XSalsa20-Poly1305, pure
+  Lua), Go interop tested (`tests/interop/xkeys_interop.sh`). New primitives
+  `nkeys.x25519`, `box_seal`, `box_open`, `poly1305`, ...
+- `consumer:stop()` / `consumer:drain()` implemented (stop/drain every
+  consume, messages and push context of the consumer); real `ctx:drain`,
+  `iter:drain`, `ordered:stop/drain`, `ordered_ctx:drain`, `push_sub:drain`.
+- KV get, object store info and `counter_get` work on streams without
+  `allow_direct` (new `stream:get_stored`).
+- `tests/run.sh` exits non-zero when any suite fails.
+
+Breaking: `nextmsg` semantics (see above); `new_inbox()` subjects change when a
+custom `inbox_prefix` is set; `create_pair('curve')` keys are x25519 (old
+ed25519-with-X-prefix seeds give different public keys); `iter:drain()` is no
+longer an alias of `stop()`.
+
 ## Changes in 0.3.0
 
 New modules `nats-nkeys` and `nats-micro`. Breaking changes:
