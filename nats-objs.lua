@@ -1,5 +1,12 @@
-
--- Adding OBJ JS functionality
+-- nats-objs.lua - JetStream Object Store (ADR-20) - NOT IMPLEMENTED YET
+--
+-- Copyright (c) 2023-2026 Sam Orlando
+-- SPDX-License-Identifier: MIT (see LICENSE)
+--
+-- Placeholder: loading this module is safe but provides no functionality yet.
+-- The Go API it is meant to mirror is kept below as a reference.
+local nats = require('nats-jetstream')
+nats.jetstream.objs = nats.jetstream.objs or { implemented = false }
 local objs = nats.jetstream.objs
 	-- // Put will place the contents from the reader into a new object.
 	-- Put(obj *ObjectMeta, reader io.Reader, opts ...ObjectOpt) (*ObjectInfo, error)
@@ -50,3 +57,5 @@ local objs = nats.jetstream.objs
 -- func encodeName(name string) string {
 	-- return base64.URLEncoding.EncodeToString([]byte(name))
 -- }
+
+return objs
