@@ -10,6 +10,7 @@ if os.getenv("NATS_NO_CJSON") then -- exercise the pure Lua JSON fallback
     package.preload.cjson = function() error("cjson disabled for test") end
 end
 local nats = require("nats-kvs") -- loads nats + nats-jetstream too
+require("nats-objs")
 local nuid = require("nuid")
 local socket = require("socket")
 
@@ -297,6 +298,144 @@ test("KV: create bucket, put/get/update/delete/purge, destroy", function()
     nc:unsubscribe(wsid)
     assert(kv:destroy())
     table.remove(cleanup)
+end)
+
+-- Object store ---------------------------------------------------------------
+local OBUCKET, OBUCKET2 = BUCKET .. "-obj", BUCKET .. "-obj2"
+local obs, obs2
+local function blob(n)
+    local t = {}
+    for i = 1, n do t[i] = string.char((i * 7 + math.floor(i / 251)) % 256) end
+    return table.concat(t)
+end
+
+test("OBJ: create bucket (ADR-20 stream config)", function()
+    if not js_ok then error("SKIP " .. js_why, 0) end
+    local err
+    obs, err = nc:create_object_store({ bucket = OBUCKET, description = "nats-lua test", storage = "memory",
+        metadata = { owner = "nats-lua" } })
+    assert(obs, type(err) == "table" and nats.json.encode(err.data) or tostring(err))
+    cleanup[#cleanup + 1] = function() nc:delete_object_store(OBUCKET) end
+    local c = obs.stream.config
+    eq(c.name, "OBJ_" .. OBUCKET); eq(c.allow_rollup_hdrs, true); eq(c.allow_direct, true); eq(c.discard, "new")
+    obs2 = assert(nc:create_object_store({ bucket = OBUCKET2, storage = "memory" }))
+    cleanup[#cleanup + 1] = function() nc:delete_object_store(OBUCKET2) end
+    assert(nc:object_store(OBUCKET), "bind to existing bucket")
+end)
+
+test("OBJ: put/get small, empty, multi-chunk, streaming", function()
+    if not obs then error("SKIP no object store", 0) end
+    local info = assert(obs:put("hello.txt", "hello world"))
+    eq(info.size, 11); eq(info.chunks, 1)
+    eq(info.digest, nats.objs.digest_value(nats.objs.sha256.digest("hello world")))
+    local data, gi = obs:get("hello.txt")
+    eq(data, "hello world"); eq(gi.nuid, info.nuid); assert(gi.mtime)
+    local e = assert(obs:put("empty", ""))
+    eq(e.chunks, 0); eq(e.size, 0)
+    eq(obs:get("empty"), "")
+    local big = blob(300 * 1024 + 17)
+    local bi = assert(obs:put({ name = "dir/big.bin", description = "big", headers = { ["X-A"] = { "1" } } },
+        big, { chunk_size = 64 * 1024 }))
+    eq(bi.chunks, 5); eq(bi.size, #big)
+    eq(obs:get("dir/big.bin"), big)
+    local parts = {}
+    assert(obs:get("dir/big.bin", { callback = function(c) parts[#parts + 1] = c end, batch = 2 }))
+    eq(#parts, 5); eq(table.concat(parts), big)
+    local i2 = assert(obs:get_info("dir/big.bin"))
+    eq(i2.description, "big"); eq(i2.headers["X-A"][1], "1"); eq(i2.options.max_chunk_size, 64 * 1024)
+    -- reader function input
+    local n = 0
+    local ri = assert(obs:put("reader", function() n = n + 1 if n <= 3 then return string.rep("r", 1000) end end,
+        { chunk_size = 1024 }))
+    eq(ri.size, 3000); eq(ri.chunks, 3)
+end)
+
+test("OBJ: overwrite purges old chunks", function()
+    if not obs then error("SKIP no object store", 0) end
+    local before = obs:status().stream.state.messages
+    local a = assert(obs:put("ow", string.rep("a", 5000), { chunk_size = 1000 }))
+    local mid = obs:status().stream.state.messages
+    eq(mid, before + 6)
+    local b = assert(obs:put("ow", "b"))
+    assert(a.nuid ~= b.nuid)
+    eq(obs:status().stream.state.messages, before + 2, "5 old chunks purged, meta rolled up")
+    eq(obs:get("ow"), "b")
+end)
+
+test("OBJ: put_file / get_file", function()
+    if not obs then error("SKIP no object store", 0) end
+    local src, dst = os.tmpname(), os.tmpname()
+    local f = io.open(src, "wb"); f:write(blob(70000)); f:close()
+    local info = assert(obs:put_file(src, "file.bin", { chunk_size = 32768 }))
+    eq(info.chunks, 3)
+    assert(obs:get_file("file.bin", dst))
+    local a, b = io.open(src, "rb"), io.open(dst, "rb")
+    eq(b:read("*a"), a:read("*a")); a:close(); b:close()
+    os.remove(src); os.remove(dst)
+end)
+
+test("OBJ: update_meta rename, delete, show_deleted, list", function()
+    if not obs then error("SKIP no object store", 0) end
+    assert(obs:put("tmp", "data"))
+    assert(obs:update_meta("tmp", { name = "renamed", description = "new desc" }))
+    local _, e1 = obs:get_info("tmp"); eq(e1, "object not found")
+    eq(obs:get_info("renamed").description, "new desc")
+    eq(obs:get("renamed"), "data")
+    local r, e2 = obs:update_meta("renamed", { name = "hello.txt" }); eq(r, nil); assert(e2)
+    assert(obs:delete("renamed"))
+    local _, e3 = obs:get("renamed"); eq(e3, "object not found")
+    local d = assert(obs:get_info("renamed", true)); eq(d.deleted, true); eq(d.size, 0)
+    local _, e4 = obs:update_meta("renamed", { description = "x" }); assert(e4)
+    local list = assert(obs:list())
+    local names = {}
+    for _, i in ipairs(list) do names[i.name] = true end
+    assert(names["hello.txt"] and names["dir/big.bin"] and names["empty"] and not names["renamed"], "list")
+    local all = assert(obs:list({ show_deleted = true }))
+    eq(#all, #list + 1)
+    local _, e5 = obs:delete("never-existed"); assert(e5)
+end)
+
+test("OBJ: links to objects and buckets", function()
+    if not obs then error("SKIP no object store", 0) end
+    local target = assert(obs:get_info("hello.txt"))
+    assert(obs2:add_link("link-to-hello", target))
+    eq(obs2:get("link-to-hello"), "hello world")
+    assert(obs2:add_bucket_link("bucket-link", obs))
+    local bl = assert(obs2:get_info("bucket-link")); eq(bl.options.link.bucket, OBUCKET)
+    local _, e1 = obs2:get("bucket-link"); assert(e1, "cannot get bucket link")
+    local li = assert(obs2:get_info("link-to-hello"))
+    local _, e2 = obs:add_link("x", li); assert(e2, "link to link refused")
+    local _, e3 = obs:add_link("hello.txt", target); assert(e3, "cannot overwrite regular object")
+end)
+
+test("OBJ: watch (initial values, nil marker, updates)", function()
+    if not obs then error("SKIP no object store", 0) end
+    local seen, marker = {}, false
+    assert(obs:watch(function(info)
+        if info == nil then marker = true return false end
+        seen[#seen + 1] = info.name
+    end, { timeout = 5 }))
+    eq(marker, true)
+    assert(#seen >= 5, "initial values " .. #seen)
+    local up = {}
+    obs2:put("watched", "1")
+    assert(obs2:watch(function(info)
+        if info then up[#up + 1] = info.name end
+    end, { timeout = 1.5 }))
+    local found = false
+    for _, n in ipairs(up) do if n == "watched" then found = true end end
+    assert(found, "watch saw existing object")
+end)
+
+test("OBJ: status, seal", function()
+    if not obs then error("SKIP no object store", 0) end
+    local st = assert(obs:status())
+    eq(st.bucket, OBUCKET); eq(st.sealed, false); eq(st.backing_store, "JetStream"); eq(st.description, "nats-lua test")
+    eq(st.metadata.owner, "nats-lua")
+    local s2 = assert(obs2:seal())
+    eq(s2.sealed, true)
+    local r = obs2:put("after-seal", "x")
+    eq(r, nil, "sealed bucket refuses writes")
 end)
 
 -- cleanup -------------------------------------------------------------------

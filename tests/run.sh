@@ -8,6 +8,7 @@ rc=0
 for lua in lua5.1 lua5.2 lua5.3 lua5.4 luajit; do
     command -v "$lua" >/dev/null 2>&1 || continue
     "$lua" tests/test_nats.lua || rc=1
+    "$lua" tests/test_objs.lua || rc=1
     if [ -n "$NATS_URL" ]; then "$lua" tests/test_integration.lua | tail -1 || rc=1; fi
 done
 exit $rc
