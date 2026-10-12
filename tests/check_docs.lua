@@ -105,6 +105,7 @@ need("nats-micro.md", "req", ":", static("nats-micro.lua", "Request"))
 local nk = require("nats-nkeys")
 need("nats-nkeys.md", "nkeys", ".", all(nk))
 need("nats-nkeys.md", "kp", ":", static("nats-nkeys.lua", "KP"))
+need("nats-nkeys.md", "xkp", ":", static("nats-nkeys.lua", "CKP"))
 
 local sha = require("nats-sha256")
 need("nats-sha256.md", "sha256", ".", all(sha))

@@ -187,10 +187,40 @@ payload). Errors: `nil, 'message not found', status_msg`, `nil, err`.
 local m = assert(st:getmsg('orders.new')); print(m:headers()['Nats-Sequence'])
 ```
 
-### stream:lastmsg(subject) / stream:nextmsg(subject)
+### stream:lastmsg(subject)
 
-`getmsg(0, subject)` / `getmsg(nil, subject)`. Note: both currently return the
-**last** message on `subject` (see API notes in the index).
+Last message stored on `subject` (wildcards allowed): ADR-31 `last_by_subj`, same
+as `getmsg(subject)`. Returns like `getmsg`.
+
+### stream:nextmsg(subject, seq)
+
+First message on `subject` (wildcards allowed) with sequence `>= seq` (default
+`1`): ADR-31 `{seq, next_by_subj}`. `nextmsg(seq, subject)` is accepted too;
+`nextmsg(nil, seq)` gets by sequence only. Iterate with
+`nextmsg(subject, last_seq + 1)`. Returns like `getmsg` (`nil, 'message not
+found'` past the end on direct streams). Changed in 0.3.1 (was an alias of
+`lastmsg`).
+
+```lua
+local seq = 1
+while true do
+  local m = st:nextmsg('orders.*', seq); if not m then break end
+  seq = tonumber(m:headers()['Nats-Sequence']) + 1
+end
+```
+
+### stream:get_stored(seq, subject)
+
+Same forms as `getmsg`, but a `STREAM.MSG.GET` reply (stream without
+`allow_direct`) is converted to the direct get shape: `msg.data` is the decoded
+payload and `msg:headers()` holds the stored headers plus `Nats-Stream`,
+`Nats-Subject`, `Nats-Sequence`, `Nats-Time-Stamp` (`msg.stored` is the raw API
+`message`). Used by KV, object store and counters. Errors: `nil, 'message not
+found'`, `nil, api_error_description, api_msg`, `nil, err`.
+
+### nats.jetstream.b64_decode(s)
+
+Standard (padded) base64 decoder used for `STREAM.MSG.GET` payloads. Returns: string.
 
 ### stream:deletemsg(seq, secure)
 
@@ -414,10 +444,25 @@ it:stop()
 
 `stream:pause_consumer` / `resume_consumer` / `unpin_consumer` for this consumer.
 
-### consumer:stop() / consumer:drain()
+### consumer:stop()
 
-Placeholders kept for API symmetry. Always return `nil, 'use the context
-returned by consume():stop()'` (or `drain()`).
+Stops every `consume()` / `messages()` context and every (non ordered) push
+subscription running on this consumer object, and releases its fetch inbox (a
+later `fetch()`/`next()` re-subscribes). The server side consumer is kept (use
+`consumer:delete()`); push subscriptions still delete ephemeral consumers as in
+`push_sub:stop()`. Returns: number of contexts stopped.
+
+### consumer:drain(timeout, idle)
+
+Like `stop()` but drains each context first (`ctx:drain`, `push_sub:drain`)
+within an overall `timeout` (default 5 s), then drains the fetch inbox.
+Returns: `ok, count` (`ok` is `false` when a drain hit the timeout).
+
+```lua
+local ctx = con:consume(handler)
+-- ... later, graceful shutdown
+local ok, n = con:drain(10)
+```
 
 ## Object: consume context (`ctx`)
 
@@ -430,10 +475,13 @@ Fields: `consumer`, `client`, `running`, `delivered`, `pulls`, `missed`,
 Stops pulling, unsubscribes, removes the ticker and reconnect hook. Messages of
 outstanding pull requests are dropped (they are redelivered after `ack_wait`).
 
-### ctx:drain(timeout)
+### ctx:drain(timeout, idle)
 
-Stops issuing pulls, delivers what is in flight for up to `timeout` seconds
-(default 5), then `stop()`.
+Stops issuing pulls and keeps delivering messages of the outstanding pull
+requests (the callback still runs, acks work) until they are satisfied, nothing
+arrived for `idle` seconds (default 0.5) or `timeout` (default 5) passed; then
+UNSUB + flush (messages already in flight are still delivered) and `stop()`.
+Returns: `true` when it finished before the timeout.
 
 ### ctx:closed()
 
@@ -451,9 +499,15 @@ Returned by `consumer:messages()` and `ordered:messages()`.
 Pumps until a message is queued. Returns: `msg`, or `nil, 'timeout'` (after
 `timeout` seconds, default 30) / `nil, 'stopped'`.
 
-### iter:stop() / iter:drain()
+### iter:stop()
 
-Stops the underlying context (`drain` is an alias of `stop`).
+Stops the underlying context; queued messages are still returned by `next()`,
+then `nil, 'stopped'`.
+
+### iter:drain(timeout, idle)
+
+`ctx:drain` on the underlying context: in-flight messages are queued and remain
+readable with `next()`, then `nil, 'stopped'`. Returns like `ctx:drain`.
 
 ## Object: ordered consumer
 
@@ -490,9 +544,19 @@ Deletes the current consumer and creates a new one from the next sequence.
 Returns: `consumer` or `nil, err` (`'ordered consumer: too many resets'`).
 Calls `cfg.reset_cb(ordered, reason)`.
 
-### ordered:delete_current() / ordered:stop()
+### ordered:delete_current()
 
 Forget and delete (best effort, no wait) the current server consumer.
+
+### ordered:stop()
+
+Stops a running `consume()` / `messages()` context of this ordered consumer and
+deletes the current server consumer.
+
+### ordered:drain(timeout, idle)
+
+Drains a running `consume()` / `messages()` context (see `ctx:drain`), then
+deletes the current consumer. Returns: `true` when finished in time.
 
 ### ordered:info()
 
@@ -510,6 +574,11 @@ it (`delivered`, `pulls`, ...); `ordered`, `client`, `last_error` are its own.
 Stops consuming and deletes the current consumer. Call as `octx.stop()` or
 `octx:stop()` (it ignores its argument).
 
+#### ordered_ctx:drain(timeout, idle)
+
+Drains the active `ctx` (no resets afterwards) and deletes the consumer. Returns
+like `ctx:drain`. Call as `octx:drain(t)`.
+
 #### ordered_ctx:closed()
 
 Returns: `true` once stopped (also after a failed reset).
@@ -523,6 +592,16 @@ Returned by `stream:subscribe()`. Fields: `consumer`, `deliver`, `sid`, `hb`,
 
 Unsubscribe, remove the heartbeat ticker and delete the consumer (ephemeral
 consumers, unless `opts.keep`; ordered consumers always).
+
+### push_sub:drain(timeout)
+
+UNSUB the deliver subject, deliver what is already in flight (PING/PONG round
+trip, `timeout` default 5 s), then release the consumer like `stop()`. Returns:
+`true` when completed in time.
+
+### push_sub:closed()
+
+Returns: `true` once stopped or drained.
 
 ### push_sub:reset(reason)
 

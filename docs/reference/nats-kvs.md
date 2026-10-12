@@ -3,7 +3,7 @@
 
 `local nats = require('nats-kvs')` (loads `nats-jetstream`; returns `nats`).
 Buckets are streams `KV_<bucket>` on `$KV.<bucket>.>` (ADR-8). Reads use direct
-get (`allow_direct`); watchers, `keys`, `history` and `purge_deletes` use
+get (`allow_direct`, falling back to `STREAM.MSG.GET` on buckets without it); watchers, `keys`, `history` and `purge_deletes` use
 ordered consumers (ADR-17) driven by the pump loop — see
 [the pump model](nats.md#the-pump-model-threading).
 
@@ -85,8 +85,8 @@ Fields: `name`/`bucket`, `stream`, `client`, `pre` (read subject prefix
 ### kv:get(key, revision)
 
 Returns: entry; `nil, 'key not found'`; `nil, 'key not found', entry` for a
-deleted/purged key (op DEL/PURGE); `nil, 'invalid key name'`;
-`nil, 'bucket without allow_direct is not supported'`; `nil, err`.
+deleted/purged key (op DEL/PURGE); `nil, 'invalid key name'`; `nil, err`.
+Buckets without `allow_direct` are read with `STREAM.MSG.GET` (0.3.1).
 
 ```lua
 local e = kv:get('app.level'); if e then print(e.value, e.revision) end

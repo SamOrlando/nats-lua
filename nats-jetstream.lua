@@ -198,7 +198,7 @@ function cm.stream_by_subject(client, subject)
 	if not names then return nil, err end
 	return names[1]
 end
--- TODO paging support for information and not objects
+-- all pages are collected (offset/total)
 function cm.list_streams(client, subject, opts)
 	local l, err = paged(client, api_prefix(opts) .. "STREAM.LIST", 'streams', subject and { subject = subject } or nil)
 	if not l then return false, err end
@@ -269,8 +269,64 @@ function js.getmsg(stream, seq, subject)
 	return msg
 end
 
+-- standard base64 (RFC 4648 §4, padded) decoder for STREAM.MSG.GET payloads
+local B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+local B64R = {}
+for i = 1, 64 do B64R[B64:byte(i)] = i - 1 end
+local function b64_decode(s)
+	if type(s) ~= 'string' then return '' end
+	s = s:gsub('[^%w%+/]', '')
+	local out, n = {}, 0
+	for i = 1, #s, 4 do
+		local a, b, c, d = B64R[s:byte(i)], B64R[s:byte(i + 1) or 0], B64R[s:byte(i + 2) or 0], B64R[s:byte(i + 3) or 0]
+		if not a or not b then break end
+		local v = a * 262144 + b * 4096 + (c or 0) * 64 + (d or 0)
+		n = n + 1
+		out[n] = string.char(floor(v / 65536))
+		if c then n = n + 1 out[n] = string.char(floor(v / 256) % 256) end
+		if d then n = n + 1 out[n] = string.char(v % 256) end
+	end
+	return table.concat(out)
+end
+nats.jetstream.b64_decode = b64_decode
+
+-- get_stored(seq [, subject]) / get_stored(subject): like getmsg() but a STREAM.MSG.GET reply
+-- (stream without allow_direct) is converted to the direct get shape: msg.data is the payload
+-- and msg:headers() carries the stored headers plus Nats-Stream, Nats-Subject, Nats-Sequence
+-- and Nats-Time-Stamp. Errors: 'message not found' or the API error description.
+function js.get_stored(stream, seq, subject)
+	local m, err = js.getmsg(stream, seq, subject)
+	if not m then
+		if type(err) == 'table' then
+			local e = type(err.data) == 'table' and err.data.error or {}
+			if tonumber(e.code) == 404 then return nil, 'message not found', err end
+			return nil, e.description or 'stream msg get error', err
+		end
+		return nil, err
+	end
+	if type(m.data) ~= 'table' then return m end
+	local sm = m.data.message
+	if type(sm) ~= 'table' then return nil, 'invalid stream msg get response', m end
+	local h = (sm.hdrs and sm.hdrs ~= '' and nats.decode_header(b64_decode(sm.hdrs))) or {}
+	h['Nats-Stream'] = stream.name
+	h['Nats-Subject'] = sm.subject
+	h['Nats-Sequence'] = tostring(sm.seq)
+	h['Nats-Time-Stamp'] = sm.time
+	local out = nats.msg(sm.subject, b64_decode(sm.data), nil, h, m.client, m.sid)
+	rawset(out, 'stored', sm)
+	return out
+end
+
 function js.lastmsg(stream, subject) return js.getmsg(stream, 0, subject) end
-function js.nextmsg(stream, subject) return js.getmsg(stream, nil, subject) end
+-- nextmsg(subject [, seq]): first message with sequence >= seq (default 1) matching subject
+-- (ADR-31 next_by_subj). nextmsg(seq, subject) is accepted too.
+function js.nextmsg(stream, subject, seq)
+	if type(subject) == 'number' then subject, seq = seq, subject end
+	seq = tonumber(seq) or 1
+	if seq < 1 then seq = 1 end
+	if subject == nil then return js.getmsg(stream, seq) end
+	return js.getmsg(stream, seq, subject)
+end
 
 function js.deletemsg(stream, seq, secure)
 	local data = secure == true and { seq = seq } or { seq = seq, no_erase = true }
@@ -372,7 +428,7 @@ local function consumer_update(consumer, data, stream)
 	consumer.cluster = data.cluster or consumer.cluster
 	consumer.ts = data.ts or consumer.ts
 	-- unique pull inbox for this consumer object (not shared across clients/processes)
-	consumer.sid = consumer.sid or cm.subscribe(consumer.stream.client, cm.new_inbox(), function(m) return m end)
+	consumer.sid = consumer.sid or cm.subscribe(consumer.stream.client, cm.new_inbox(consumer.stream.client), function(m) return m end)
 	setmetatable(consumer, consumer_metatable)
 	consumer.stream.consumers[consumer.name] = consumer
 	return consumer
@@ -444,7 +500,7 @@ function js.delete_consumer(stream, consumer_name)
 	if not msg then return false, err end
 	return true, msg
 end
--- TODO paging support for information and not objects
+-- all pages are collected (offset/total)
 function js.consumer_list(stream)
 	local l, err = paged(stream.client, stream.api .. 'CONSUMER.LIST.' .. stream.name, 'consumers')
 	if not l then return false, err end
@@ -510,6 +566,13 @@ local function priority_fields(consumer, req, opts)
 end
 nats.jetstream.priority_fields = priority_fields
 
+local function ensure_fetch_inbox(consumer)
+	if not rawget(consumer, 'sid') then
+		local c = consumer.stream.client
+		consumer.sid = cm.subscribe(c, cm.new_inbox(c), function(m) return m end)
+	end
+end
+
 -- fetch(n, max_bytes, timeout, heartbeat [, opts]) opts: group, min_pending, min_ack_pending, priority, id
 function con.fetch(consumer, n, b, to, hb, popts)
 	n = tonumber(n) or 1
@@ -526,6 +589,7 @@ function con.fetch(consumer, n, b, to, hb, popts)
 		wait_t = client.config.timeout
 	end
 	if tonumber(hb) then req.idle_heartbeat = floor(tonumber(hb) * NS) end
+	if not rawget(consumer, 'sid') then ensure_fetch_inbox(consumer) end
 	local s = client.subscriptions[consumer.sid]
 	if not s then return {}, 'consumer inbox not subscribed' end
 	cm.publish(client, stream.api .. 'CONSUMER.MSG.NEXT.' .. stream.name .. '.' .. consumer.name, encode(req), s.subject)
@@ -685,18 +749,35 @@ function ConsumeCtx:stop()
 	end
 	if self.ticker then cm.remove_ticker(self.client, self.ticker) self.ticker = nil end
 	if self.rc_hook then cm.off_reconnect(self.client, self.rc_hook) self.rc_hook = nil end
+	local reg = self.consumer and rawget(self.consumer, '_ctxs')
+	if reg then reg[self] = nil end
 	if self.on_stop then pcall(self.on_stop, self) end
 end
 
--- drain: stop pulling, deliver what is already buffered/in flight (up to timeout), then stop
-function ConsumeCtx:drain(timeout)
+-- drain([timeout [, idle]]): stop issuing pulls, keep delivering messages of the outstanding
+-- pull requests until they are satisfied, nothing arrived for idle seconds (default 0.5) or
+-- timeout (default 5 s) passed; then UNSUB + flush (in-flight messages are still delivered)
+-- and stop. Returns true when the drain completed before the timeout.
+function ConsumeCtx:drain(timeout, idle)
+	if not self.sid then return true end
 	self.running = false
-	local deadline = gettime() + (timeout or 5)
-	while self.pending_msgs > 0 and gettime() < deadline do
-		if not cm.wait(self.client, { sid = self.sid, timeout = min(0.25, deadline - gettime()) }) then break end
+	self.draining = true
+	idle = tonumber(idle) or 0.5
+	local deadline = gettime() + (tonumber(timeout) or 5)
+	self.last_activity = gettime()
+	local client = self.client
+	while self.sid and self.pending_msgs > 0 and client.connected do
+		local now = gettime()
+		if now >= deadline or now - self.last_activity >= idle then break end
+		cm.wait(client, { timeout = min(0.1, deadline - now, idle), maxcount = 1 })
 	end
-	self.running = true
+	local ok = gettime() < deadline
+	if self.sid and client.connected then
+		ok = cm.drain_sub(client, self.sid, max(0.1, deadline - gettime())) and ok
+	end
+	self.draining = false
 	self:stop()
+	return ok
 end
 
 function ConsumeCtx:closed() return not self.running end
@@ -717,7 +798,7 @@ local function consume(consumer, callback, opts)
 		thr_bytes = tonumber(opts.threshold_bytes) or (max_bytes and floor(max_bytes / 2)),
 		pending_msgs = 0, pending_bytes = 0, delivered = 0, pulls = 0, missed = 0,
 		last_activity = gettime(), running = true,
-		inbox = cm.new_inbox(),
+		inbox = cm.new_inbox(client),
 	}, ConsumeCtx)
 	ctx.sid = cm.subscribe(client, ctx.inbox, function(m) ctx:on_msg(m) return nil end)
 	ctx.ticker = cm.add_ticker(client, min(hb, 1), function(_, now) return ctx:check(now) end)
@@ -726,6 +807,9 @@ local function consume(consumer, callback, opts)
 		ctx.last_activity = gettime()
 		ctx:pull()
 	end)
+	local reg = rawget(consumer, '_ctxs')
+	if not reg then reg = {} rawset(consumer, '_ctxs', reg) end
+	reg[ctx] = true
 	ctx:pull()
 	return ctx
 end
@@ -748,7 +832,9 @@ function MsgIter:next(timeout)
 	return table.remove(q, 1)
 end
 function MsgIter:stop() self.ctx:stop() end
-MsgIter.drain = MsgIter.stop
+-- drain: stop pulling and collect the in-flight messages; next() keeps returning the
+-- buffered messages and then nil, 'stopped'
+function MsgIter:drain(timeout, idle) return self.ctx:drain(timeout, idle) end
 function con.messages(consumer, opts)
 	opts = type(opts) == 'table' and opts or {}
 	local it = setmetatable({ queue = {} }, MsgIter)
@@ -757,8 +843,44 @@ function con.messages(consumer, opts)
 	it.ctx = ctx
 	return it
 end
-function con.stop() return nil, 'use the context returned by consume():stop()' end
-function con.drain() return nil, 'use the context returned by consume():drain()' end
+-- consumer:stop(): stop every consume()/messages() context and push subscription that is
+-- running on this consumer object and release its fetch inbox. The server side consumer is
+-- not deleted (use consumer:delete()). Returns the number of contexts stopped.
+-- A later fetch()/next() re-subscribes the fetch inbox.
+local function release_fetch_inbox(consumer, draining, timeout)
+	local sid = rawget(consumer, 'sid')
+	if not sid then return true end
+	local client = unwrap(consumer.stream.client)
+	consumer.sid = nil
+	if draining and client.connected and client.subscriptions[sid] then return cm.drain_sub(client, sid, timeout) end
+	pcall(cm.unsubscribe, client, sid)
+	return true
+end
+local function active_ctxs(consumer)
+	local l = {}
+	for c in pairs(rawget(consumer, '_ctxs') or {}) do l[#l + 1] = c end
+	return l
+end
+function con.stop(consumer)
+	local l = active_ctxs(consumer)
+	for _, c in ipairs(l) do c:stop() end
+	rawset(consumer, '_ctxs', nil)
+	release_fetch_inbox(consumer)
+	return #l
+end
+-- consumer:drain([timeout [, idle]]): like stop() but every context is drained first
+-- (see ConsumeCtx:drain / PushSub:drain). Returns true when all drains completed in time,
+-- plus the number of contexts drained.
+function con.drain(consumer, timeout, idle)
+	local deadline = gettime() + (tonumber(timeout) or 5)
+	local l, ok = active_ctxs(consumer), true
+	for _, c in ipairs(l) do
+		ok = c:drain(max(0.1, deadline - gettime()), idle) and ok
+	end
+	rawset(consumer, '_ctxs', nil)
+	ok = release_fetch_inbox(consumer, true, max(0.1, deadline - gettime())) and ok
+	return ok, #l
+end
 
 -- ---------------------------------------------------------------------------
 -- Ordered consumer (ADR-17, ADR-37): ephemeral, ack none, single replica, memory
@@ -902,7 +1024,15 @@ function Ordered:consume(callback, opts)
 	end
 	start()
 	function outer.stop() outer.running = false if outer.ctx then outer.ctx:stop() end me:delete_current() end
+	function outer.drain(_, timeout, idle)
+		outer.running = false
+		local ok = true
+		if outer.ctx then ok = outer.ctx:drain(timeout, idle) end
+		me:delete_current()
+		return ok
+	end
 	function outer.closed() return not outer.running end
+	me._outer = outer
 	outer.client = unwrap(self.stream.client)
 	return setmetatable(outer, { __index = function(t, k) return t.ctx and t.ctx[k] end })
 end
@@ -914,7 +1044,22 @@ function Ordered:messages(opts)
 	it.ctx = ctx
 	return it
 end
-function Ordered:stop() self:delete_current() end
+-- stop(): stop a running consume()/messages() context and delete the current consumer
+function Ordered:stop()
+	local o = self._outer
+	self._outer = nil
+	if o and o.running then o.stop() end
+	self:delete_current()
+end
+-- drain([timeout [, idle]]): drain a running consume()/messages() context, then delete
+function Ordered:drain(timeout, idle)
+	local o = self._outer
+	self._outer = nil
+	local ok = true
+	if o and o.running then ok = o.drain(o, timeout, idle) end
+	self:delete_current()
+	return ok
+end
 
 -- ---------------------------------------------------------------------------
 -- Push consumers with flow control and idle heartbeats (ADR-9), optionally ordered (ADR-17)
@@ -938,7 +1083,7 @@ function js.subscribe(stream, cfg, callback, opts)
 	sub.hb = hb
 	local ccfg = {}
 	for k, v in pairs(cfg) do ccfg[k] = v end
-	ccfg.deliver_subject = ccfg.deliver_subject or cm.new_inbox()
+	ccfg.deliver_subject = ccfg.deliver_subject or cm.new_inbox(client)
 	if opts.queue then ccfg.deliver_group = opts.queue end
 	if hb then ccfg.idle_heartbeat = floor(hb * NS) end
 	if opts.flow_control or opts.ordered then ccfg.flow_control = true end
@@ -990,6 +1135,11 @@ function js.subscribe(stream, cfg, callback, opts)
 	else c, err = js.consumer(stream, ccfg, opts.action) end
 	if not c then cm.unsubscribe(client, sub.sid) return nil, err end
 	sub.consumer = c
+	if not sub.ordered then
+		local reg = rawget(c, '_ctxs')
+		if not reg then reg = {} rawset(c, '_ctxs', reg) end
+		reg[sub] = true
+	end
 	if hb then
 		sub.ticker = cm.add_ticker(client, hb, function(_, now)
 			if not sub.running then return false end
@@ -1013,16 +1163,40 @@ function PushSub:reset(reason)
 	elseif self.opts.error_cb then pcall(self.opts.error_cb, self, err) end
 end
 
-function PushSub:stop()
-	self.running = false
-	if self.sid then pcall(cm.unsubscribe, self.client, self.sid) self.sid = nil end
+local function push_release(self)
 	if self.ticker then cm.remove_ticker(self.client, self.ticker) self.ticker = nil end
+	local c = self.consumer
+	if c then
+		local reg = rawget(c, '_ctxs')
+		if reg then reg[self] = nil end
+	end
 	if self.ordered then self.ordered:delete_current()
-	elseif self.consumer and not self.consumer.durable and not self.opts.keep then
-		pcall(con.delete, self.consumer)
+	elseif c and not c.durable and not self.opts.keep then
+		pcall(con.delete, c)
 	end
 end
+function PushSub:stop()
+	if not self.running and not self.sid then return end
+	self.running = false
+	if self.sid then pcall(cm.unsubscribe, self.client, self.sid) self.sid = nil end
+	push_release(self)
+end
 PushSub.unsubscribe = PushSub.stop
+-- drain([timeout]): UNSUB the deliver subject, deliver everything already in flight
+-- (PING/PONG round trip), then release the consumer like stop(). true if completed in time.
+function PushSub:drain(timeout)
+	if not self.running and not self.sid then return true end
+	local ok = true
+	if self.sid then
+		if self.client.connected then ok = cm.drain_sub(self.client, self.sid, tonumber(timeout) or 5) == true
+		else pcall(cm.unsubscribe, self.client, self.sid) end
+		self.sid = nil
+	end
+	self.running = false
+	push_release(self)
+	return ok
+end
+function PushSub:closed() return not self.running end
 
 -- ---------------------------------------------------------------------------
 -- Direct get batch / multi last (ADR-31)
@@ -1068,7 +1242,7 @@ function cm.js_counter_add(client, subject, delta, opts)
 end
 function js.counter_add(stream, subject, delta) return cm.js_counter_add(stream.client, subject, delta) end
 function js.counter_get(stream, subject)
-	local m, err = js.getmsg(stream, subject)
+	local m, err = js.get_stored(stream, subject)
 	if not m then return nil, err end
 	local ok, d = pcall(decode, m.data)
 	if not ok or type(d) ~= 'table' then return nil, 'invalid counter value' end

@@ -512,8 +512,10 @@ subscription (`<inbox_prefix>.<nuid>`); replies to it are routed to
 
 ### client:new_inbox()
 
-Returns: `_INBOX.<nuid>`, a subject for your own `subscribe` (not routed through
-the muxed inbox). Note: always uses `_INBOX`, not `config.inbox_prefix`.
+Returns: `<inbox_prefix>.<nuid>` (`inbox_prefix` option, default `_INBOX`), a
+subject for your own `subscribe` (not routed through the muxed inbox). Used for
+JetStream pull, consume, ordered and push consumer inboxes. Changed in 0.3.1
+(previously always `_INBOX`).
 
 ```lua
 local inbox = nc:new_inbox(); nc:subscribe(inbox, print)

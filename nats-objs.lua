@@ -239,7 +239,7 @@ end
 function om.get_info(obs, name, show_deleted)
 	if type(name) ~= 'string' or name == '' then return nil, 'object name required' end
 	if type(show_deleted) == 'table' then show_deleted = show_deleted.show_deleted end
-	local m, err = js.getmsg(obs.stream, meta_subject(obs, name))
+	local m, err = js.get_stored(obs.stream, meta_subject(obs, name))
 	if not m then
 		if err == 'message not found' then return nil, 'object not found' end
 		return nil, err

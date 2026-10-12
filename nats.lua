@@ -18,7 +18,7 @@ local socket = require('socket')
 local nuid = require('nuid')
 
 local nats = {
-	_VERSION     = 'lua-nats-nx 0.3.0',
+	_VERSION     = 'lua-nats-nx 0.3.1',
 	_DESCRIPTION = 'Lua client for NATS w/ headers, tls, request/reply, JetStream - https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2023-2026 Sam Orlando - MIT',
 	--
@@ -298,7 +298,7 @@ nats.client_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] end,
 	methods = {},
 	lang = 'lua',
-	version = '0.3.0',
+	version = '0.3.1',
 }
 local client_metatable = nats.client_metatable
 
@@ -1289,7 +1289,11 @@ function cm.create_inbox(client)
 end
 local create_inbox = cm.create_inbox
 
-function cm.new_inbox() return inbox_prefix .. '.' .. nuid.next() end
+-- unique inbox outside the muxed request subscription; honours the inbox_prefix option
+function cm.new_inbox(client)
+	local cfg = type(client) == 'table' and unwrap(client).config
+	return (cfg and cfg.inbox_prefix or inbox_prefix) .. '.' .. nuid.next()
+end
 
 local function inbox_req_cb(client, m) -- inbox request callback and handling for wait function
 	local lid = sub(m.subject, #client.inbox_prefix + 2)

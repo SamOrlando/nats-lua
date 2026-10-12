@@ -24,7 +24,7 @@ print(kp:public_key())
 ### nkeys.create_pair(kind, raw)
 
 `kind`: `'user'` (default), `'account'`, `'operator'`, `'server'`, `'cluster'`
-(also `'curve'`, see API notes). `raw`: 32 random bytes, read from
+or `'curve'` (x25519 xkey, see [curve key pair](#object-curve-key-pair-xkp)). `raw`: 32 random bytes, read from
 `/dev/urandom` when omitted. Returns: kp or `nil, 'invalid key type' | 'no
 entropy source: pass a 32 byte seed' | 'seed must be 32 bytes'`.
 
@@ -57,6 +57,49 @@ Returns: 64 byte raw ed25519 signature.
 #### kp:sign_nonce(nonce)
 
 Returns: base64url (no padding) signature, as sent in CONNECT `sig`.
+
+### Object: curve key pair (`xkp`)
+
+Returned by `create_pair('curve')` and `from_seed('SX...')`. x25519 keys for
+nkeys xkeys (Go `nkeys.CreateCurveKeys`): public keys start with `X`, seeds with
+`SX`. Sealed messages use the Go nkeys `xkv1` format: `'xkv1' .. nonce(24) ..
+secretbox(tag(16) .. ciphertext)` with x25519 + HSalsa20 + XSalsa20-Poly1305
+(NaCl `box`), so they interoperate with Go `kp.Seal`/`kp.Open` (tested by
+`tests/interop/xkeys_interop.sh`). Pure Lua.
+
+#### xkp:seed() / xkp:public_key() / xkp:raw_public()
+
+Encoded seed (`SX...`), encoded public key (`X...`), 32 byte raw x25519 public key.
+
+#### xkp:private_key()
+
+Returns: the private key encoded with the `P` prefix (Go `PrivateKey()`).
+
+#### xkp:type()
+
+Returns: `'curve'`.
+
+#### xkp:seal(input, recipient, nonce)
+
+Encrypts `input` for the `recipient` public key (`X...`). `nonce`: optional 24
+bytes (random by default; only for test vectors). Returns: sealed bytes or `nil,
+'invalid recipient' | 'nonce must be 24 bytes' | err`.
+
+```lua
+local a, b = nkeys.create_pair('curve'), nkeys.create_pair('curve')
+local box = a:seal('secret', b:public_key())
+print(b:open(box, a:public_key()))  --> secret
+```
+
+#### xkp:open(input, sender)
+
+Decrypts a message sealed by `sender` (`X...`). Returns: plaintext or `nil,
+'invalid encrypted data' | 'invalid encryption version' | 'invalid sender' |
+'could not decrypt'`.
+
+#### xkp:sign() / xkp:sign_nonce()
+
+Returns: `nil, 'invalid curve key operation'` (as Go nkeys).
 
 ## Creds and JWT
 
@@ -154,3 +197,26 @@ backend only). Returns: 32 byte public key / 64 byte signature.
 Always the pure Lua implementation.
 
 Fields: `nkeys.backend` (`'lua' | 'luasodium' | 'luatweetnacl'`), `nkeys.prefix`.
+
+## x25519 / NaCl box primitives (xkeys)
+
+### nkeys.x25519(scalar32, point32) / nkeys.x25519_base(scalar32)
+
+RFC 7748 X25519 (scalar clamped). Returns: 32 byte shared secret / public key.
+
+### nkeys.hsalsa20(in16, key32) / nkeys.xsalsa20_xor(msg, nonce24, key32)
+
+HSalsa20 subkey (32 bytes) / XSalsa20 stream XOR of `msg` (encrypt = decrypt).
+
+### nkeys.poly1305(msg, key32)
+
+Returns: 16 byte Poly1305 tag (RFC 8439).
+
+### nkeys.box_seal(msg, nonce24, peer_pk32, sk32) / nkeys.box_open(boxed, nonce24, peer_pk32, sk32)
+
+NaCl `crypto_box` (Go `box.Seal` layout: tag .. ciphertext). `box_open` returns
+the plaintext or `nil` when authentication fails.
+
+### nkeys.random_bytes(n)
+
+Returns: `n` bytes from `/dev/urandom`, or `nil, err`.

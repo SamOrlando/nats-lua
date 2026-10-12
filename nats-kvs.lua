@@ -237,12 +237,11 @@ nats.kvs.entry_from = entry_from
 function kvsm.get(kv, key, rev)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
 	local subject = kv.pre .. key
-	local m, err = js.getmsg(kv.stream, rev, subject)
+	local m, err = js.get_stored(kv.stream, rev, subject)
 	if not m then
 		if err == 'message not found' or (type(err) == 'table') then return nil, 'key not found' end
 		return nil, err
 	end
-	if type(m.data) == 'table' then return nil, 'bucket without allow_direct is not supported' end
 	local h = m:headers()
 	if h['Nats-Subject'] and h['Nats-Subject'] ~= subject then return nil, 'key not found' end
 	local e = entry_from(kv, key, m, h, tonumber(h['Nats-Sequence']), h['Nats-Time-Stamp'], 0)

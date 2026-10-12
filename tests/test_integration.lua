@@ -703,6 +703,191 @@ test("OBJ: non blocking watcher on ordered consumers", function()
     w:stop()
 end)
 
+
+-- 0.3.1 ----------------------------------------------------------------------
+test("JS: nextmsg/lastmsg by subject (ADR-31) on direct and non-direct streams", function()
+    if not js_ok then error("SKIP " .. js_why, 0) end
+    for _, direct in ipairs({ true, false }) do
+        local name = STREAM .. (direct and "-gd" or "-gs")
+        local sp = P .. (direct and ".gd" or ".gs")
+        local st = assert(nc:stream({ name = name, subjects = { sp .. ".>" }, storage = "memory", allow_direct = direct }, "create"))
+        cleanup[#cleanup + 1] = function() nc:delete_stream(name) end
+        -- seq: 1 a1, 2 b1, 3 a2, 4 b2, 5 a3
+        for i, v in ipairs({ "a1", "b1", "a2", "b2", "a3" }) do assert(nc:js_publish(sp .. "." .. v:sub(1, 1), v)) end
+        local function v(m) return m and (m.data or "?") end
+        local function seq(m) return tonumber(m:headers()["Nats-Sequence"]) end
+        local function get(f, ...)
+            if direct then return f(st, ...) end
+            local m, e = st:get_stored(...)
+            return m, e
+        end
+        if direct then
+            eq(v(st:nextmsg(sp .. ".a")), "a1", "nextmsg default start 1")
+            eq(v(st:nextmsg(sp .. ".a", 2)), "a2", "nextmsg from seq 2")
+            eq(seq(st:nextmsg(sp .. ".a", 3)), 3, "nextmsg inclusive start")
+            eq(v(st:nextmsg(4, sp .. ".a")), "a3", "nextmsg(seq, subject) accepted")
+            eq(v(st:nextmsg(sp .. ".>", 4)), "b2", "wildcard next")
+            eq(v(st:lastmsg(sp .. ".a")), "a3"); eq(v(st:lastmsg(sp .. ".b")), "b2")
+            local none, nerr = st:nextmsg(sp .. ".a", 6); eq(none, nil); eq(nerr, "message not found")
+            local nob, berr = st:lastmsg(sp .. ".zz"); eq(nob, nil); eq(berr, "message not found")
+        else
+            -- STREAM.MSG.GET: raw API reply from nextmsg/lastmsg, normalized via get_stored
+            local r = assert(st:nextmsg(sp .. ".a", 2)); eq(r.data.message.seq, 3)
+            r = assert(st:lastmsg(sp .. ".b")); eq(r.data.message.seq, 4)
+            local m = assert(st:get_stored(2, sp .. ".a")); eq(m.data, "a2"); eq(seq(m), 3)
+            eq(m:headers()["Nats-Subject"], sp .. ".a")
+            m = assert(st:get_stored(sp .. ".a")); eq(m.data, "a3")
+            local none, nerr = st:get_stored(6, sp .. ".a"); eq(none, nil); eq(nerr, "message not found")
+        end
+        assert(nc:delete_stream(name)); table.remove(cleanup)
+    end
+end)
+
+test("KV/OBJ/counter on streams without allow_direct (STREAM.MSG.GET)", function()
+    if not js_ok then error("SKIP " .. js_why, 0) end
+    local B = BUCKET .. "-nd"
+    local kv = assert(nc:create_key_value({ bucket = B, history = 3, storage = "memory" }))
+    cleanup[#cleanup + 1] = function() nc:delete_key_value(B) end
+    kv.stream.config.allow_direct = false -- force the non-direct get path
+    kv:put("k", "bin\0\1\255value"); kv:put("k", "v2"); kv:put("h", "x", nil)
+    local e = assert(kv:get("k")); eq(e.value, "v2"); eq(e.revision, 2); assert(e.created)
+    eq(kv:get("k", 1).value, "bin\0\1\255value", "get revision, binary payload")
+    kv:delete("h")
+    local _, err, de = kv:get("h"); eq(err, "key not found"); eq(de.op, "DEL")
+    eq(select(2, kv:get("missing")), "key not found")
+    assert(nc:delete_key_value(B)); table.remove(cleanup)
+end)
+
+test("inbox_prefix: new_inbox, request mux, JS pull/consume/ordered/push, kv, objs, micro", function()
+    if not js_ok then error("SKIP " .. js_why, 0) end
+    require("nats-micro")
+    local IP = P .. ".ibx"
+    local c = connect({ inbox_prefix = IP })
+    local spy = connect()
+    local seen = 0
+    spy:subscribe(IP .. ".>", function() seen = seen + 1 end)
+    spy:flush()
+    local function wait_seen(before, what)
+        local t = socket.gettime() + 3
+        while seen <= before and socket.gettime() < t do spy:wait({ timeout = 0.05 }) end
+        assert(seen > before, what .. " reply/delivery went to the custom prefix")
+    end
+    local function pfx(subj, what) assert(subj:sub(1, #IP + 1) == IP .. ".", what .. ": " .. tostring(subj)) end
+    pfx(c:new_inbox(), "new_inbox"); pfx(c:create_inbox(), "create_inbox")
+    assert(c:new_inbox() ~= c:new_inbox())
+    -- core request
+    local esid = c:subscribe(P .. ".ibx-echo", function(m) pfx(m.reply, "request reply"); c:publish(m.reply, m.data) end)
+    c:flush()
+    local n = seen; eq(c:get(P .. ".ibx-echo", "hi").data, "hi"); wait_seen(n, "request")
+    -- JetStream
+    local name = STREAM .. "-ibx"
+    local st = assert(c:stream({ name = name, subjects = { P .. ".ibxjs.>" }, storage = "memory" }, "create"))
+    cleanup[#cleanup + 1] = function() nc:delete_stream(name) end
+    for i = 1, 6 do assert(c:js_publish(P .. ".ibxjs.x", tostring(i))) end
+    local con = assert(st:consumer({ name = "pl", ack_policy = "explicit" }, "create"))
+    pfx(c.subscriptions[con.sid].subject, "pull inbox")
+    n = seen; eq(#con:fetch(2, nil, 1), 2); wait_seen(n, "fetch")
+    local got = 0
+    local ctx = con:consume(function(m) got = got + 1; m:ack() end, { max_messages = 10, expires = 2 })
+    pfx(ctx.inbox, "consume inbox")
+    local t = socket.gettime() + 5
+    while got < 4 and socket.gettime() < t do c:wait({ timeout = 0.05 }) end
+    eq(got, 4); ctx:stop()
+    local oc = st:ordered_consumer()
+    eq(#oc:fetch(6, 2), 6); pfx(c.subscriptions[oc.consumer.sid].subject, "ordered inbox"); oc:stop()
+    local pushed = 0
+    local ps = assert(st:subscribe({ ack_policy = "none" }, function() pushed = pushed + 1 end))
+    pfx(ps.deliver, "push deliver subject")
+    t = socket.gettime() + 5
+    while pushed < 6 and socket.gettime() < t do c:wait({ timeout = 0.05 }) end
+    eq(pushed, 6); ps:stop()
+    local ops = assert(st:subscribe({}, function() end, { ordered = true }))
+    pfx(ops.deliver, "ordered push deliver subject"); ops:stop()
+    -- kv / objs
+    local B = BUCKET .. "-ibx"
+    local kv = assert(c:create_key_value({ bucket = B, storage = "memory" }))
+    cleanup[#cleanup + 1] = function() nc:delete_key_value(B) end
+    n = seen; kv:put("k", "v"); eq(kv:get("k").value, "v"); wait_seen(n, "kv")
+    local w = assert(kv:watch_all(function() end))
+    if type(w) == "table" and w.sid then pfx(c.subscriptions[w.sid].subject, "kv watcher inbox") end
+    if type(w) == "table" and w.stop then w:stop() end
+    assert(nc:delete_key_value(B)); table.remove(cleanup)
+    local OB = BUCKET .. "-ibxo"
+    local o = assert(c:create_object_store({ bucket = OB, storage = "memory" }))
+    cleanup[#cleanup + 1] = function() nc:delete_object_store(OB) end
+    n = seen; assert(o:put("f", string.rep("z", 3000))); eq(#o:get("f"), 3000); wait_seen(n, "objs")
+    assert(o:destroy()); table.remove(cleanup)
+    -- micro: client side calls and replies use the prefix
+    c:unsubscribe(esid)
+    local svc = assert(c:add_service({ name = BUCKET .. "-ibxsvc", version = "1.0.0" }))
+    assert(svc:add_endpoint("e", function(req) pfx(req.reply or req.msg and req.msg.reply or IP .. ".", "micro reply"); req:respond("ok") end,
+        { subject = P .. ".ibxsvc.e" }))
+    c:flush()
+    n = seen; eq(c:get(P .. ".ibxsvc.e", "").data, "ok"); wait_seen(n, "micro request")
+    n = seen; eq(#nats.micro.ping(c, svc.name), 1); wait_seen(n, "micro discovery")
+    svc:stop()
+    for sid, sb in pairs(c.subscriptions) do
+        if sb.subject then pfx(sb.subject, "remaining subscription " .. tostring(sid)) end
+    end
+    assert(c:delete_stream(name)); table.remove(cleanup)
+    c:close(); spy:close()
+end)
+
+test("JS: consumer:stop()/drain() for pull consume, messages, push, ordered", function()
+    if not js_ok then error("SKIP " .. js_why, 0) end
+    local name = STREAM .. "-sd"
+    local st = assert(nc:stream({ name = name, subjects = { P .. ".sd.>" }, storage = "memory" }, "create"))
+    cleanup[#cleanup + 1] = function() nc:delete_stream(name) end
+    for i = 1, 40 do assert(nc:js_publish(P .. ".sd.x", tostring(i))) end
+    -- stop(): every context of the consumer stops, server consumer stays
+    local c = assert(st:consumer({ name = "s1", ack_policy = "explicit" }, "create"))
+    local a, b = 0, 0
+    local c1 = c:consume(function(m) a = a + 1; m:ack() end, { max_messages = 5, expires = 2 })
+    local it = assert(c:messages({ max_messages = 5, expires = 2 }))
+    pump(1, function() return a > 0 end)
+    eq(c:stop(), 2, "two contexts stopped")
+    eq(c1:closed(), true); eq(it.ctx:closed(), true)
+    local m, e = it:next(0.2); while m do b = b + 1; m:ack(); m, e = it:next(0.2) end
+    eq(e, "stopped")
+    local before = a; pump(1); eq(a, before, "no deliveries after stop")
+    assert(c:info(), "consumer still exists on the server")
+    eq(#c:fetch(1, nil, 1), 1, "fetch re-subscribes after stop()")
+    -- drain(): in-flight messages of outstanding pulls are delivered, then stop
+    local c2 = assert(st:consumer({ name = "d1", ack_policy = "explicit" }, "create"))
+    local d = 0
+    local dc = c2:consume(function(m) d = d + 1; m:ack() end, { max_messages = 10, expires = 3 })
+    local ok, count = c2:drain(5)
+    eq(ok, true); eq(count, 1); eq(dc:closed(), true)
+    assert(d >= 1 and d <= 10, "drained " .. d)
+    local after = d; pump(1); eq(d, after)
+    nc:flush(); eq(c2:info().num_ack_pending, 0, "everything delivered during drain was acked")
+    -- messages() iterator drain keeps already received messages readable
+    local c3 = assert(st:consumer({ name = "d2", ack_policy = "none" }, "create"))
+    local it3 = assert(c3:messages({ max_messages = 8, expires = 3 }))
+    assert(it3:drain(5))
+    local q = 0; m = it3:next(0.1); while m do q = q + 1; m = it3:next(0.1) end
+    assert(q >= 1 and q <= 8, "iterator drained " .. q)
+    -- push consumer: consumer:stop() stops the push subscription, PushSub:drain()
+    local pn = 0
+    local ps = assert(st:subscribe({ durable_name = "pd", ack_policy = "none" }, function() pn = pn + 1 end, { keep = true }))
+    pump(3, function() return pn == 40 end); eq(pn, 40)
+    eq(ps.consumer:stop(), 1); eq(ps:closed(), true)
+    local ps2 = assert(st:subscribe({ ack_policy = "none" }, function() pn = pn + 1 end))
+    pump(0.5); eq(ps2:drain(2), true); eq(ps2:closed(), true)
+    -- ordered: stop() and drain() end the running consume context and delete the consumer
+    local oc = st:ordered_consumer()
+    local on = 0
+    local octx = assert(oc:consume(function() on = on + 1 end, { max_messages = 5, expires = 2 }))
+    pump(3, function() return on >= 10 end)
+    oc:stop(); eq(octx.closed(), true); eq(oc.consumer, nil)
+    local o2 = st:ordered_consumer()
+    local on2 = 0
+    assert(o2:consume(function() on2 = on2 + 1 end, { max_messages = 5, expires = 2 }))
+    pump(0.5); assert(o2:drain(3)); eq(o2.consumer, nil)
+    local n2 = on2; pump(0.5); eq(on2, n2, "nothing after ordered drain")
+    assert(nc:delete_stream(name)); table.remove(cleanup)
+end)
+
 -- cleanup -------------------------------------------------------------------
 for i = #cleanup, 1, -1 do pcall(cleanup[i]) end
 test("cleanup: no test streams left", function()
