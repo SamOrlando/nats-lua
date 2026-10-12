@@ -2,8 +2,11 @@
 
 A [NATS](https://nats.io) client written in plain Lua on top of LuaSocket. It runs on
 Lua 5.1, 5.2, 5.3, 5.4 and LuaJIT. It covers core NATS (pub/sub, queue groups,
-headers, request/reply, keepalive, reconnect, drain) and a practical part of
-JetStream (streams, pull consumers, acks, Key-Value buckets).
+headers, request/reply, keepalive, reconnect, drain, TLS, WebSocket, nkey/JWT
+auth) plus JetStream (streams, pull/push/ordered consumers), Key-Value buckets,
+Object Store buckets and the Service API (micro).
+
+Source: <https://github.com/SamOrlando/nats-lua>
 
 The I/O model is **blocking and single threaded**: nothing happens in the
 background. Messages are read and dispatched to callbacks while you call
@@ -13,14 +16,25 @@ those calls.
 
 ## Install
 
+nats-lua is not on luarocks.org yet; install it from a clone:
+
 ```sh
-luarocks make rockspecs/nats-lua-0.2.0-1.rockspec
+git clone https://github.com/SamOrlando/nats-lua.git
+cd nats-lua
+luarocks make rockspecs/nats-lua-0.4.0-1.rockspec   # pulls luasocket and nuid
 ```
+
+Or copy the `nats*.lua` files onto your `package.path` and install the
+dependencies yourself (`luarocks install luasocket nuid`).
+
+Modules: `nats` (core client), `nats-jetstream`, `nats-kvs`, `nats-objs`,
+`nats-micro` (each extends and returns the `nats` module), `nats-nkeys` and
+`nats-sha256` (standalone).
 
 Requirements:
 
 - `luasocket` (>= 3.0)
-- [`nuid`](https://git.nodex.net:9002/odi/lua-nuid) >= 1.0.0 (pure Lua), used for inboxes and sids
+- [`nuid`](https://github.com/SamOrlando/lua-nuid) >= 1.0.0 (pure Lua, luarocks package `nuid`), used for inboxes and sids
 - optional: `lua-cjson` for faster JSON. Without it, a built-in pure Lua codec is used (`nats.json.backend` tells you which one is active).
 - optional: `luasec` for TLS. It is only loaded when TLS is needed.
 - optional: `luaossl` (`openssl.digest`) for faster SHA-256 in the object store. Otherwise a pure Lua SHA-256 is used: native integers on 5.3+, `bit` on LuaJIT, `bit32` on 5.2, lookup tables on 5.1. Rough speed per MB: LuaJIT 0.07 s, 5.4 0.17 s, 5.3 0.26 s, 5.2 1.1 s, 5.1 4.2 s.
@@ -160,16 +174,18 @@ con:delete(); stream:delete()
 ```lua
 require("nats-kvs")
 local kv = nc:kvs({ bucket = "config", history = 5, ttl = 3600 })   -- ttl in seconds
-local rev = kv:put("app.level", "3")      -- revision (integer), reply msg | nil, err
+local rev, m = kv:put("app.level", "3")   -- revision (integer), pub ack msg | nil, err
 local e = kv:get("app.level")             -- {value=, revision=, op=, created=} | nil, "key not found"
-rev = kv:update("app.level", "4", e.revision)   -- compare-and-set; nil, "wrong last sequence" if stale
-kv:create("app.once", "x")                -- revision | nil, "key exists"
+rev = kv:update("app.level", "4", e.revision)   -- compare-and-set: revision, msg | nil, "wrong last sequence" if stale
+kv:create("app.once", "x")                -- revision, msg | nil, "key exists"
 kv:delete("app.level"); kv:purge("app.once")   -- true, msg | nil, err
 local w = kv:watch("app.*", function(e) if e then print(e.key, e.value, e.op) end end,
     { include_history = false, ignore_deletes = false, meta_only = false, updates_only = false })
 w:wait_initial(5)                         -- pumps until the nil "initial values done" marker
 w:stop()
-kv:keys(), kv:history("app.level"), kv:purge_deletes({ older_than = 1800 })
+local keys = kv:keys()                    -- list of key names
+local hist = kv:history("app.level")      -- list of entries
+kv:purge_deletes({ older_than = 1800 })
 kv:create("tmp", "x", { ttl = 10 })       -- per key TTL (bucket created with limit_marker_ttl)
 nc:create_key_value({ bucket = "copy", mirror = { name = "config" } })   -- mirrors / sources
 kv:destroy()
@@ -193,14 +209,14 @@ obs:put_file("/tmp/photo.jpg")                                          -- name 
 local data, info = obs:get("a.txt")                  -- whole object; size + SHA-256 verified
 obs:get("big.bin", { callback = function(chunk) ... end })   -- streaming
 obs:get_file("big.bin", "/tmp/out.bin")
-obs:get_info("a.txt"), obs:get_info("a.txt", true)  -- true = include deleted
+obs:get_info("a.txt"); obs:get_info("a.txt", true)  -- true = include deleted
 obs:update_meta("a.txt", { name = "b.txt", description = "renamed" })
 obs:delete("b.txt")                                  -- deleted marker + chunk purge
-obs:list(), obs:list({ show_deleted = true })
+obs:list(); obs:list({ show_deleted = true })
 obs:add_link("alias", obs:get_info("big.bin")); obs:add_bucket_link("other", other_obs)
 obs:watch(function(info) ... end, { timeout = 10 })  -- BLOCKING; nil marker after initial values
 local w = obs:watcher(function(info) ... end)       -- non blocking (ordered consumer), w:stop()
-obs:status(), obs:seal(), obs:destroy()
+obs:status(); obs:seal(); obs:destroy()
 ```
 
 Chunks default to 128 KiB (capped below the server `max_payload`) and are
@@ -228,14 +244,14 @@ pumps the connection: `nc:wait({ timeout = t })`, `nc:get()`, `flush()`,
 on `nc:wait({ timeout = 0.1 })` (or call it from its own event loop).
 `nc:add_ticker(interval, fn)` runs timers inside the same loop.
 
-### JetStream consumers (0.3.0)
+### More JetStream consumers
 
 ```lua
 local ctx = consumer:consume(function(m) m:ack() end, { max_messages = 100, expires = 30, idle_heartbeat = 5 })
-ctx:stop() / ctx:drain()
+ctx:stop()                                -- or ctx:drain()
 local it = consumer:messages(); local m = it:next(5); it:stop()
 local oc = stream:ordered_consumer({ filter_subjects = { "orders.>" } })   -- ADR-17
-oc:fetch(10), oc:next(5), oc:consume(cb), oc:messages()
+oc:fetch(10); oc:next(5)                  -- also oc:consume(cb), oc:messages()
 local sub = stream:subscribe({ deliver_subject = nc:new_inbox(), flow_control = true, idle_heartbeat = 5 }, cb)  -- push (ADR-9)
 consumer:pause(os.time() + 60); consumer:resume(); consumer:unpin()                       -- ADR-42
 consumer:fetch(10, nil, 5, nil, { group = "g1" })                                         -- priority groups
@@ -252,6 +268,15 @@ svc:add_group("math"):add_endpoint("add", function(req) req:respond_json({ sum =
 nats.micro.ping(nc, "calc"); nats.micro.info(nc, "calc"); nats.micro.stats(nc, "calc")
 svc:stop()
 ```
+
+## Known gaps
+
+- No threads: push flow control, heartbeats, watchers and service endpoints only
+  run while the application pumps the connection (see above).
+- ADR-50 fast-ingest batch publishing, ADR-51 scheduler helpers (headers only),
+  ADR-63 backup/restore, codecs and tracing are not implemented.
+- WebSocket without permessage-deflate compression.
+- TLS defaults to `verify = "none"`; configure `tls` for certificate checks.
 
 ## Feature matrix vs. the NATS ADRs
 
@@ -322,14 +347,20 @@ globally in `nats.defaults`.
 
 ## Tests
 
+The test scripts need `nuid` on `LUA_PATH`: either `luarocks install nuid`, or a
+clone of [lua-nuid](https://github.com/SamOrlando/lua-nuid) passed as `NUID_DIR`.
+Integration tests run only against a server you point them at with `NATS_URL`
+(default `nats://127.0.0.1:4222`); `test_local.lua` starts its own `nats-server`
+on 127.0.0.1.
+
 ```sh
-NUID_DIR=/path/to/lua-nuid tests/run.sh                                   # unit tests on every Lua found
+NUID_DIR=/path/to/lua-nuid tests/run.sh                                   # unit tests + docs check on every Lua found
 (cd tests/interop && go build -o interop .) && NATS_URL=... lua tests/interop/objs_interop.lua  # nats.go interop
 NATS_URL=nats://127.0.0.1:4222 NUID_DIR=... tests/run.sh                  # + integration tests
 NATS_NO_CJSON=1 NATS_URL=... lua tests/test_integration.lua               # with the pure Lua JSON codec
 NATS_SERVER_BIN=/path/nats-server lua tests/test_local.lua                # nkey, creds, websocket, restart buffering
 lua tests/test_nkeys.lua                                                  # SHA-512, ed25519 RFC 8032, nkeys vectors
-lua tests/check_docs.lua                                                  # every exported function is in docs/reference
+LUA_PATH="./?.lua;$NUID_DIR/?.lua;;" lua tests/check_docs.lua             # every exported function is in docs/reference
 lua tests/bench.lua 200000                                                # parser/publish benchmark
 ```
 

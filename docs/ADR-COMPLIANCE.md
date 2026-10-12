@@ -8,8 +8,9 @@ Deprecated (15, 18, 52) and server-only ADRs (3, 12, 26, 28, 30, 38, 39, 41, 44,
 55, 56, 59, 61, 62).
 
 Legend: ✅ done, ◐ partial, ❌ missing, n/a = nothing for a client to do.
+The 0.3.0+ column also applies to 0.3.1 and 0.4.0 (0.4.0 changed KV write return values, see the README).
 
-| ADR | Title | Status | 0.2.0 | 0.3.0 | Notes |
+| ADR | Title | Status | 0.2.0 | 0.3.0+ | Notes |
 |---|---|---|---|---|---|
 | 1 | JetStream JSON API Design | Implemented | ✅ | ✅ | API paging now aggregated (stream/consumer lists, names) |
 | 2 | NATS Typed Messages | Implemented | ◐ | ◐ | JSON encoded client; header/status constants; no typed-message helpers |

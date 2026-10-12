@@ -1,7 +1,7 @@
 <!-- Copyright (c) 2023-2026 Sam Orlando. SPDX-License-Identifier: MIT -->
 # `nats` — core client
 
-`local nats = require('nats')` (file `nats.lua`, v0.3.0). Depends on LuaSocket and
+`local nats = require('nats')` (file `nats.lua`, v0.4.0). Depends on LuaSocket and
 `nuid`; LuaSec is loaded only for TLS, lua-cjson is used when installed.
 
 Conventions used in this reference:
@@ -704,7 +704,7 @@ Note: `msg.status_code` is a string (`'503'`); compare with
 
 ### Other module fields
 
-`nats._VERSION` (`'lua-nats-nx 0.3.0'`), `nats._DESCRIPTION`, `nats._COPYRIGHT`,
+`nats._VERSION` (`'lua-nats-nx 0.4.0'`), `nats._DESCRIPTION`, `nats._COPYRIGHT`,
 `nats.verbose` (bool, prints protocol traffic), `nats.defaults` (table),
 `nats.valid_config` (set of accepted option names), `nats.nuid` (the `nuid`
 module), `nats.client_metatable` (`lang`, `version`, `methods`),

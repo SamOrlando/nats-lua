@@ -2,7 +2,7 @@ rockspec_format = "3.0"
 package = "nats-lua"
 version = "0.4.0-1"
 source = {
-   url = "git+https://git.nodex.net:9002/odi/nats-lua.git",
+   url = "git+https://github.com/SamOrlando/nats-lua.git",
    tag = "v0.4.0",
 }
 description = {
@@ -17,7 +17,7 @@ nats.go compatible, pure Lua SHA-256), consume/ordered/push consumers,
 Service API (micro), nkey/creds auth with pure Lua ed25519 and WebSocket
 transport. Lua 5.1-5.4 and LuaJIT.
 ]],
-   homepage = "https://git.nodex.net:9002/odi/nats-lua",
+   homepage = "https://github.com/SamOrlando/nats-lua",
    license = "MIT",
    labels = { "nats", "messaging", "jetstream", "pubsub" },
 }

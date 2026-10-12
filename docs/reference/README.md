@@ -1,5 +1,5 @@
 <!-- Copyright (c) 2023-2026 Sam Orlando. SPDX-License-Identifier: MIT -->
-# nats-lua API reference (v0.3.0)
+# nats-lua API reference (v0.4.0)
 
 Reference for the public API of every module, derived from the source. Start
 with [the pump model](nats.md#the-pump-model-threading): nothing happens in the
@@ -8,12 +8,12 @@ run only while the application is inside `nc:wait()` or another blocking call.
 
 | Module | `require` returns | Reference | Contents | Functions |
 |---|---|---|---|---|
-| `nats` | `nats` | [nats.md](nats.md) | client, options, msg, encoded client, headers/status constants, JSON, contexts, WebSocket | 77 |
-| `nats-jetstream` | `nats` | [nats-jetstream.md](nats-jetstream.md) | streams, consumers, fetch/consume/messages, ordered and push consumers, acks, direct get, counters, batches | 87 |
+| `nats` | `nats` | [nats.md](nats.md) | client, options, msg, encoded client, headers/status constants, JSON, contexts, WebSocket | 78 |
+| `nats-jetstream` | `nats` | [nats-jetstream.md](nats-jetstream.md) | streams, consumers, fetch/consume/messages, ordered and push consumers, acks, direct get, counters, batches | 92 |
 | `nats-kvs` | `nats` | [nats-kvs.md](nats-kvs.md) | Key-Value buckets, entries, watchers | 29 |
 | `nats-objs` | `nats` | [nats-objs.md](nats-objs.md) | Object store, ObjectInfo, watchers | 36 |
 | `nats-micro` | `nats` | [nats-micro.md](nats-micro.md) | Service API: services, groups, requests, discovery | 27 |
-| `nats-nkeys` | own table | [nats-nkeys.md](nats-nkeys.md) | key pairs, ed25519, SHA-512, creds, user JWTs | 30 |
+| `nats-nkeys` | own table | [nats-nkeys.md](nats-nkeys.md) | key pairs, ed25519, x25519 xkeys, SHA-512, creds, user JWTs | 47 |
 | `nats-sha256` | own table | [nats-sha256.md](nats-sha256.md) | SHA-256 | 6 |
 
 Function counts are exported functions (metatable methods and module
