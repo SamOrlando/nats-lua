@@ -210,6 +210,14 @@ the `SHA-256=<base64url>` digest and the ObjectInfo JSON match nats.go: an
 interop test (`tests/interop/`) checks that Go reads Lua objects and links and
 that Lua reads Go objects and links.
 
+## API reference
+
+Full reference for every public function, object and constant:
+[docs/reference/](docs/reference/README.md) ([nats](docs/reference/nats.md),
+[jetstream](docs/reference/nats-jetstream.md), [kvs](docs/reference/nats-kvs.md),
+[objs](docs/reference/nats-objs.md), [micro](docs/reference/nats-micro.md),
+[nkeys](docs/reference/nats-nkeys.md), [sha256](docs/reference/nats-sha256.md)).
+
 ## Single-threaded model
 
 nats-lua has no threads. Everything that other clients do in the background
@@ -321,6 +329,7 @@ NATS_URL=nats://127.0.0.1:4222 NUID_DIR=... tests/run.sh                  # + in
 NATS_NO_CJSON=1 NATS_URL=... lua tests/test_integration.lua               # with the pure Lua JSON codec
 NATS_SERVER_BIN=/path/nats-server lua tests/test_local.lua                # nkey, creds, websocket, restart buffering
 lua tests/test_nkeys.lua                                                  # SHA-512, ed25519 RFC 8032, nkeys vectors
+lua tests/check_docs.lua                                                  # every exported function is in docs/reference
 lua tests/bench.lua 200000                                                # parser/publish benchmark
 ```
 

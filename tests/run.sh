@@ -10,6 +10,7 @@ for lua in lua5.1 lua5.2 lua5.3 lua5.4 luajit; do
     "$lua" tests/test_nats.lua || rc=1
     "$lua" tests/test_objs.lua || rc=1
     "$lua" tests/test_nkeys.lua | tail -1 || rc=1
+    "$lua" tests/check_docs.lua | tail -1 || rc=1
     if [ -n "$NATS_SERVER_BIN" ]; then "$lua" tests/test_local.lua | tail -1 || rc=1; fi
     if [ -n "$NATS_URL" ]; then "$lua" tests/test_integration.lua | tail -1 || rc=1; fi
 done
