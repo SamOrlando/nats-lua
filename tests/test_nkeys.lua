@@ -62,6 +62,37 @@ test("issue and decode user JWT, creds round trip", function()
     eq(j2, jwt); eq(s2, user:seed())
 end)
 
+test("x25519 RFC 7748 6.1 and poly1305 RFC 8439 2.5.2", function()
+    local a = U("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+    local b = U("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+    eq(H(nk.x25519_base(a)), "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
+    eq(H(nk.x25519_base(b)), "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+    eq(H(nk.x25519(a, nk.x25519_base(b))), "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+    eq(H(nk.poly1305("Cryptographic Forum Research Group",
+        U("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"))), "a8061dc1305136c6c22b8baf0c0127a9")
+end)
+
+test("xkeys: curve pair, Go nkeys vector, seal/open", function()
+    -- vector from tests/interop/nkeys (nkeyscheck xvector): seeds 32x01 / 32x02, nonce 24x07
+    local a = assert(nk.from_seed("SXAACAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAN4QM"))
+    local b = assert(nk.from_seed("SXAAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAT5QQ"))
+    eq(a:type(), "curve")
+    eq(a:public_key(), "XCSOBEUSWZI4E6FZO4WFNH27VG5RHWIGWRVLNDE57HOCWRAJ7CRATSUK")
+    eq(b:public_key(), "XDHI2OWRZS3DH3D3ODAXQFFFY5XM2AUWQUCQ2NCHIW5ALBYOLB6VSWAL")
+    local sealed = assert(a:seal("hello xkeys", b:public_key(), string.rep("\7", 24)))
+    eq(H(sealed), "786b76310707070707070707070707070707070707070707070707073b4845e98228ced59bf6ae706ae523a540e1ba079404c1719cd5e0")
+    eq(b:open(sealed, a:public_key()), "hello xkeys")
+    local _, e = b:open(sealed:sub(1, -2) .. "x", a:public_key()); eq(e, "could not decrypt")
+    _, e = b:open("xkv2" .. sealed:sub(5), a:public_key()); eq(e, "invalid encryption version")
+    _, e = a:seal("x", "UDHCE3WRB3YPXVFQR34XLEURROUWO22W377GUOHCY7SCO2DBLWH7QSJT"); eq(e, "invalid recipient")
+    eq(select(2, a:sign("x")), "invalid curve key operation")
+    local c = assert(nk.create_pair("curve"))
+    eq(c:public_key():sub(1, 1), "X"); eq(c:seed():sub(1, 2), "SX"); eq(c:private_key():sub(1, 1), "P")
+    local long = string.rep("0123456789abcdef", 20)
+    eq(c:open(a:seal(long, c:public_key()), a:public_key()), long)
+    assert(nk.is_valid_public(c:public_key(), "curve"))
+end)
+
 test("micro semver validation", function()
     for _, v in ipairs({ "0.0.1", "1.2.3-alpha.1+build.5", "10.20.30" }) do assert(micro.valid_version(v), v) end
     for _, v in ipairs({ "1.2", "01.2.3", "1.2.3-", "v1.2.3", "" }) do assert(not micro.valid_version(v), v) end

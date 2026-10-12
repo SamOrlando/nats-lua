@@ -7,6 +7,7 @@
 --   * SHA-512 and SHA-512/256
 --   * ed25519 key derivation and signing (port of the TweetNaCl reference)
 --   * NKEY seed/public key encoding (base32 + crc16) used by NATS auth
+--   * x25519 curve keys (xkeys) with xsalsa20-poly1305 seal/open ('xkv1', nkeys compatible)
 --   * ADR-14 user JWT issuing (sign a user JWT with an account seed) and creds files
 -- A native backend is used for ed25519 when available: luasodium
 -- (crypto_sign_seed_keypair / crypto_sign_detached) or luatweetnacl.
@@ -377,6 +378,166 @@ end
 function M.ed25519_public(seed) return ed_public(seed) end
 function M.ed25519_sign(seed, msg, pk) return ed_sign(seed, msg, pk) end
 
+-- ------------------------------------------------------------------ x25519 / xsalsa20-poly1305 (xkeys)
+-- TweetNaCl crypto_scalarmult, crypto_box (xsalsa20 + poly1305), pure Lua.
+local function unpack25519(n)
+	local o = gf()
+	for i = 0, 15 do o[i] = byte(n, 2 * i + 1) + byte(n, 2 * i + 2) * 256 end
+	o[15] = o[15] % 32768
+	return o
+end
+local G121665 = gf({ 0xDB41, 1 })
+local BASE9 = char(9) .. rep('\0', 31)
+
+local function x25519(n, p) -- n: 32 byte scalar, p: 32 byte u coordinate -> 32 bytes
+	local z = { byte(n, 1, 32) }
+	z[32] = z[32] % 64 + 64 -- (b & 127) | 64
+	z[1] = z[1] - z[1] % 8
+	local x = unpack25519(p)
+	local a, b, c, d, e, f = gf(), gf(), gf(), gf(), gf(), gf()
+	set(b, x)
+	a[0], d[0] = 1, 1
+	for i = 254, 0, -1 do
+		local r = floor(z[floor(i / 8) + 1] / 2 ^ (i % 8)) % 2
+		sel(a, b, r) sel(c, d, r)
+		A(e, a, c) Z(a, a, c) A(c, b, d) Z(b, b, d)
+		S(d, e) S(f, a) Mul(a, c, a) Mul(c, b, e)
+		A(e, a, c) Z(a, a, c) S(b, a) Z(c, d, f)
+		Mul(a, c, G121665) A(a, a, d) Mul(c, c, a) Mul(a, d, f) Mul(d, b, x) S(b, e)
+		sel(a, b, r) sel(c, d, r)
+	end
+	inv25519(c, c)
+	Mul(a, a, c)
+	return pack25519(a)
+end
+M.x25519 = x25519
+function M.x25519_base(n) return x25519(n, BASE9) end
+
+-- salsa20 core (h = true: hsalsa20 -> 32 bytes, else 64 byte block)
+local function ld32(s, i) local a, b, c, d = byte(s, i, i + 3) return a + b * 256 + c * 65536 + d * 16777216 end
+local function st32(v) return char(v % 256, floor(v / 256) % 256, floor(v / 65536) % 256, floor(v / 16777216) % 256) end
+local function L32(x, c) x = x % M32 local hi = floor(x / 2 ^ (32 - c)) return (x * 2 ^ c) % M32 + hi end
+local SIGMA = 'expand 32-byte k'
+local function core(inp, k, h)
+	local x, y, w, t = {}, {}, {}, {}
+	for i = 0, 3 do
+		x[5 * i] = ld32(SIGMA, 4 * i + 1)
+		x[1 + i] = ld32(k, 4 * i + 1)
+		x[6 + i] = ld32(inp, 4 * i + 1)
+		x[11 + i] = ld32(k, 16 + 4 * i + 1)
+	end
+	for i = 0, 15 do y[i] = x[i] end
+	for _ = 1, 20 do
+		for j = 0, 3 do
+			for m = 0, 3 do t[m] = x[(5 * j + 4 * m) % 16] end
+			t[1] = bxor(t[1], L32(t[0] + t[3], 7))
+			t[2] = bxor(t[2], L32(t[1] + t[0], 9))
+			t[3] = bxor(t[3], L32(t[2] + t[1], 13))
+			t[0] = bxor(t[0], L32(t[3] + t[2], 18))
+			for m = 0, 3 do w[4 * j + (j + m) % 4] = t[m] end
+		end
+		for m = 0, 15 do x[m] = w[m] end
+	end
+	local out = {}
+	if h then
+		for i = 0, 3 do out[#out + 1] = st32(x[5 * i]) end
+		for i = 0, 3 do out[#out + 1] = st32(x[6 + i]) end
+	else
+		for i = 0, 15 do out[#out + 1] = st32((x[i] + y[i]) % M32) end
+	end
+	return concat(out)
+end
+local function hsalsa20(inp16, k) return core(inp16, k, true) end
+M.hsalsa20 = hsalsa20
+
+-- salsa20 stream with 8 byte nonce xored with m (counter from 0)
+local function salsa20_xor(m, n8, k)
+	local out, ctr, pos = {}, 0, 1
+	while pos <= #m do
+		local cb = {}
+		local c = ctr
+		for i = 1, 8 do cb[i] = char(c % 256) c = floor(c / 256) end
+		local ks = core(n8 .. concat(cb), k, false)
+		local chunk = m:sub(pos, pos + 63)
+		local o = {}
+		for i = 1, #chunk do o[i] = char(bxor(byte(chunk, i), byte(ks, i))) end
+		out[#out + 1] = concat(o)
+		pos, ctr = pos + 64, ctr + 1
+	end
+	return concat(out)
+end
+local function xsalsa20_xor(m, n24, k) return salsa20_xor(m, n24:sub(17, 24), hsalsa20(n24:sub(1, 16), k)) end
+M.xsalsa20_xor = xsalsa20_xor
+
+local MINUSP = { [0] = 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 252 }
+local function add1305(h, c)
+	local u = 0
+	for j = 0, 16 do
+		u = u + h[j] + c[j]
+		h[j] = u % 256
+		u = floor(u / 256)
+	end
+end
+local function poly1305(m, k) -- 16 byte tag
+	local r, h, c, x, g = {}, {}, {}, {}, {}
+	for j = 0, 16 do r[j], h[j] = 0, 0 end
+	for j = 0, 15 do r[j] = byte(k, j + 1) end
+	r[3] = r[3] % 16; r[4] = r[4] - r[4] % 4; r[7] = r[7] % 16; r[8] = r[8] - r[8] % 4
+	r[11] = r[11] % 16; r[12] = r[12] - r[12] % 4; r[15] = r[15] % 16
+	local pos, n = 1, #m
+	while n > 0 do
+		for j = 0, 16 do c[j] = 0 end
+		local j = 0
+		while j < 16 and j < n do c[j] = byte(m, pos + j) j = j + 1 end
+		c[j] = 1
+		pos, n = pos + j, n - j
+		add1305(h, c)
+		for i = 0, 16 do
+			local v = 0
+			for jj = 0, 16 do v = v + h[jj] * ((jj <= i) and r[i - jj] or 320 * r[i + 17 - jj]) end
+			x[i] = v
+		end
+		for i = 0, 16 do h[i] = x[i] end
+		local u = 0
+		for jj = 0, 15 do u = u + h[jj] h[jj] = u % 256 u = floor(u / 256) end
+		u = u + h[16] h[16] = u % 4
+		u = 5 * floor(u / 4)
+		for jj = 0, 15 do u = u + h[jj] h[jj] = u % 256 u = floor(u / 256) end
+		u = u + h[16] h[16] = u
+	end
+	for j = 0, 16 do g[j] = h[j] end
+	add1305(h, MINUSP)
+	if floor(h[16] / 128) % 2 == 1 then for j = 0, 16 do h[j] = g[j] end end
+	for j = 0, 15 do c[j] = byte(k, j + 17) end
+	c[16] = 0
+	add1305(h, c)
+	local o = {}
+	for j = 0, 15 do o[j + 1] = char(h[j]) end
+	return concat(o)
+end
+M.poly1305 = poly1305
+
+local ZERO16, ZERO32 = rep('\0', 16), rep('\0', 32)
+local function box_key(pk, sk) return hsalsa20(ZERO16, x25519(sk, pk)) end
+-- nacl secretbox: tag(16) .. ciphertext
+local function secretbox(m, n24, k)
+	local c = xsalsa20_xor(ZERO32 .. m, n24, k)
+	return poly1305(c:sub(33), c:sub(1, 32)) .. c:sub(33)
+end
+local function secretbox_open(b, n24, k)
+	if #b < 16 then return nil end
+	local tag, ct = b:sub(1, 16), b:sub(17)
+	local ks = xsalsa20_xor(ZERO32, n24, k)
+	local want = poly1305(ct, ks)
+	local diff = 0
+	for i = 1, 16 do diff = diff + (byte(tag, i) == byte(want, i) and 0 or 1) end
+	if diff ~= 0 then return nil end
+	return xsalsa20_xor(ZERO32 .. ct, n24, k):sub(33)
+end
+-- nacl box (compatible with Go golang.org/x/crypto/nacl/box Seal/Open)
+function M.box_seal(m, n24, pk, sk) return secretbox(m, n24, box_key(pk, sk)) end
+function M.box_open(b, n24, pk, sk) return secretbox_open(b, n24, box_key(pk, sk)) end
+
 -- ------------------------------------------------------------------ encodings
 local B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
 local B32R = {}
@@ -521,22 +682,35 @@ end
 local KP = {}
 KP.__index = KP
 
+local CKP = {} -- curve (x25519) key pair, ADR / nkeys xkeys
+CKP.__index = CKP
+M.XKEY_VERSION = 'xkv1'
+
 function M.from_seed(seed)
 	local raw, prefix = M.decode_seed(seed)
 	if not raw then return nil, prefix end
-	return setmetatable({ _seed = raw, _prefix = prefix, _encoded = seed:match('^%s*(.-)%s*$') }, KP)
+	local mt = (prefix == P.curve) and CKP or KP
+	return setmetatable({ _seed = raw, _prefix = prefix, _encoded = seed:match('^%s*(.-)%s*$') }, mt)
 end
 
--- create_pair(kind [, raw_seed]) kind: 'user' | 'account' | 'operator' | 'server' | 'cluster'
+local function random_bytes(n)
+	local f = io.open('/dev/urandom', 'rb')
+	if not f then return nil end
+	local r = f:read(n)
+	f:close()
+	return r
+end
+M.random_bytes = random_bytes
+
+-- create_pair(kind [, raw_seed]) kind: 'user' | 'account' | 'operator' | 'server' | 'cluster' | 'curve'
+-- ('curve' returns an x25519 key pair with seal/open, as nkeys CreateCurveKeys)
 -- raw_seed (32 bytes) is required unless /dev/urandom is readable.
 function M.create_pair(kind, raw)
 	local prefix = P[kind or 'user']
 	if not prefix or not PLETTER[prefix] then return nil, 'invalid key type' end
 	if not raw then
-		local f = io.open('/dev/urandom', 'rb')
-		if not f then return nil, 'no entropy source: pass a 32 byte seed' end
-		raw = f:read(32)
-		f:close()
+		raw = random_bytes(32)
+		if not raw then return nil, 'no entropy source: pass a 32 byte seed' end
 	end
 	if #raw ~= 32 then return nil, 'seed must be 32 bytes' end
 	return M.from_seed(M.encode_seed(prefix, raw))
@@ -554,6 +728,48 @@ function KP:public_key()
 end
 function KP:sign(data) return ed_sign(self._seed, data, self:raw_public()) end
 function KP:sign_nonce(nonce) return M.base64url(self:sign(nonce)) end
+
+-- curve key pairs: seed/public_key/type like KP, plus seal/open; no signing
+function CKP:seed() return self._encoded end
+function CKP:type() return 'curve' end
+function CKP:raw_public()
+	if not self._pk then self._pk = x25519(self._seed, BASE9) end
+	return self._pk
+end
+function CKP:public_key()
+	if not self._pub then self._pub = M.encode_public(P.curve, self:raw_public()) end
+	return self._pub
+end
+function CKP:private_key() return M.encode_public(P.private, self._seed) end -- 'P...' (nkeys PrivateKey)
+function CKP:sign() return nil, 'invalid curve key operation' end
+function CKP:sign_nonce() return nil, 'invalid curve key operation' end
+
+local function curve_public(s)
+	local raw, prefix = M.decode_public(s or '')
+	if not raw or prefix ~= P.curve or #raw ~= 32 then return nil end
+	return raw
+end
+
+-- seal(input, recipient_public [, nonce24]) -> 'xkv1' .. nonce .. box   (nkeys Seal)
+function CKP:seal(input, recipient, nonce)
+	local rpub = curve_public(recipient)
+	if not rpub then return nil, 'invalid recipient' end
+	nonce = nonce or random_bytes(24)
+	if not nonce then return nil, 'no entropy source: pass a 24 byte nonce' end
+	if #nonce ~= 24 then return nil, 'nonce must be 24 bytes' end
+	return M.XKEY_VERSION .. nonce .. M.box_seal(input, nonce, rpub, self._seed)
+end
+
+-- open(sealed, sender_public) -> plaintext | nil, err   (nkeys Open)
+function CKP:open(input, sender)
+	if type(input) ~= 'string' or #input <= 4 + 24 then return nil, 'invalid encrypted data' end
+	if input:sub(1, 4) ~= M.XKEY_VERSION then return nil, 'invalid encryption version' end
+	local spub = curve_public(sender)
+	if not spub then return nil, 'invalid sender' end
+	local plain = M.box_open(input:sub(29), input:sub(5, 28), spub, self._seed)
+	if not plain then return nil, 'could not decrypt' end
+	return plain
+end
 
 -- ------------------------------------------------------------------ creds / JWT (ADR-14)
 function M.parse_creds(content)
