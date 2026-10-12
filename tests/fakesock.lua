@@ -1,3 +1,5 @@
+-- Copyright (c) 2023-2026 Sam Orlando
+-- SPDX-License-Identifier: MIT (see LICENSE)
 -- Fake LuaSocket-compatible TCP object used by the unit tests and benchmarks.
 -- Mimics receive(pattern, prefix) semantics: '*l' strips CR, numeric patterns
 -- count the prefix, and a short read returns nil, 'timeout', partial.

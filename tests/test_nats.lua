@@ -1,3 +1,5 @@
+-- Copyright (c) 2023-2026 Sam Orlando
+-- SPDX-License-Identifier: MIT (see LICENSE)
 -- Unit tests for nats.lua using a fake socket (no network needed).
 -- usage: lua tests/test_nats.lua   (run from the repository root)
 package.path = "./?.lua;./tests/?.lua;" .. package.path

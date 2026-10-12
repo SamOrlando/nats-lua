@@ -1,3 +1,5 @@
+-- Copyright (c) 2023-2026 Sam Orlando
+-- SPDX-License-Identifier: MIT (see LICENSE)
 -- Integration tests against a live NATS server (JetStream enabled, no auth).
 -- usage: NATS_URL=nats://host:4222 lua tests/test_integration.lua
 -- Everything lives under the subject prefix nats-lua.test.<random>.> and the

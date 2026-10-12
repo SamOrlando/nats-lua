@@ -1,3 +1,5 @@
+-- Copyright (c) 2023-2026 Sam Orlando
+-- SPDX-License-Identifier: MIT (see LICENSE)
 -- helper for bench.lua: serves N pre-built MSG/HMSG frames, or sinks data
 local socket = require("socket")
 local port, kind, N = tonumber(arg[1]), arg[2], tonumber(arg[3])

@@ -1,3 +1,5 @@
+-- Copyright (c) 2023-2026 Sam Orlando
+-- SPDX-License-Identifier: MIT (see LICENSE)
 -- Micro-benchmarks for the parser and publish hot paths over a real loopback
 -- LuaSocket connection (a helper process feeds/sinks the bytes; no NATS server).
 -- usage: lua tests/bench.lua [N]      (NATS_MODULE=<module> to compare builds)
