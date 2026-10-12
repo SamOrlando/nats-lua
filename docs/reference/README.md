@@ -43,13 +43,15 @@ LUA_PATH="./?.lua;/path/to/lua-nuid/?.lua;;" lua tests/check_docs.lua
 | key pair | `nkeys.from_seed()`, `nkeys.create_pair()` | [nkeys](nats-nkeys.md#object-key-pair-kp) |
 | hasher | `sha256.new()` | [sha256](nats-sha256.md#object-hasher) |
 
-## API notes (known inconsistencies in 0.3.1)
+## API notes (known inconsistencies in 0.4.0)
 
 These are documented as the code behaves today; they are candidates for a
 future release. Fixed in 0.3.1: `stream:nextmsg` (now ADR-31 `next_by_subj`),
 `client:new_inbox()` (honours `inbox_prefix`), `consumer:stop()/drain()`
 (implemented), `nkeys.create_pair('curve')` (real x25519 xkeys with seal/open),
-KV/object store/counter reads on streams without `allow_direct`.
+KV/object store/counter reads on streams without `allow_direct`. Fixed in
+0.4.0: KV writes return the revision first and `kv:update` requires a revision
+(ADR-8 / nats.go); JSON numbers without a fraction are integers on Lua 5.3+.
 
 1. Error sentinels differ: most functions return `nil, err`, but
    `delete_stream`, `list_streams`, `stream:delete`, `purge`, `deletemsg`,
@@ -57,23 +59,19 @@ KV/object store/counter reads on streams without `allow_direct`.
    validation errors of `client:kvs` return `false, err`.
 2. `msg:clone(subject, data, reply, header, sid)`: `subject`/`sid` override the
    message, while `data`/`reply`/`header` are only fallbacks.
-3. `kv:put/update/create/delete` return the raw reply msg (`msg.revision`), not
-   a revision number; `kv:update(key, value, nil)` silently behaves like `put`.
-4. Revisions/sequences decoded from JSON are floats on Lua 5.3+ (`1.0`) when
-   lua-cjson is used.
-5. `nats.load_context()` returns a `jetstream` table that `nats.client()` drops
+3. `nats.load_context()` returns a `jetstream` table that `nats.client()` drops
    (not a valid option); pass its fields to `client:stream(..., opts)` yourself.
-6. `nats.connect_context()` returns `nil, err` for context errors but raises
+4. `nats.connect_context()` returns `nil, err` for context errors but raises
    for connection errors.
-7. `stream:counter_add(subject, delta)` takes no `opts` (the client method does).
-8. `sha256.hex(s)` hashes `s`; `nkeys.hex(s)` only hex-encodes `s`.
-9. `nats.micro.ping/info/stats` return `nil, 'no responders'` (not `{}`) when no
+5. `stream:counter_add(subject, delta)` takes no `opts` (the client method does).
+6. `sha256.hex(s)` hashes `s`; `nkeys.hex(s)` only hex-encodes `s`.
+7. `nats.micro.ping/info/stats` return `nil, 'no responders'` (not `{}`) when no
    service answers.
-10. `client:add_ticker()` returns the ticker table (the source comment says
+8. `client:add_ticker()` returns the ticker table (the source comment says
     "id"); `on_reconnect`/`off_reconnect` are exported although meant for
     internal use.
-11. `nats.jetstream.objs` is an alias of `nats.objs`; `max_chan_len` is accepted
+9. `nats.jetstream.objs` is an alias of `nats.objs`; `max_chan_len` is accepted
     but unused.
-12. `stream:getmsg/nextmsg/lastmsg` on a stream without `allow_direct` return the
+10. `stream:getmsg/nextmsg/lastmsg` on a stream without `allow_direct` return the
     raw `STREAM.MSG.GET` API reply (base64 payload); use `stream:get_stored` for
     a uniform message.

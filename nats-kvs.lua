@@ -244,53 +244,75 @@ function kvsm.get(kv, key, rev)
 	end
 	local h = m:headers()
 	if h['Nats-Subject'] and h['Nats-Subject'] ~= subject then return nil, 'key not found' end
-	local e = entry_from(kv, key, m, h, tonumber(h['Nats-Sequence']), h['Nats-Time-Stamp'], 0)
+	local e = entry_from(kv, key, m, h, nats.int(h['Nats-Sequence']), h['Nats-Time-Stamp'], 0)
 	if e.op ~= 'PUT' then return nil, 'key not found', e end
 	return e
 end
 function kvsm.get_revision(kv, key, rev) return kvsm.get(kv, key, rev) end
 
+local int = nats.int
+local WRONG_LAST = 10071 -- JSStreamWrongLastSequenceErr
+
+-- internal: publish to the bucket. Returns revision, reply msg (msg.ack, msg.revision)
+-- or nil, err, reply msg, api_error ('wrong last sequence' for expected revision mismatches)
 local function kv_publish(kv, key, value, header)
 	local m, err = cm.get(unwrap(kv.stream.client), kv.put_pre .. key, value,
 		header and next(header) and nats.encode_header(header) or nil)
 	if not m then return nil, err end
 	local ok, ack = pcall(decode, m.data)
-	if ok and type(ack) == 'table' then
-		if ack.error then return nil, ack.error.description or 'kv publish error', m, ack.error end
-		rawset(m, 'ack', ack)
-		rawset(m, 'revision', tonumber(ack.seq))
+	if not ok or type(ack) ~= 'table' then return nil, 'invalid pub ack', m end
+	if ack.error then
+		if tonumber(ack.error.err_code) == WRONG_LAST then return nil, 'wrong last sequence', m, ack.error end
+		return nil, ack.error.description or 'kv publish error', m, ack.error
 	end
-	return m
+	local rev = int(ack.seq)
+	rawset(m, 'ack', ack)
+	rawset(m, 'revision', rev)
+	return rev, m
 end
 
--- put/update(key, value [, expected_revision]) -> reply msg (msg.revision, msg.ack) or nil, err
-function kvsm.update(kv, key, value, rev)
+local function expect(rev) return { ['Nats-Expected-Last-Subject-Sequence'] = format('%d', rev) } end
+
+-- put(key, value) -> revision, reply msg | nil, err  (ADR-8 Put)
+function kvsm.put(kv, key, value)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
-	local header = rev and { ['Nats-Expected-Last-Subject-Sequence'] = tostring(floor(tonumber(rev))) } or nil
-	return kv_publish(kv, key, value, header)
+	return kv_publish(kv, key, value, nil)
 end
-function kvsm.put(kv, key, value) return kvsm.update(kv, key, value, nil) end
 
--- create(key, value [, {ttl=seconds}]) succeeds only if the key does not exist (or is deleted)
+-- update(key, value, last) -> revision, reply msg | nil, err  (ADR-8 Update: compare-and-set)
+-- last is required (0 = the key must have no stored message); a stale revision returns
+-- nil, 'wrong last sequence', reply msg, api_error
+function kvsm.update(kv, key, value, last)
+	if not valid_key_name(key) then return nil, 'invalid key name' end
+	local rev = tonumber(last)
+	if not rev or rev < 0 or rev ~= floor(rev) then return nil, 'revision required' end
+	return kv_publish(kv, key, value, expect(rev))
+end
+
+-- create(key, value [, {ttl=seconds}]) -> revision, reply msg | nil, 'key exists' | nil, err
+-- succeeds only if the key does not exist or its last entry is a delete/purge marker
 function kvsm.create(kv, key, value, opts)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
 	opts = type(opts) == 'table' and opts or {}
-	local header = { ['Nats-Expected-Last-Subject-Sequence'] = '0' }
+	local header = expect(0)
 	if opts.ttl then header['Nats-TTL'] = nats.jetstream.ttl_string(opts.ttl) end
-	local m, err, raw, apierr = kv_publish(kv, key, value, header)
-	if m then return m end
-	if apierr and tonumber(apierr.err_code) == 10071 then -- wrong last sequence: deleted key?
+	local rev, err, raw, apierr = kv_publish(kv, key, value, header)
+	if rev then return rev, err end
+	if err == 'wrong last sequence' then -- exists, or deleted: retry on top of the marker
 		local _, gerr, e = kvsm.get(kv, key)
 		if gerr == 'key not found' and e and e.op ~= 'PUT' then
-			header['Nats-Expected-Last-Subject-Sequence'] = tostring(e.revision)
-			return kv_publish(kv, key, value, header)
+			header['Nats-Expected-Last-Subject-Sequence'] = format('%d', e.revision)
+			local r2, e2, raw2, api2 = kv_publish(kv, key, value, header)
+			if r2 then return r2, e2 end
+			if e2 == 'wrong last sequence' then return nil, 'key exists', raw2, api2 end
+			return nil, e2, raw2, api2
 		end
-		return nil, 'key exists', raw
+		return nil, 'key exists', raw, apierr
 	end
-	return nil, err, raw
+	return nil, err, raw, apierr
 end
 
--- delete(key [, {revision=, purge=, ttl=}])
+-- delete(key [, {revision=, purge=, ttl=}]) -> true, reply msg | nil, err  (nats.go: error only)
 function kvsm.delete(kv, key, opts)
 	if not valid_key_name(key) then return nil, 'invalid key name' end
 	opts = type(opts) == 'table' and opts or {}
@@ -304,9 +326,12 @@ function kvsm.delete(kv, key, opts)
 	end
 	local rev = tonumber(opts.revision or opts.last_revision)
 	if rev and rev > 0 then header['Nats-Expected-Last-Subject-Sequence'] = format('%d', rev) end
-	return kv_publish(kv, key, nil, header)
+	local r, m, raw, apierr = kv_publish(kv, key, nil, header)
+	if not r then return nil, m, raw, apierr end
+	return true, m
 end
 
+-- purge(key [, {revision=, ttl=}]) -> true, reply msg | nil, err
 function kvsm.purge(kv, key, opts)
 	local o = {}
 	for k, v in pairs(type(opts) == 'table' and opts or {}) do o[k] = v end

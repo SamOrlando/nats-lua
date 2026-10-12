@@ -96,27 +96,42 @@ local e = kv:get('app.level'); if e then print(e.value, e.revision) end
 
 Same as `get(key, revision)`.
 
+Error convention for writes: runtime and argument errors are returned, never
+raised: `nil, err` (plus the reply `msg` and the JetStream `api_error` table
+when the server rejected the write). Revisions are integers on Lua 5.3+.
+
 ### kv:put(key, value)
 
-Returns: the pub ack reply msg with `msg.revision` (number) and `msg.ack`;
-`nil, 'invalid key name'`; `nil, description, msg, api_error`; `nil, 'timeout'`.
+ADR-8 Put. Returns: `revision, msg` (`msg` is the pub ack reply, with `msg.ack`
+and `msg.revision`); `nil, 'invalid key name'`; `nil, description, msg,
+api_error`; `nil, 'timeout'`. Changed in 0.4.0 (returned `msg` first).
 
 ```lua
-local r = assert(kv:put('app.level', '3')); print(r.revision)
+local rev = assert(kv:put('app.level', '3'))
 ```
 
-### kv:update(key, value, revision)
+### kv:update(key, value, last)
 
-Compare-and-set: succeeds only if the last revision of `key` is `revision`
-(`Nats-Expected-Last-Subject-Sequence`). With `revision = nil` it behaves like
-`put`. Returns like `put` (a wrong revision gives `nil, 'wrong last sequence: N',
-msg, api_error`).
+ADR-8 Update (compare-and-set): writes only if the last revision of `key` is
+`last` (sent as `Nats-Expected-Last-Subject-Sequence`; `0` = the key must have
+no stored message). `last` is required. Returns: `revision, msg`; `nil,
+'revision required'` when `last` is missing or not a non-negative integer;
+`nil, 'wrong last sequence', msg, api_error` (err_code 10071) for a stale
+revision; other errors like `put`. Changed in 0.4.0 (returned `msg`; a missing
+revision behaved like `put`).
+
+```lua
+local e = assert(kv:get('app.level'))
+local rev, err = kv:update('app.level', '4', e.revision)
+if err == 'wrong last sequence' then --[[ re-read and retry ]] end
+```
 
 ### kv:create(key, value, opts)
 
-Creates `key` only if it does not exist or its last entry is a delete/purge
-marker. `opts.ttl` (seconds or string): per key TTL (ADR-48, bucket needs
-`limit_marker_ttl`). Returns like `put`, or `nil, 'key exists', msg`.
+ADR-8 Create: writes `key` only if it does not exist or its last entry is a
+delete/purge marker (then it retries on top of the marker). `opts.ttl` (seconds
+or string): per key TTL (ADR-48, bucket needs `limit_marker_ttl`). Returns:
+`revision, msg`; `nil, 'key exists', msg, api_error`; other errors like `put`.
 
 ```lua
 kv:create('lock.job1', 'me', { ttl = 30 })
@@ -125,13 +140,14 @@ kv:create('lock.job1', 'me', { ttl = 30 })
 ### kv:delete(key, opts)
 
 Writes a `DEL` marker. `opts.revision` (or `last_revision`): expected last
-revision; `opts.purge = true` → `PURGE` with rollup; `opts.ttl` (with purge):
-marker TTL (ADR-48). Returns like `put`.
+revision (stale → `nil, 'wrong last sequence', msg, api_error`); `opts.purge =
+true` → `PURGE` with rollup; `opts.ttl` (with purge): marker TTL (ADR-48).
+Returns: `true, msg` or `nil, err` (nats.go `Delete` returns only an error).
 
 ### kv:purge(key, opts)
 
 `delete(key, {purge = true, ...})`: removes all history of `key`, leaving one
-`PURGE` marker.
+`PURGE` marker. Returns: `true, msg` or `nil, err`.
 
 ### kv:watch(keys, callback, opts)
 

@@ -18,7 +18,7 @@ local socket = require('socket')
 local nuid = require('nuid')
 
 local nats = {
-	_VERSION     = 'lua-nats-nx 0.3.1',
+	_VERSION     = 'lua-nats-nx 0.4.0',
 	_DESCRIPTION = 'Lua client for NATS w/ headers, tls, request/reply, JetStream - https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2023-2026 Sam Orlando - MIT',
 	--
@@ -197,6 +197,33 @@ do
 		json.null, json.backend = null, 'lua'
 	end
 end
+-- integers: on Lua 5.3+ JSON numbers without a fraction (sequences, revisions,
+-- counts) are returned as integers (lua-cjson decodes them as floats).
+local tointeger = math.tointeger
+local function int(v)
+	v = tonumber(v)
+	if v and tointeger then return tointeger(v) or v end
+	return v
+end
+nats.int = int
+if tointeger and json.backend == 'cjson' then
+	local cdecode = json.decode
+	local function fix(t, depth)
+		if depth > 64 then return end
+		for k, v in pairs(t) do
+			local tv = type(v)
+			if tv == 'number' then
+				local i = tointeger(v)
+				if i and v == v and v > -9007199254740993 and v < 9007199254740993 then t[k] = i end
+			elseif tv == 'table' then fix(v, depth + 1) end
+		end
+	end
+	function json.decode(s)
+		local v = cdecode(s)
+		if type(v) == 'table' then fix(v, 0) elseif type(v) == 'number' then v = tointeger(v) or v end
+		return v
+	end
+end
 nats.json = json
 local encode, decode = json.encode, json.decode
 
@@ -298,7 +325,7 @@ nats.client_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] end,
 	methods = {},
 	lang = 'lua',
-	version = '0.3.1',
+	version = '0.4.0',
 }
 local client_metatable = nats.client_metatable
 

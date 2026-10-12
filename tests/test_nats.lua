@@ -64,6 +64,16 @@ test("json codec (active backend) round trip", function()
     eq(t.a, 1); eq(t.b[3], 3); eq(t.c, "x\"y\n"); eq(t.d, true)
 end)
 
+test("integers: nats.int and json decode on Lua 5.3+", function()
+    eq(nats.int("7"), 7); eq(nats.int(2.5), 2.5); eq(nats.int("x"), nil)
+    local t = nats.json.decode('{"seq":12,"f":1.5,"n":{"a":[3]}}')
+    eq(t.seq, 12); eq(t.f, 1.5); eq(t.n.a[1], 3)
+    if math.type then
+        eq(math.type(nats.int(3.0)), "integer")
+        eq(math.type(t.seq), "integer"); eq(math.type(t.n.a[1]), "integer"); eq(math.type(t.f), "float")
+    end
+end)
+
 test("pure Lua json fallback", function()
     local saved = package.loaded.nats
     package.loaded.nats = nil

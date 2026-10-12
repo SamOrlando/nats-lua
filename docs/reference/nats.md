@@ -134,6 +134,12 @@ Returns: string — `$XDG_CONFIG_HOME/nats`, or `$HOME/.config/nats`.
 print(nats.context_dir())
 ```
 
+### nats.int(v)
+
+Returns: `tonumber(v)`, as an integer on Lua 5.3+ when it has no fraction
+(`math.tointeger`); `nil` for non numbers. On Lua 5.3+ `nats.json.decode` with
+lua-cjson also returns integers for such numbers (0.4.0).
+
 ### nats.create_inbox()
 
 Legacy module level inbox, not bound to a client's muxed request subscription.
