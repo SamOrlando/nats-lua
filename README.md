@@ -160,11 +160,11 @@ con:delete(); stream:delete()
 ```lua
 require("nats-kvs")
 local kv = nc:kvs({ bucket = "config", history = 5, ttl = 3600 })   -- ttl in seconds
-kv:put("app.level", "3")
+local rev = kv:put("app.level", "3")      -- revision (integer), reply msg | nil, err
 local e = kv:get("app.level")             -- {value=, revision=, op=, created=} | nil, "key not found"
-kv:update("app.level", "4", e.revision)   -- compare-and-set
-kv:create("app.once", "x")                -- fails if the key exists
-kv:delete("app.level"); kv:purge("app.once")
+rev = kv:update("app.level", "4", e.revision)   -- compare-and-set; nil, "wrong last sequence" if stale
+kv:create("app.once", "x")                -- revision | nil, "key exists"
+kv:delete("app.level"); kv:purge("app.once")   -- true, msg | nil, err
 local w = kv:watch("app.*", function(e) if e then print(e.key, e.value, e.op) end end,
     { include_history = false, ignore_deletes = false, meta_only = false, updates_only = false })
 w:wait_initial(5)                         -- pumps until the nil "initial values done" marker
@@ -336,6 +336,36 @@ lua tests/bench.lua 200000                                                # pars
 The unit tests (`tests/test_nats.lua`) drive the protocol through a fake
 socket (`tests/fakesock.lua`). The integration tests only use subjects under
 `nats-lua.test.<random>.>` and delete the streams and buckets they create.
+
+## Changes in 0.4.0 (breaking)
+
+KV writes follow ADR-8 / nats.go:
+
+| Call | 0.3.x | 0.4.0 |
+|---|---|---|
+| `kv:put(k, v)` | reply msg (`msg.revision`) | `revision, msg` |
+| `kv:create(k, v [, opts])` | reply msg | `revision, msg` / `nil, "key exists"` |
+| `kv:update(k, v, last)` | reply msg; `last = nil` acted like put | `revision, msg`; `last` required (`nil, "revision required"`), stale → `nil, "wrong last sequence", msg, api_error` |
+| `kv:delete(k [, opts])`, `kv:purge(k [, opts])` | reply msg | `true, msg` |
+
+Errors are returned (`nil, err`), never raised. On Lua 5.3+ numbers without a
+fraction decoded from JSON (sequences, revisions, counts, pub acks, stream and
+consumer info) are integers with lua-cjson too (before: floats such as `1.0`);
+`nats.int(v)` is the helper.
+
+Migration:
+
+```lua
+-- 0.3.x
+local m = kv:put("k", "v"); local rev = m.revision
+kv:update("k", "v2")                       -- silently a put
+-- 0.4.0
+local rev, m = kv:put("k", "v")            -- m.revision / m.ack still available
+kv:put("k", "v2")                          -- unconditional write
+local e = kv:get("k")
+local r, err = kv:update("k", "v3", e.revision)
+if not r and err == "wrong last sequence" then --[[ re-read and retry ]] end
+```
 
 ## Changes in 0.3.1
 
