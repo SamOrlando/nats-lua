@@ -1,4 +1,6 @@
-# nats-lua (lua-nats-nx)
+# nats-lua
+
+Not affiliated with the `lua-nats` package; this is an independent client built to the NATS ADR specs.
 
 A [NATS](https://nats.io) client written in plain Lua on top of LuaSocket. It runs on
 Lua 5.1, 5.2, 5.3, 5.4 and LuaJIT. It covers core NATS (pub/sub, queue groups,
@@ -27,7 +29,7 @@ From a clone:
 ```sh
 git clone https://github.com/SamOrlando/nats-lua.git
 cd nats-lua
-luarocks make rockspecs/nats-lua-0.4.1-1.rockspec
+luarocks make rockspecs/nats-lua-0.4.2-1.rockspec
 ```
 
 Or copy the `nats*.lua` files onto your `package.path` and install the
@@ -373,6 +375,12 @@ lua tests/bench.lua 200000                                                # pars
 The unit tests (`tests/test_nats.lua`) drive the protocol through a fake
 socket (`tests/fakesock.lua`). The integration tests only use subjects under
 `nats-lua.test.<random>.>` and delete the streams and buckets they create.
+
+## Changes in 0.4.2
+
+- `nats._VERSION` is now `'nats-lua 0.4.2'` (was `'lua-nats-nx 0.4.1'`); the
+  project is named nats-lua everywhere. The CONNECT `version` field is `0.4.2`.
+- No API changes.
 
 ## Changes in 0.4.1
 

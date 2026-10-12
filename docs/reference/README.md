@@ -1,5 +1,5 @@
 <!-- Copyright (c) 2023-2026 Sam Orlando. SPDX-License-Identifier: MIT -->
-# nats-lua API reference (v0.4.1)
+# nats-lua API reference (v0.4.2)
 
 Reference for the public API of every module, derived from the source. Start
 with [the pump model](nats.md#the-pump-model-threading): nothing happens in the

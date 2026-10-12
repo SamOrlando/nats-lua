@@ -8,7 +8,7 @@ Deprecated (15, 18, 52) and server-only ADRs (3, 12, 26, 28, 30, 38, 39, 41, 44,
 55, 56, 59, 61, 62).
 
 Legend: ✅ done, ◐ partial, ❌ missing, n/a = nothing for a client to do.
-The 0.3.0+ column also applies to 0.3.1, 0.4.0 and 0.4.1 (0.4.0 changed KV write return values, see the README).
+The 0.3.0+ column also applies to 0.3.1 and 0.4.x (0.4.0 changed KV write return values, see the README).
 
 | ADR | Title | Status | 0.2.0 | 0.3.0+ | Notes |
 |---|---|---|---|---|---|
