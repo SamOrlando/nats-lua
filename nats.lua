@@ -6,12 +6,19 @@
 -- Core client: connection handling, protocol parser, pub/sub, request/reply,
 -- headers, keepalive, reconnect and drain. Blocking LuaSocket I/O; messages are
 -- dispatched to callbacks while client:wait() (or a request) pumps the socket.
+--
+-- Single threaded model: everything "in the background" (reconnect attempts,
+-- publish buffering while reconnecting, keepalive PINGs, JetStream pull
+-- re-requests, idle heartbeat monitors, flow control replies, KV/object
+-- watchers, service endpoints) runs inside the pump loop, i.e. while the
+-- application is inside client:wait()/flush()/request(). Timers registered with
+-- client:add_ticker() fire from the same loop.
 
 local socket = require('socket')
 local nuid = require('nuid')
 
 local nats = {
-	_VERSION     = 'lua-nats-nx 0.2.0',
+	_VERSION     = 'lua-nats-nx 0.3.0',
 	_DESCRIPTION = 'Lua client for NATS w/ headers, tls, request/reply, JetStream - https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2023-2026 Sam Orlando - MIT',
 	--
@@ -291,7 +298,7 @@ nats.client_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] end,
 	methods = {},
 	lang = 'lua',
-	version = '0.2.0',
+	version = '0.3.0',
 }
 local client_metatable = nats.client_metatable
 
@@ -336,7 +343,8 @@ local valid_config = {
 	ping_interval = true, max_pings_out = true, validate_subjects = true, drain_timeout = true,
 	tls = true, tls_first = true, creds = true, signature_cb = true, inbox_prefix = true,
 	error_cb = true, disconnected_cb = true, reconnected_cb = true, closed_cb = true, lame_duck_cb = true,
-	max_chan_len = true,
+	max_chan_len = true, reconnect_buf_size = true, discovered_servers_cb = true, nkey_seed = true,
+	nkey_file = true, resolve_all = true, ws_mask = true, ws_headers = true,
 }
 nats.valid_config = valid_config
 
@@ -372,6 +380,8 @@ local function create_client(config, n_opts)
 		inbox_prefix = d.inbox_prefix,
 		error_cb = d.error_cb, disconnected_cb = d.disconnected_cb, reconnected_cb = d.reconnected_cb,
 		closed_cb = d.closed_cb, lame_duck_cb = d.lame_duck_cb, reconnect_delay_cb = d.reconnect_delay_cb,
+		reconnect_buf_size = dflt('reconnect_buf_size', 8 * 1024 * 1024),
+		discovered_servers_cb = d.discovered_servers_cb, resolve_all = dflt('resolve_all', true),
 	}
 	for k, v in pairs(config or {}) do cfg[k] = v end
 
@@ -407,6 +417,9 @@ local function create_client(config, n_opts)
 		_partial = false,
 		_pend = false,
 		_to = false,
+		_rc = false,       -- reconnect state while disconnected
+		_tickers = {},
+		_rc_hooks = {},   -- internal reconnect listeners (JetStream consumers)
 	}, client_metatable)
 	return client
 end
@@ -453,16 +466,211 @@ function nats.socket_factory(srv, cfg)
 		if not cok then s:close() return nil, 'could not connect to ' .. srv.path .. ' [' .. tostring(err) .. ']' end
 		return s
 	end
-	local s, err = socket.tcp()
-	if not s then return nil, err end
-	s:settimeout(timeout)
-	local cok, cerr = s:connect(srv.host, srv.port)
-	if not cok then
-		s:close()
-		return nil, 'could not connect to ' .. srv.host .. ':' .. srv.port .. ' [' .. tostring(cerr) .. ']'
+	-- ADR-11: resolve the host name and try every address (randomized unless no_randomize)
+	local addrs = { srv.host }
+	if cfg.resolve_all ~= false and not match(srv.host, '^[%d%.]+$') and not find(srv.host, ':', 1, true) then
+		local ok, info = pcall(socket.dns.getaddrinfo, srv.host)
+		if ok and type(info) == 'table' and #info > 0 then
+			addrs = {}
+			local seen = {}
+			for _, a in ipairs(info) do
+				if a.addr and not seen[a.addr] and (a.family == 'inet' or a.family == 'inet6') then
+					seen[a.addr] = true
+					addrs[#addrs + 1] = a.addr
+				end
+			end
+			if #addrs == 0 then addrs = { srv.host } end
+			if #addrs > 1 and not cfg.no_randomize then
+				for i = #addrs, 2, -1 do local j = random(i) addrs[i], addrs[j] = addrs[j], addrs[i] end
+			end
+		end
 	end
-	if cfg.tcp_nodelay ~= nil then s:setoption('tcp-nodelay', cfg.tcp_nodelay and true or false) end
-	return s
+	local cerr
+	for _, addr in ipairs(addrs) do
+		local s, err = (find(addr, ':', 1, true) and socket.tcp6 or socket.tcp)()
+		if not s then return nil, err end
+		s:settimeout(timeout)
+		local cok, e = s:connect(addr, srv.port)
+		if cok then
+			if cfg.tcp_nodelay ~= nil then s:setoption('tcp-nodelay', cfg.tcp_nodelay and true or false) end
+			if srv.ws then return nats.websocket_wrap(s, srv, cfg, timeout) end
+			return s
+		end
+		s:close()
+		cerr = e
+	end
+	return nil, 'could not connect to ' .. srv.host .. ':' .. srv.port .. ' [' .. tostring(cerr) .. ']'
+end
+
+-- ---------------------------------------------------------------------------
+-- WebSocket transport (ws:// and wss://). Wraps a LuaSocket TCP object into an
+-- object with the same send/receive/settimeout/close interface; NATS protocol
+-- bytes travel in binary frames. Client frames use a zero mask key unless
+-- ws_mask = true (random keys, slower in pure Lua).
+-- ---------------------------------------------------------------------------
+local WS = {}
+WS.__index = WS
+local ws_xor
+local function ws_mask_payload(data, key)
+	if not ws_xor then
+		ws_xor = require('nats-sha256')._bxor
+	end
+	local out, k = {}, { byte(key, 1, 4) }
+	for i = 1, #data do out[i] = char(ws_xor(byte(data, i), k[(i - 1) % 4 + 1])) end
+	return concat(out)
+end
+local function ws_frame(op, data, mask)
+	local n = #data
+	local hdr
+	if n < 126 then hdr = char(0x80 + op, 0x80 + n)
+	elseif n < 65536 then hdr = char(0x80 + op, 0x80 + 126, floor(n / 256), n % 256)
+	else
+		local b = {}
+		local v = n
+		for i = 8, 1, -1 do b[i] = v % 256 v = floor(v / 256) end
+		hdr = char(0x80 + op, 0x80 + 127) .. char(unpack(b))
+	end
+	if mask then
+		local key = char(random(0, 255), random(0, 255), random(0, 255), random(0, 255))
+		return hdr .. key .. ws_mask_payload(data, key)
+	end
+	return hdr .. '\0\0\0\0' .. data
+end
+nats.ws_frame = ws_frame
+
+function WS:settimeout(t) self.timeout = t return self.sock:settimeout(t) end
+function WS:setoption(...) if self.sock.setoption then return self.sock:setoption(...) end end
+function WS:close() return self.sock:close() end
+function WS:shutdown() if self.sock.shutdown then return self.sock:shutdown() end end
+function WS:dirty() return #self.buf > 0 or (self.sock.dirty and self.sock:dirty()) end
+function WS:getfd() return self.sock.getfd and self.sock:getfd() end
+function WS:send(data, i)
+	i = i or 1
+	if i > 1 then data = sub(data, i) end
+	local f = ws_frame(2, data, self.mask)
+	local j = 1
+	while j <= #f do
+		local last, err, partial = self.sock:send(f, j)
+		if last then break end
+		if err ~= 'timeout' or not partial or partial < j then return nil, err, (i - 1) end
+		j = partial + 1
+	end
+	return #data + i - 1
+end
+-- decode complete frames from self.raw into self.buf
+function WS:decode()
+	local raw = self.raw
+	while true do
+		local n = #raw
+		if n < 2 then break end
+		local b1, b2 = byte(raw, 1, 2)
+		local op, len, pos = b1 % 16, b2 % 128, 3
+		if len == 126 then
+			if n < 4 then break end
+			len = byte(raw, 3) * 256 + byte(raw, 4)
+			pos = 5
+		elseif len == 127 then
+			if n < 10 then break end
+			len = 0
+			for k = 3, 10 do len = len * 256 + byte(raw, k) end
+			pos = 11
+		end
+		local masked = b2 >= 128
+		local key
+		if masked then
+			if n < pos + 3 then break end
+			key = sub(raw, pos, pos + 3)
+			pos = pos + 4
+		end
+		if n < pos + len - 1 then break end
+		local payload = sub(raw, pos, pos + len - 1)
+		if masked then payload = ws_mask_payload(payload, key) end
+		raw = sub(raw, pos + len)
+		if op == 0 or op == 1 or op == 2 then self.buf = self.buf .. payload
+		elseif op == 8 then self.closed = true
+		elseif op == 9 then self.sock:send(ws_frame(10, payload, self.mask))
+		end
+	end
+	self.raw = raw
+end
+function WS:fill()
+	-- block (up to the socket timeout) for one byte, then take whatever else is buffered
+	local first, err = self.sock:receive(1)
+	if not first then
+		if err == 'timeout' or err == 'wantread' then return nil, 'timeout' end
+		return nil, err
+	end
+	self.sock:settimeout(0)
+	local data, _, partial = self.sock:receive(65536)
+	self.sock:settimeout(self.timeout)
+	local got = first .. (data or partial or '')
+	if got ~= '' then
+		self.raw = self.raw .. got
+		self:decode()
+		return true
+	end
+	if err and err ~= 'timeout' and err ~= 'wantread' then return nil, err end
+	return nil, 'timeout'
+end
+function WS:receive(pat, prefix)
+	if prefix and prefix ~= '' then self.buf = prefix .. self.buf end
+	while true do
+		local buf = self.buf
+		if pat == '*l' then
+			local e = find(buf, '\n', 1, true)
+			if e then
+				self.buf = sub(buf, e + 1)
+				return (gsub(sub(buf, 1, e - 1), '\r', ''))
+			end
+		elseif type(pat) == 'number' and #buf >= pat then
+			self.buf = sub(buf, pat + 1)
+			return sub(buf, 1, pat)
+		end
+		if self.closed then return nil, 'closed', '' end
+		local ok, err = self:fill()
+		if not ok and err ~= 'timeout' then return nil, err, '' end
+		if not ok then return nil, 'timeout', '' end
+	end
+end
+
+function nats.websocket_wrap(s, srv, cfg, timeout)
+	if srv.tls then
+		local ts, terr = tls_wrap(s, cfg, srv.host, timeout)
+		if not ts then s:close() return nil, terr end
+		s = ts
+	end
+	local key = {}
+	for i = 1, 16 do key[i] = char(random(0, 255)) end
+	local b64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+	local k, enc = concat(key), {}
+	for i = 1, 16, 3 do
+		local a, b, c = byte(k, i, i + 2)
+		local v = a * 65536 + (b or 0) * 256 + (c or 0)
+		for j = 0, 3 do
+			if j <= (c and 3 or b and 2 or 1) then
+				local x = floor(v / 2 ^ (18 - 6 * j)) % 64
+				enc[#enc + 1] = sub(b64, x + 1, x + 1)
+			else enc[#enc + 1] = '=' end
+		end
+	end
+	local req = { 'GET ' .. (srv.ws_path or '/') .. ' HTTP/1.1', 'Host: ' .. srv.host .. ':' .. srv.port,
+		'Upgrade: websocket', 'Connection: Upgrade', 'Sec-WebSocket-Key: ' .. concat(enc),
+		'Sec-WebSocket-Version: 13' }
+	for hk, hv in pairs(cfg.ws_headers or {}) do req[#req + 1] = hk .. ': ' .. hv end
+	req[#req + 1] = ''
+	req[#req + 1] = ''
+	local ok, err = s:send(concat(req, '\r\n'))
+	if not ok then s:close() return nil, 'websocket handshake failed: ' .. tostring(err) end
+	local status = s:receive('*l')
+	if not status or not find(status, '^HTTP/1%.1 101') then
+		s:close()
+		return nil, 'websocket upgrade refused: ' .. tostring(status)
+	end
+	repeat
+		local line = s:receive('*l')
+		if not line then s:close() return nil, 'websocket handshake truncated' end
+	until line == ''
+	return setmetatable({ sock = s, buf = '', raw = '', mask = cfg.ws_mask and true or false }, WS)
 end
 
 -- send everything; returns true or nil, err
@@ -589,14 +797,20 @@ local function parse_url(u, default_port)
 	if not scheme then rest = u end
 	local userinfo, hostport = match(rest, '^(.*)@([^@]*)$')
 	if not userinfo then hostport = rest end
-	hostport = match(hostport, '^([^/]*)')
+	local path
+	hostport, path = match(hostport, '^([^/]*)(.*)$')
 	local host, port = match(hostport, '^%[(.-)%]:?(%d*)$')
 	if not host then
 		host, port = match(hostport, '^([^:]*):?(%d*)$')
 	end
 	local srv = { url = u, host = (host and host ~= '') and host or '127.0.0.1',
 		port = tonumber(port) or default_port or 4222, attempts = 0 }
-	if scheme == 'tls' then srv.tls = true end
+	if scheme == 'tls' or scheme == 'wss' then srv.tls = true end
+	if scheme == 'ws' or scheme == 'wss' then
+		srv.ws = true
+		srv.ws_path = (path and path ~= '') and path or '/'
+		if not tonumber(port) then srv.port = default_port or (scheme == 'wss' and 443 or 80) end
+	end
 	if userinfo then
 		local user, pass = match(userinfo, '^([^:]*):(.*)$')
 		if user then srv.user, srv.pass = user, pass else srv.token = userinfo end
@@ -637,7 +851,7 @@ end
 local function merge_discovered(client, urls)
 	if client.config.ignore_discovered_servers or type(urls) ~= 'table' then return end
 	local pool = client.servers
-	local known = {}
+	local known, added = {}, false
 	for _, s in ipairs(pool) do known[s.host .. ':' .. s.port] = true end
 	for _, u in ipairs(urls) do
 		local s = parse_url(u)
@@ -646,8 +860,11 @@ local function merge_discovered(client, urls)
 			s.discovered = true
 			known[key] = true
 			pool[#pool + 1] = s
+			added = true
 		end
 	end
+	local cb = client.config.discovered_servers_cb
+	if added and cb then pcall(cb, client) end
 end
 
 -- ---------------------------------------------------------------------------
@@ -665,8 +882,8 @@ local function read_creds(creds)
 		content = f:read('*a')
 		f:close()
 	end
-	local jwt = match(content, '%-%-%-%-%-BEGIN NATS USER JWT%-%-%-%-%-%s*([^%s%-]+)')
-	local seed = match(content, '%-%-%-%-%-BEGIN USER NKEY SEED%-%-%-%-%-%s*([^%s%-]+)')
+	local jwt = match(content, '%-%-%-%-%-BEGIN NATS USER JWT%-%-%-%-%-%s*([^%s]+)')
+	local seed = match(content, '%-%-%-%-%-BEGIN USER NKEY SEED%-%-%-%-%-%s*([^%s]+)')
 	if not jwt then return nil, 'creds: user JWT not found' end
 	return jwt, seed
 end
@@ -681,17 +898,47 @@ local function build_connect(client, srv, info)
 	if srv.user then ct.user, ct.pass = srv.user, srv.pass end
 	if srv.token then ct.auth_token = srv.token end
 	if (srv.tls or cfg.tls_required) then ct.tls_required = true end
+	local function builtin_sign(seed, nonce)
+		local kp = rawget(client, '_kp')
+		if not kp or kp._encoded ~= seed then
+			local nkeys = require('nats-nkeys')
+			local err
+			kp, err = nkeys.from_seed(seed)
+			if not kp then return nil, 'invalid nkey seed: ' .. tostring(err) end
+			rawset(client, '_kp', kp)
+		end
+		return kp:sign_nonce(nonce), kp
+	end
 	if cfg.creds then
 		local jwt, seed = read_creds(cfg.creds)
 		if not jwt then return nil, seed end
 		ct.jwt = jwt
 		if info.nonce then
-			if not cfg.signature_cb then return nil, 'creds auth requires a signature_cb(nonce, seed) (ed25519 signer)' end
-			ct.sig = cfg.signature_cb(info.nonce, seed)
+			if cfg.signature_cb then ct.sig = cfg.signature_cb(info.nonce, seed)
+			elseif seed then
+				local sig, kerr = builtin_sign(seed, info.nonce)
+				if not sig then return nil, kerr end
+				ct.sig = sig
+			else return nil, 'creds file without nkey seed' end
 		end
-	elseif cfg.nkey and info.nonce and not cfg.sig then
-		if not cfg.signature_cb then return nil, 'nkey auth requires a signature_cb(nonce) (ed25519 signer)' end
-		ct.sig = cfg.signature_cb(info.nonce)
+	else
+		local seed = cfg.nkey_seed
+		if not seed and cfg.nkey_file then
+			local f, ferr = io.open(cfg.nkey_file, 'rb')
+			if not f then return nil, 'cannot read nkey file: ' .. tostring(ferr) end
+			seed = match(f:read('*a'), '(S[A-Z2-7]+)')
+			f:close()
+		end
+		if not seed and type(cfg.nkey) == 'string' and sub(cfg.nkey, 1, 1) == 'S' then seed = cfg.nkey end
+		if seed then
+			local sig, kp = builtin_sign(seed, info.nonce or '')
+			if not sig then return nil, kp end
+			if not cfg.jwt then ct.nkey = kp:public_key() end
+			if info.nonce then ct.sig = sig end
+		elseif (cfg.nkey or cfg.jwt) and info.nonce and not cfg.sig then
+			if not cfg.signature_cb then return nil, 'nkey auth requires a signature_cb(nonce) or nkey_seed' end
+			ct.sig = cfg.signature_cb(info.nonce)
+		end
 	end
 	return 'CONNECT ' .. encode(ct) .. CRLF
 end
@@ -775,61 +1022,136 @@ local function backoff(client, attempt, srv)
 	return base + random() * (jitter or 0)
 end
 
-local function do_reconnect(client, reason)
+-- Reconnect state machine (ADR-40). While disconnected, client._rc holds the
+-- server order, attempt counter, next attempt time and the publish buffer.
+-- Attempts run from the pump loop (non blocking for the caller) or blocking via
+-- client:reconnect(). Publishes are buffered up to reconnect_buf_size bytes and
+-- flushed right after the subscriptions are restored.
+local function begin_reconnect(client, reason)
 	local cfg = client.config
-	rawset(client, 'reconnecting', true)
 	close_socket(client)
-	if cfg.disconnected_cb then pcall(cfg.disconnected_cb, client, reason) end
-	local pool = client.servers or build_pool(client)
-	-- try other servers first, the one we just lost last
-	local cur = client.current_server
-	local order = {}
-	for _, s in ipairs(pool) do if s ~= cur then order[#order + 1] = s end end
-	if not cfg.no_randomize then shuffle(order) end
-	if cur then order[#order + 1] = cur end
+	local rc = rawget(client, '_rc')
+	if not rc then
+		local pool = client.servers or build_pool(client)
+		local cur = client.current_server
+		local order = {}
+		for _, s in ipairs(pool) do if s ~= cur then order[#order + 1] = s end end
+		if not cfg.no_randomize then shuffle(order) end
+		if cur then order[#order + 1] = cur end
+		if #order == 0 then order[1] = cur end
+		rc = { order = order, attempt = 0, next_at = 0, max = cfg.max_reconnect or 60,
+			pend = {}, pend_size = 0, last_err = reason }
+		rawset(client, '_rc', rc)
+		rawset(client, 'reconnecting', true)
+		if cfg.disconnected_cb then pcall(cfg.disconnected_cb, client, reason) end
+	end
+	return rc
+end
 
-	local max = cfg.max_reconnect or 60
-	local attempt, last_err = 0, reason
-	while max < 0 or attempt < max * #order do
-		for _, srv in ipairs(order) do
-			if max >= 0 and attempt >= max * #order then break end
-			if attempt >= #order then sleep(backoff(client, floor(attempt / #order), srv)) end
-			attempt = attempt + 1
-			srv.attempts = (srv.attempts or 0) + 1
-			local ok, err = connect_once(client, srv)
-			if ok then
-				rawset(client, 'reconnecting', false)
-				client.stats.reconnects = client.stats.reconnects + 1
-				if cfg.reconnected_cb then pcall(cfg.reconnected_cb, client) end
-				return true
-			end
-			last_err = err
+local function rc_flush(client, rc)
+	if #rc.pend == 0 then return true end
+	local data = concat(rc.pend)
+	local ok = raw_send(client, data)
+	if ok then
+		client.stats.out_bytes = client.stats.out_bytes + #data
+		rc.pend, rc.pend_size = {}, 0
+		return true
+	end
+	rc.pend = { data }
+	return false
+end
+
+-- performs the reconnect attempts that are due; block = sleep until the next one.
+-- returns true once connected, false if still waiting; raises when giving up.
+local function rc_step(client, block)
+	local rc = rawget(client, '_rc')
+	if not rc then return client.connected end
+	local cfg = client.config
+	while true do
+		local now = gettime()
+		if now < rc.next_at then
+			if not block then return false end
+			sleep(rc.next_at - now)
+		end
+		local order = rc.order
+		local n = #order
+		local srv = order[rc.attempt % n + 1]
+		rc.attempt = rc.attempt + 1
+		srv.attempts = (srv.attempts or 0) + 1
+		local ok, err = connect_once(client, srv)
+		if ok and rc_flush(client, rc) then
+			rawset(client, '_rc', false)
+			rawset(client, 'reconnecting', false)
+			client.stats.reconnects = client.stats.reconnects + 1
+			for _, h in ipairs(client._rc_hooks) do pcall(h, client) end
+			if cfg.reconnected_cb then pcall(cfg.reconnected_cb, client) end
+			return true
+		end
+		if ok then close_socket(client) err = 'flush of reconnect buffer failed' end
+		rc.last_err = err
+		if rc.max >= 0 and rc.attempt >= rc.max * n then
+			rawset(client, '_rc', false)
+			rawset(client, 'reconnecting', false)
+			rawset(client, 'closed', true)
+			if cfg.closed_cb then pcall(cfg.closed_cb, client) end
+			client.error('connection error: reconnect failed (' .. tostring(err) .. ')', 3)
+		end
+		if rc.attempt >= n then
+			rc.next_at = gettime() + backoff(client, floor(rc.attempt / n), order[rc.attempt % n + 1])
 		end
 	end
-	rawset(client, 'reconnecting', false)
-	rawset(client, 'closed', true)
-	if cfg.closed_cb then pcall(cfg.closed_cb, client) end
-	client.error('connection error: reconnect failed (' .. tostring(last_err) .. ')', 3)
 end
 
--- network failure: reconnect if enabled, otherwise raise
+local function buffering(client)
+	local b = client.config.reconnect_buf_size
+	return b and b > 0
+end
+
+local function do_reconnect(client, reason)
+	begin_reconnect(client, reason)
+	return rc_step(client, true)
+end
+
+-- network failure: reconnect if enabled, otherwise raise. Returns true when
+-- connected again, false when the reconnect continues from the pump loop.
 local function io_failure(client, err)
 	close_socket(client)
-	if client.closed or not client.config.reconnect or client.reconnecting then
+	if client.closed or not client.config.reconnect then
 		client.error('connection error: ' .. tostring(err), 3)
 	end
-	report(client, 'disconnected: ' .. tostring(err))
-	return do_reconnect(client, err)
+	if not rawget(client, '_rc') then report(client, 'disconnected: ' .. tostring(err)) end
+	begin_reconnect(client, err)
+	return rc_step(client, not buffering(client))
 end
 
-local function network_write(client, buffer)
+-- is_pub: PUB/HPUB data that may be buffered while reconnecting. Control lines
+-- (SUB/UNSUB/PING/PONG) are not buffered: subscriptions are restored from the
+-- subscription table after a reconnect.
+local function network_write(client, buffer, is_pub, retried)
+	if not client.connected then
+		local rc = rawget(client, '_rc')
+		if not rc then
+			if client.closed or not client.config.reconnect then client.error('not connected', 3) end
+			io_failure(client, 'not connected')
+			return network_write(client, buffer, is_pub, true)
+		end
+		if not is_pub then return end
+		if buffering(client) then
+			if rc.pend_size + #buffer > client.config.reconnect_buf_size then
+				client.error('reconnect buffer exceeded (' .. client.config.reconnect_buf_size .. ' bytes)', 3)
+			end
+			rc.pend[#rc.pend + 1] = buffer
+			rc.pend_size = rc.pend_size + #buffer
+			return
+		end
+		rc_step(client, true)
+	end
 	if nats.verbose then print('->> ' .. sub(buffer, 1, -3)) end
 	local ok, err = raw_send(client, buffer)
 	if not ok then
-		if err == 'not connected' and not client.config.reconnect then client.error('not connected', 3) end
+		if retried then client.error('connection error: ' .. tostring(err), 3) end
 		io_failure(client, err)
-		ok, err = raw_send(client, buffer)
-		if not ok then client.error('connection error: ' .. tostring(err), 3) end
+		return network_write(client, buffer, is_pub, true)
 	end
 	client.stats.out_bytes = client.stats.out_bytes + #buffer
 end
@@ -907,6 +1229,44 @@ function cm.set_server_pool(client, servers)
 end
 
 function cm.is_connected(client) return unwrap(client).connected == true end
+function cm.is_reconnecting(client) return rawget(unwrap(client), '_rc') and true or false end
+-- bytes of publishes buffered while reconnecting
+function cm.buffered(client)
+	local rc = rawget(unwrap(client), '_rc')
+	return rc and rc.pend_size or 0
+end
+-- ADR-40 connection status: 'connected' | 'reconnecting' | 'closed' | 'disconnected'
+function cm.status_string(client)
+	local nc = unwrap(client)
+	if nc.connected then return 'connected' end
+	if rawget(nc, '_rc') then return 'reconnecting' end
+	if nc.closed then return 'closed' end
+	return 'disconnected'
+end
+
+-- timers driven by the pump loop: add_ticker(interval_seconds, fn(client, now)) -> id
+-- fn returning false removes the ticker.
+function cm.add_ticker(client, interval, fn)
+	local nc = unwrap(client)
+	local t = { interval = interval, fn = fn, due = gettime() + interval }
+	local list = nc._tickers
+	list[#list + 1] = t
+	return t
+end
+-- internal: fn(client) is called after every successful reconnect
+function cm.on_reconnect(client, fn)
+	local l = unwrap(client)._rc_hooks
+	l[#l + 1] = fn
+	return fn
+end
+function cm.off_reconnect(client, fn)
+	local l = unwrap(client)._rc_hooks
+	for i = #l, 1, -1 do if l[i] == fn then table.remove(l, i) end end
+end
+function cm.remove_ticker(client, t)
+	local list = unwrap(client)._tickers
+	for i = #list, 1, -1 do if list[i] == t then table.remove(list, i) end end
+end
 
 -- ---------------------------------------------------------------------------
 -- Inbox / request-reply (new style muxed inbox)
@@ -999,7 +1359,7 @@ function cm.publish(client, subject, data, reply, header)
 	end
 	if header ~= nil and nc.config.headers == false then nc.error('headers are disabled on this connection', 2) end
 	local buf = msg_string(nc, subject, data, reply, header)
-	network_write(nc, buf)
+	network_write(nc, buf, true)
 	nc.stats.out_msgs = nc.stats.out_msgs + 1
 	return create_msg(subject, data, reply, header, client)
 end
@@ -1112,6 +1472,7 @@ local function handle_info(nc, data)
 end
 
 local function send_ping(nc)
+	if not nc.connected then return end
 	network_write(nc, 'PING\r\n')
 	rawset(nc, 'pings_sent', nc.pings_sent + 1)
 	rawset(nc, 'last_ping', gettime())
@@ -1132,6 +1493,23 @@ local function maintain(nc, now, rt)
 		end
 		local left = due - now
 		if not rt or left < rt then rt = left end
+	end
+	local tk = nc._tickers
+	if #tk > 0 then
+		for i = #tk, 1, -1 do
+			local t = tk[i]
+			if t and now >= t.due then
+				t.due = now + t.interval
+				local ok, r = pcall(t.fn, nc, now)
+				if not ok then report(nc, 'ticker error: ' .. tostring(r))
+				elseif r == false then table.remove(tk, i) end
+			end
+		end
+		for i = 1, #tk do
+			local left = tk[i].due - now
+			if left < 0 then left = 0 end
+			if not rt or left < rt then rt = left end
+		end
 	end
 	if now - nc.last_sweep > 1 then
 		rawset(nc, 'last_sweep', now)
@@ -1204,19 +1582,30 @@ local function pump(client, deadline, stop)
 			end
 			rt = maintain(nc, now, rt)
 		end
-		if not nc.connected then
-			if nc.closed or not nc.config.reconnect then nc.error('connection error: not connected', 3) end
-			io_failure(nc, 'not connected')
-		end
-		local op, err = response_read(nc, rt)
-		if op then
-			local res, msg = process(nc, client, op)
-			if stop(msg, op) then
-				if res == nil then return true end
-				return res
+		local up = nc.connected
+		if not up then
+			if rawget(nc, '_rc') then up = rc_step(nc, false)
+			elseif nc.closed or not nc.config.reconnect then nc.error('connection error: not connected', 3)
+			else up = io_failure(nc, 'not connected') end
+			if not up then -- wait for the next reconnect attempt (or the deadline / a ticker)
+				burst = 0
+				local rc = rawget(nc, '_rc')
+				local w = rc and (rc.next_at - gettime()) or 0
+				if rt and rt < w then w = rt end
+				if w > 0 then sleep(w) end
 			end
-		elseif err ~= 'timeout' then
-			io_failure(nc, err)
+		end
+		if up then
+			local op, err = response_read(nc, rt)
+			if op then
+				local res, msg = process(nc, client, op)
+				if stop(msg, op) then
+					if res == nil then return true end
+					return res
+				end
+			elseif err ~= 'timeout' then
+				io_failure(nc, err)
+			end
 		end
 	end
 end
@@ -1243,11 +1632,26 @@ function cm.wait(client, opts)
 end
 
 -- flush: PING and process traffic until the matching PONG (true) or timeout (false)
+local function await_connected(nc, deadline)
+	while not nc.connected do
+		if not rawget(nc, '_rc') then return false end
+		if rc_step(nc, false) then return true end
+		local w = nc._rc and (nc._rc.next_at - gettime()) or 0
+		if deadline and deadline - gettime() < w then w = deadline - gettime() end
+		if deadline and w <= 0 and gettime() >= deadline then return false end
+		if w > 0 then sleep(w) end
+	end
+	return true
+end
+
 function cm.flush(client, timeout)
 	local nc = unwrap(client)
+	local t = parse_timeout(timeout or nc.config.timeout)
+	if not nc.connected and rawget(nc, '_rc') then
+		if not await_connected(nc, t and gettime() + t) then return false end
+	end
 	send_ping(nc)
 	local target = nc.pings_sent
-	local t = parse_timeout(timeout or nc.config.timeout)
 	if nc.pongs_received >= target then return true end
 	local r = pump(client, t and gettime() + t, function(_, op)
 		return op == OP_PONG and nc.pongs_received >= target
@@ -1294,8 +1698,10 @@ end
 
 function cm.close(client)
 	local nc = unwrap(client)
-	local was = nc.socket ~= false
+	local was = nc.socket ~= false or rawget(nc, '_rc')
 	rawset(nc, 'closed', true)
+	rawset(nc, '_rc', false)
+	rawset(nc, 'reconnecting', false)
 	close_socket(nc)
 	if was and nc.config.closed_cb then pcall(nc.config.closed_cb, nc) end
 end
@@ -1439,6 +1845,158 @@ function ec.poll(client, subject, callback, data, header, wait, count)
 			report(client.client, 'encoded poll callback error: ' .. tostring(r))
 		end,
 		ec_encode_data(client, data), ec_encode_header(client, header), wait, count)
+end
+
+
+-- ---------------------------------------------------------------------------
+-- Well known headers and status codes (ADR-4, ADR-9, ADR-13, ADR-31, ADR-43, ADR-50)
+-- ---------------------------------------------------------------------------
+nats.headers = {
+	MSG_ID = 'Nats-Msg-Id',
+	EXPECTED_STREAM = 'Nats-Expected-Stream',
+	EXPECTED_LAST_SEQ = 'Nats-Expected-Last-Sequence',
+	EXPECTED_LAST_SUBJECT_SEQ = 'Nats-Expected-Last-Subject-Sequence',
+	EXPECTED_LAST_SUBJECT_SEQ_SUBJECT = 'Nats-Expected-Last-Subject-Sequence-Subject',
+	EXPECTED_LAST_MSG_ID = 'Nats-Expected-Last-Msg-Id',
+	ROLLUP = 'Nats-Rollup',
+	STREAM = 'Nats-Stream',
+	SEQUENCE = 'Nats-Sequence',
+	TIMESTAMP = 'Nats-Time-Stamp',
+	SUBJECT = 'Nats-Subject',
+	LAST_SEQUENCE = 'Nats-Last-Sequence',
+	NUM_PENDING = 'Nats-Num-Pending',
+	UP_TO_SEQUENCE = 'Nats-UpTo-Sequence',
+	PENDING_MESSAGES = 'Nats-Pending-Messages',
+	PENDING_BYTES = 'Nats-Pending-Bytes',
+	LAST_CONSUMER = 'Nats-Last-Consumer',
+	LAST_STREAM = 'Nats-Last-Stream',
+	CONSUMER_STALLED = 'Nats-Consumer-Stalled',
+	TTL = 'Nats-TTL',
+	MARKER_REASON = 'Nats-Marker-Reason',
+	INCR = 'Nats-Incr',
+	BATCH_ID = 'Nats-Batch-Id',
+	BATCH_SEQUENCE = 'Nats-Batch-Sequence',
+	BATCH_COMMIT = 'Nats-Batch-Commit',
+	SCHEDULE = 'Nats-Schedule',
+	SCHEDULE_TARGET = 'Nats-Schedule-Target',
+	REQUIRED_API_LEVEL = 'Nats-Required-Api-Level',
+	SERVICE_ERROR = 'Nats-Service-Error',
+	SERVICE_ERROR_CODE = 'Nats-Service-Error-Code',
+	KV_OPERATION = 'KV-Operation',
+	STATUS = 'Status',
+	DESCRIPTION = 'Description',
+}
+nats.status = {
+	IDLE_HEARTBEAT = 100, -- also flow control requests (description "FlowControl Request")
+	EOB = 204,            -- end of batch (direct get batch)
+	BAD_REQUEST = 400,
+	NOT_FOUND = 404,
+	TIMEOUT = 408,
+	CONFLICT = 409,       -- e.g. max waiting / consumer deleted / leadership change
+	PIN_ID_MISMATCH = 423,
+	NO_RESPONDERS = 503,
+}
+
+-- ---------------------------------------------------------------------------
+-- Request many (ADR-47): blocking scatter/gather.
+-- request_many(subject, data, opts) -> array of msgs, err
+-- opts: header, max_messages, max_wait (total seconds, default timeout),
+--       stall (seconds without a new message after the first, ends the request),
+--       sentinel (function(msg) -> true ends; or true = empty payload without headers ends),
+--       callback (function(msg) -> false ends; messages are not collected when set)
+-- ---------------------------------------------------------------------------
+function cm.request_many(client, subject, data, opts)
+	local nc = unwrap(client)
+	opts = opts or {}
+	local reply, lid = create_inbox(nc)
+	local out, done = {}, false
+	local last = gettime()
+	local sentinel = opts.sentinel
+	if sentinel == true then
+		sentinel = function(m) return (m.data == nil or m.data == '') and not m.header end
+	end
+	nc.inbox_table[lid] = { created = last, expire = last + 3600, callback = function(m)
+		last = gettime()
+		if rawget(m, 'status_code') == '503' then done = 'no responders' return m end
+		if sentinel and sentinel(m) then done = true return m end
+		if opts.callback then
+			if opts.callback(m) == false then done = true end
+		else out[#out + 1] = m end
+		if opts.max_messages and #out >= opts.max_messages then done = true end
+		return m
+	end }
+	cm.publish(client, subject, data, reply, opts.header)
+	local deadline = gettime() + (opts.max_wait or nc.config.timeout or 5)
+	while not done do
+		local now = gettime()
+		local stop_at = deadline
+		if opts.stall and #out > 0 and last + opts.stall < stop_at then stop_at = last + opts.stall end
+		if now >= stop_at then break end
+		cm.wait(client, { lid = lid, timeout = stop_at - now })
+	end
+	nc.inbox_table[lid] = nil
+	if done == 'no responders' and #out == 0 then return out, 'no responders' end
+	return out
+end
+
+-- ---------------------------------------------------------------------------
+-- NATS configuration contexts (ADR-21): options compatible with the nats CLI
+-- context files ($XDG_CONFIG_HOME or ~/.config)/nats/context/<name>.json
+-- ---------------------------------------------------------------------------
+function nats.context_dir()
+	local base = os.getenv('XDG_CONFIG_HOME')
+	if not base or base == '' then base = (os.getenv('HOME') or '.') .. '/.config' end
+	return base .. '/nats'
+end
+
+local function read_file(path)
+	local f = io.open(path, 'rb')
+	if not f then return nil end
+	local d = f:read('*a')
+	f:close()
+	return d
+end
+
+-- load_context([name | path]) -> client options table, raw context (or nil, err)
+function nats.load_context(name)
+	local dir = nats.context_dir()
+	local path
+	if name and find(name, '/', 1, true) then path = name
+	else
+		if not name or name == '' then
+			name = match(read_file(dir .. '/context.txt') or '', '^%s*(.-)%s*$')
+			if not name or name == '' then return nil, 'no context selected' end
+		end
+		path = dir .. '/context/' .. name .. '.json'
+	end
+	local raw = read_file(path)
+	if not raw then return nil, 'context not found: ' .. path end
+	local ok, ctx = pcall(decode, raw)
+	if not ok or type(ctx) ~= 'table' then return nil, 'invalid context json' end
+	local function expand(p) return p and (gsub(p, '^~', os.getenv('HOME') or '~')) or nil end
+	local function nz(v) if v == nil or v == '' or v == json.null then return nil end return v end
+	local o = {}
+	if nz(ctx.url) then o.servers = ctx.url end
+	o.user, o.pass, o.auth_token = nz(ctx.user), nz(ctx.password), nz(ctx.token)
+	o.creds = expand(nz(ctx.creds))
+	o.nkey_file = expand(nz(ctx.nkey))
+	o.inbox_prefix = nz(ctx.inbox_prefix)
+	if nz(ctx.cert) or nz(ctx.key) or nz(ctx.ca) then
+		o.tls = { certificate = expand(nz(ctx.cert)), key = expand(nz(ctx.key)), cafile = expand(nz(ctx.ca)),
+			verify = nz(ctx.ca) and 'peer' or 'none' }
+		o.tls_required = true
+	end
+	if ctx.tls_first then o.tls_first = true end
+	o.jetstream = { domain = nz(ctx.jetstream_domain), api_prefix = nz(ctx.jetstream_api_prefix),
+		event_prefix = nz(ctx.jetstream_event_prefix) }
+	return o, ctx
+end
+
+function nats.connect_context(name, extra)
+	local o, err = nats.load_context(name)
+	if not o then return nil, err end
+	for k, v in pairs(extra or {}) do o[k] = v end
+	return nats.connect(o)
 end
 
 return nats

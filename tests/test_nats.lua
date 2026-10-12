@@ -398,5 +398,120 @@ test("nkey auth uses signature_cb with server nonce", function()
     eq(st.connects[1].nkey, "UPUBKEY"); eq(st.connects[1].sig, "sig(NONCE123)")
 end)
 
+
+test("publish buffering while reconnecting (ADR-40)", function()
+    local down = false
+    local st = fake_server({ refuse = function(_, n) return down and n >= 1 end })
+    local ev = {}
+    local c = nats.client({ reconnect = true, reconnect_wait = 0.05, reconnect_jitter = 0, max_reconnect = -1,
+        disconnected_cb = function() ev[#ev + 1] = "down" end,
+        reconnected_cb = function() ev[#ev + 1] = "up" end })
+    c:connect()
+    local sid = c:subscribe("keep", function() end)
+    down = true
+    st.last.eof = true
+    c:wait({ timeout = 0.01 })
+    eq(c:status_string(), "reconnecting")
+    local t0 = require("socket").gettime()
+    c:publish("buf.a", "one")
+    c:publish("buf.b", "two")
+    assert(require("socket").gettime() - t0 < 0.02, "publish did not block")
+    eq(c:buffered() > 0, true)
+    down = false
+    c:wait({ timeout = 0.3 })
+    eq(c:status_string(), "connected")
+    eq(c:buffered(), 0)
+    local w = st.last:written()
+    local isub, ipub = w:find("SUB keep " .. sid, 1, true), w:find("PUB buf.a 3\r\none\r\nPUB buf.b 3\r\ntwo", 1, true)
+    assert(isub and ipub and isub < ipub, "resubscribed then flushed buffered publishes")
+    eq(ev[1], "down"); eq(ev[2], "up")
+end)
+
+test("reconnect buffer limit", function()
+    local st = fake_server({ refuse = function(_, n) return n >= 1 end })
+    local c = nats.client({ reconnect = true, reconnect_wait = 10, max_reconnect = -1, reconnect_buf_size = 10 })
+    c:connect()
+    st.last.eof = true
+    c:wait({ timeout = 0.01 })
+    assert(not pcall(c.publish, c, "x", string.rep("y", 20)))
+end)
+
+test("tickers fire from the pump loop", function()
+    fake_server()
+    local c = nats.client(); c:connect()
+    local n = 0
+    c:add_ticker(0.01, function() n = n + 1; if n == 3 then return false end end)
+    c:wait({ timeout = 0.1 })
+    eq(n, 3)
+end)
+
+test("nkey seed auth signs nonce with built-in ed25519", function()
+    local nkeys = require("nats-nkeys")
+    local info = {}; for k, v in pairs(INFO) do info[k] = v end
+    info.nonce = "NONCE123"
+    local st = fake_server({ info = info })
+    local seed = "SUANU6Z2W3GZXAGW7HW542S7DV64FPWMCN3DXKNMJU5DLTONOQDP4UFKNY"
+    local c = nats.client({ nkey_seed = seed }); c:connect()
+    eq(st.connects[1].nkey, "UDHCE3WRB3YPXVFQR34XLEURROUWO22W377GUOHCY7SCO2DBLWH7QSJT")
+    eq(st.connects[1].sig, nkeys.from_seed(seed):sign_nonce("NONCE123"))
+end)
+
+test("creds auth signs with the seed in the creds file", function()
+    local info = {}; for k, v in pairs(INFO) do info[k] = v end
+    info.nonce = "abc"
+    local st = fake_server({ info = info })
+    local nkeys = require("nats-nkeys")
+    local creds = nkeys.format_creds("eyJ0.eyJ1.sig", "SUANU6Z2W3GZXAGW7HW542S7DV64FPWMCN3DXKNMJU5DLTONOQDP4UFKNY")
+    local c = nats.client({ creds = creds }); c:connect()
+    eq(st.connects[1].jwt, "eyJ0.eyJ1.sig")
+    eq(st.connects[1].sig, nkeys.from_seed("SUANU6Z2W3GZXAGW7HW542S7DV64FPWMCN3DXKNMJU5DLTONOQDP4UFKNY"):sign_nonce("abc"))
+end)
+
+test("request_many: max_messages, stall and sentinel (ADR-47)", function()
+    fake_server({ on_pub = function(sock, args)
+        if args[2] == "many" then
+            for i = 1, 5 do sock:feed("MSG " .. args[3] .. " 1 1\r\n" .. i .. "\r\n") end
+            sock:feed("MSG " .. args[3] .. " 1 0\r\n\r\n")
+        end
+    end })
+    local c = nats.client(); c:connect()
+    eq(#c:request_many("many", "", { max_messages = 3 }), 3)
+    eq(#c:request_many("many", "", { sentinel = true, max_wait = 1 }), 5)
+    local t0 = require("socket").gettime()
+    eq(#c:request_many("many", "", { stall = 0.05, max_wait = 2 }), 6)
+    assert(require("socket").gettime() - t0 < 1, "stall ended the request")
+end)
+
+test("websocket framing round trip", function()
+    local f = nats.ws_frame(2, "PING\r\n", false)
+    eq(#f, 2 + 4 + 6)
+    eq(f:byte(1), 0x82); eq(f:byte(2), 0x80 + 6)
+    local big = nats.ws_frame(2, string.rep("x", 70000), true)
+    eq(big:byte(2), 0x80 + 127)
+end)
+
+test("url parsing: ws/wss and paths", function()
+    local s = nats.parse_url("wss://user:pw@example.com/nats")
+    eq(s.ws, true); eq(s.tls, true); eq(s.port, 443); eq(s.ws_path, "/nats"); eq(s.user, "user")
+    local w = nats.parse_url("ws://h:8080")
+    eq(w.port, 8080); eq(w.ws_path, "/")
+end)
+
+test("contexts (ADR-21)", function()
+    local dir = os.tmpname(); os.remove(dir)
+    os.execute("mkdir -p " .. dir .. "/nats/context")
+    local f = io.open(dir .. "/nats/context/t.json", "w")
+    f:write('{"url":"nats://a:1,nats://b:2","user":"u","password":"p","token":"","jetstream_domain":"hub"}')
+    f:close()
+    f = io.open(dir .. "/nats/context.txt", "w"); f:write("t\n"); f:close()
+    local old = os.getenv("XDG_CONFIG_HOME")
+    nats.context_dir = function() return dir .. "/nats" end
+    local o = assert(nats.load_context())
+    eq(o.servers, "nats://a:1,nats://b:2"); eq(o.user, "u"); eq(o.pass, "p"); eq(o.auth_token, nil)
+    eq(o.jetstream.domain, "hub")
+    os.execute("rm -rf " .. dir)
+    _ = old
+end)
+
 print(string.format("%s: %d passed, %d failed", jit and jit.version or _VERSION, passed, failed))
 os.exit(failed == 0 and 0 or 1)
