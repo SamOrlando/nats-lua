@@ -14,7 +14,7 @@ those calls.
 ## Install
 
 ```sh
-luarocks make rockspecs/nats-lua-0.1.0-1.rockspec
+luarocks make rockspecs/nats-lua-0.2.0-1.rockspec
 ```
 
 Requirements:
@@ -23,6 +23,7 @@ Requirements:
 - [`nuid`](https://git.nodex.net:9002/odi/lua-nuid) >= 1.0.0 (pure Lua), used for inboxes and sids
 - optional: `lua-cjson` for faster JSON. Without it, a built-in pure Lua codec is used (`nats.json.backend` tells you which one is active).
 - optional: `luasec` for TLS. It is only loaded when TLS is needed.
+- optional: `luaossl` (`openssl.digest`) for faster SHA-256 in the object store. Otherwise a pure Lua SHA-256 is used: native integers on 5.3+, `bit` on LuaJIT, `bit32` on 5.2, lookup tables on 5.1. Rough speed per MB: LuaJIT 0.07 s, 5.4 0.17 s, 5.3 0.26 s, 5.2 1.1 s, 5.1 4.2 s.
 
 ## Quick start
 
@@ -159,6 +160,40 @@ kv:watch_all(function(m) print(m.subject) end)   -- live updates only
 kv:destroy()
 ```
 
+### Object Store (ADR-20)
+
+```lua
+require("nats-objs")
+local obs = nc:create_object_store({ bucket = "files", description = "d", ttl = 0,
+    storage = "file", replicas = 1, compression = true, metadata = { owner = "me" } })
+-- also: nc:object_store(bucket) (bind), nc:objs(cfg) (create or update),
+--       nc:update_object_store(cfg), nc:delete_object_store(bucket), nc:object_store_names()
+
+local info = obs:put("a.txt", "hello")                                  -- string
+obs:put({ name = "big.bin", description = "x", headers = { ["X-A"] = { "1" } },
+          options = { max_chunk_size = 64 * 1024 } }, io.open("big.bin", "rb"))  -- file handle
+obs:put("gen", function() return next_piece() end)                     -- reader function (nil = EOF)
+obs:put_file("/tmp/photo.jpg")                                          -- name = base name
+
+local data, info = obs:get("a.txt")                  -- whole object; size + SHA-256 verified
+obs:get("big.bin", { callback = function(chunk) ... end })   -- streaming
+obs:get_file("big.bin", "/tmp/out.bin")
+obs:get_info("a.txt"), obs:get_info("a.txt", true)  -- true = include deleted
+obs:update_meta("a.txt", { name = "b.txt", description = "renamed" })
+obs:delete("b.txt")                                  -- deleted marker + chunk purge
+obs:list(), obs:list({ show_deleted = true })
+obs:add_link("alias", obs:get_info("big.bin")); obs:add_bucket_link("other", other_obs)
+obs:watch(function(info) ... end, { timeout = 10 })  -- BLOCKING; nil marker after initial values
+obs:status(), obs:seal(), obs:destroy()
+```
+
+Chunks default to 128 KiB (capped below the server `max_payload`) and are
+published with up to 32 acks outstanding. Reads use an ephemeral ack-none
+pull consumer filtered on the chunk subject. Name encoding (padded base64url),
+the `SHA-256=<base64url>` digest and the ObjectInfo JSON match nats.go: an
+interop test (`tests/interop/`) checks that Go reads Lua objects and links and
+that Lua reads Go objects and links.
+
 ## Feature matrix vs. the NATS ADRs
 
 | Area | ADR | Status |
@@ -197,7 +232,9 @@ kv:destroy()
 | KV: put/get/create/update/delete/purge/status/destroy, get by revision | ADR-8 | ✅ |
 | KV: watch with initial values, keys, history, purge_deletes | ADR-8 | ❌ (`watch` is live updates only) |
 | KV TTL per message / counters / codecs | ADR-48/49/54 | ❌ |
-| Object store | ADR-20 | ❌ (`nats-objs.lua` is a stub) |
+| Object store: bucket create/bind/update/delete, put (chunked, digest), get (verified, streaming), get_info (+deleted), update_meta (rename), delete, list, links, seal, status | ADR-20 | ✅ wire compatible with nats.go |
+| Object store watch | ADR-20 | ◐ blocking pull-based watch for a time window (no background push watcher) |
+| Object store get by individual chunk, compression of chunks, locking | ADR-20 (future) | ❌ |
 | Service API, tracing | ADR-32/41 | ❌ |
 | WebSocket transport | — | ❌ |
 
@@ -230,6 +267,7 @@ globally in `nats.defaults`.
 
 ```sh
 NUID_DIR=/path/to/lua-nuid tests/run.sh                                   # unit tests on every Lua found
+(cd tests/interop && go build -o interop .) && NATS_URL=... lua tests/interop/objs_interop.lua  # nats.go interop
 NATS_URL=nats://127.0.0.1:4222 NUID_DIR=... tests/run.sh                  # + integration tests
 NATS_NO_CJSON=1 NATS_URL=... lua tests/test_integration.lua               # with the pure Lua JSON codec
 lua tests/bench.lua 200000                                                # parser/publish benchmark
@@ -238,6 +276,10 @@ lua tests/bench.lua 200000                                                # pars
 The unit tests (`tests/test_nats.lua`) drive the protocol through a fake
 socket (`tests/fakesock.lua`). The integration tests only use subjects under
 `nats-lua.test.<random>.>` and delete the streams and buckets they create.
+
+## Changes in 0.2.0
+
+- New object store (`nats-objs`) and `nats-sha256` modules. Before, `require("nats-objs")` returned a stub table; it now returns the `nats` module, like `nats-kvs` does.
 
 ## Changes in 0.1.0 that can affect existing code
 
