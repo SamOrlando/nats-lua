@@ -284,13 +284,15 @@ test("KV: create bucket, put/get/update/delete/purge, destroy", function()
     local miss, merr = kv:get("missing")
     eq(miss, nil); eq(merr, "key not found")
     assert(kv:delete("a.b"))
-    eq(kv:get("a.b").op, "DEL")
+    local _, derr, de = kv:get("a.b")
+    eq(derr, "key not found"); eq(de.op, "DEL")
     assert(kv:purge("new"))
-    eq(kv:get("new").op, "PURGE")
+    local _, _, pe = kv:get("new")
+    eq(pe.op, "PURGE")
     local st = kv:status()
     eq(st.history, 5)
     local seen
-    local wsid = kv:watch_all(function(m) seen = m.subject end)
+    local wsid = kv:watch_all(function(m) seen = m.subject end, { raw = true }) -- legacy raw watch
     nc:flush()
     kv:put("w.k", "1")
     nc:wait({ sid = wsid, timeout = 2 })
@@ -436,6 +438,269 @@ test("OBJ: status, seal", function()
     eq(s2.sealed, true)
     local r = obs2:put("after-seal", "x")
     eq(r, nil, "sealed bucket refuses writes")
+end)
+
+
+-- 0.3.0: KV full spec (ADR-8/48) -------------------------------------------
+local function pump(secs, done)
+    local t = socket.gettime() + secs
+    while socket.gettime() < t do
+        nc:wait({ timeout = 0.05 })
+        if done and done() then return true end
+    end
+    return done == nil
+end
+
+test("KV: watch (initial values + marker + updates), keys, history, create-after-delete", function()
+    if not js_ok then error("SKIP " .. js_why, 0) end
+    local B = BUCKET .. "-kv2"
+    local kv = assert(nc:create_key_value({ bucket = B, history = 10, storage = "memory" }))
+    cleanup[#cleanup + 1] = function() nc:delete_key_value(B) end
+    kv:put("a.1", "x"); kv:put("a.2", "y"); kv:put("a.1", "x2"); kv:put("b", "z"); kv:delete("b")
+    local seen, marker = {}, 0
+    local w = assert(kv:watch("a.*", function(e)
+        if e then seen[#seen + 1] = e.key .. "=" .. tostring(e.value) else marker = marker + 1 end
+    end))
+    assert(w:wait_initial(5), "end of initial data")
+    eq(#seen, 2); eq(marker, 1)
+    kv:put("a.3", "new")
+    assert(pump(3, function() return #seen == 3 end), "update delivered")
+    eq(seen[3], "a.3=new")
+    w:stop()
+    local all = {}
+    local w2 = kv:watch_all(function(e) if e then all[#all + 1] = e.op end end, { include_history = true })
+    assert(w2:wait_initial(5)); w2:stop()
+    eq(#all, 6, "history watch")
+    local upd = {}
+    local w3 = kv:watch_all(function(e) upd[#upd + 1] = e or "marker" end, { updates_only = true })
+    eq(upd[1], "marker", "updates_only marker sent at start")
+    kv:put("c", "1")
+    assert(pump(3, function() return #upd == 2 end)); w3:stop()
+    eq(upd[2].key, "c")
+    local ks = assert(kv:keys()); table.sort(ks)
+    eq(table.concat(ks, ","), "a.1,a.2,a.3,c")
+    eq(#assert(kv:keys("a.*")), 3)
+    eq(#assert(kv:keys({ "a.1", "c" })), 2, "multiple filters (ADR-34)")
+    local h = assert(kv:history("a.1"))
+    eq(#h, 2); eq(h[1].value, "x"); eq(h[2].value, "x2")
+    local _, kerr = kv:create("a.1", "nope"); eq(kerr, "key exists")
+    assert(kv:create("b", "back"), "create over a deleted key")
+    eq(kv:get("b").value, "back")
+    kv:delete("c"); kv:purge("a.2")
+    eq(assert(kv:purge_deletes({ older_than = 0 })), 2)
+    local w4 = kv:watch_all(function() end); assert(w4:wait_initial(5)); w4:stop()
+    assert(kv:destroy()); table.remove(cleanup)
+end)
+
+test("KV: limit markers + per key TTL (ADR-48), mirror and sources (ADR-57)", function()
+    if not js_ok then error("SKIP " .. js_why, 0) end
+    local B = BUCKET .. "-ttl"
+    local kv, err = nc:create_key_value({ bucket = B, storage = "memory", limit_marker_ttl = 1 })
+    assert(kv, tostring(type(err) == "table" and err.data and err.data.error and err.data.error.description or err))
+    cleanup[#cleanup + 1] = function() nc:delete_key_value(B) end
+    eq(kv:status().limit_marker_ttl, 1)
+    assert(kv:create("eph", "v", { ttl = 1 }))
+    local ops = {}
+    local w = kv:watch("eph", function(e) if e then ops[#ops + 1] = e.op end end)
+    assert(pump(6, function() return ops[#ops] == "PURGE" end), "MaxAge marker seen as PURGE: " .. table.concat(ops, ","))
+    w:stop()
+    assert(kv:put("p", "1")); assert(kv:purge("p", { ttl = 1 }))
+    local M, S = BUCKET .. "-mir", BUCKET .. "-src"
+    local mir = assert(nc:create_key_value({ bucket = M, storage = "memory", mirror = { name = B } }))
+    cleanup[#cleanup + 1] = function() nc:delete_key_value(M) end
+    local src = assert(nc:create_key_value({ bucket = S, storage = "memory", sources = { { name = B } } }))
+    cleanup[#cleanup + 1] = function() nc:delete_key_value(S) end
+    kv:put("shared", "42")
+    assert(pump(5, function() local e = src:get("shared") return e and e.value == "42" end), "sourced bucket got key")
+    assert(pump(5, function() local e = mir:get("shared") return e and e.value == "42" end), "mirror read")
+    eq(src.stream.config.sources[1].subject_transforms[1].dest, "$KV." .. S .. ".>")
+    assert(mir:put("viamirror", "1"), "mirror writes go to origin")
+    eq(kv:get("viamirror").value, "1")
+end)
+
+-- 0.3.0: JetStream consumers (ADR-9/17/37/42) --------------------------------
+local JS2 = STREAM .. "-c"
+local s2
+test("JS: consume (continuous pull) with acks and re-pull thresholds", function()
+    if not js_ok then error("SKIP " .. js_why, 0) end
+    s2 = assert(nc:stream({ name = JS2, subjects = { P .. ".c.>" }, storage = "memory", allow_direct = true }, "create"))
+    cleanup[#cleanup + 1] = function() nc:delete_stream(JS2) end
+    for i = 1, 60 do assert(nc:js_publish(P .. ".c." .. (i % 4), tostring(i))) end
+    local c = assert(s2:consumer({ name = "work", ack_policy = "explicit" }, "create"))
+    local n = 0
+    local ctx = c:consume(function(m) n = n + 1; m:ack() end, { max_messages = 16, expires = 2 })
+    assert(pump(10, function() return n == 60 end), "consumed " .. n)
+    assert(ctx.pulls >= 4, "re-pulled at threshold (" .. ctx.pulls .. ")")
+    ctx:stop()
+    nc:flush(); eq(c:info().num_ack_pending, 0)
+    -- stale pull requests of the stopped context may still be pending on the server,
+    -- so the iterator uses its own consumer
+    local c2 = assert(s2:consumer({ name = "iter", ack_policy = "explicit", deliver_policy = "new" }, "create"))
+    local it = assert(c2:messages({ max_messages = 5 }))
+    nc:js_publish(P .. ".c.x", "late")
+    local m = it:next(5)
+    assert(m and m.data == "late", "messages() iterator"); m:ack(); it:stop()
+    nc:flush(); eq(c2:info().num_ack_pending, 0)
+end)
+
+test("JS: ordered consumer (pull) recovers from a deleted consumer", function()
+    if not s2 then error("SKIP no stream", 0) end
+    local oc = s2:ordered_consumer({ filter_subject = P .. ".c.1" })
+    local got, resets = {}, 0
+    oc.cfg.reset_cb = function() resets = resets + 1 end
+    local ctx = assert(oc:consume(function(m) got[#got + 1] = m:metafields().stream_seq end, { idle_heartbeat = 1, expires = 2 }))
+    assert(pump(5, function() return #got >= 5 end))
+    -- delete the server side consumer: the ordered consumer must recreate it and continue
+    s2:delete_consumer(oc.consumer.name)
+    for i = 1, 4 do nc:js_publish(P .. ".c.1", "after" .. i) end
+    assert(pump(10, function() return #got >= 19 end), "continued after reset: " .. #got)
+    ctx.stop()
+    for i = 2, #got do assert(got[i] > got[i - 1], "in order, no duplicates") end
+    assert(resets >= 1, "reset happened")
+    local f = s2:ordered_consumer({ filter_subject = P .. ".c.2" })
+    eq(#f:fetch(100, 2), 15); f:stop()
+end)
+
+test("JS: push consumer flow control + idle heartbeats (ADR-9), ordered push", function()
+    if not s2 then error("SKIP no stream", 0) end
+    local n, errs = 0, {}
+    local sub = assert(s2:subscribe({ deliver_policy = "all", ack_policy = "none" }, function() n = n + 1 end,
+        { flow_control = true, idle_heartbeat = 1, error_cb = function(_, e) errs[#errs + 1] = e end }))
+    assert(pump(5, function() return n == 65 end), "push delivered " .. n)
+    local before = sub.last_activity
+    pump(2.5)
+    assert(sub.last_activity > before, "idle heartbeats received")
+    eq(#errs, 0, "no missed heartbeats")
+    sub:stop()
+    local on = 0
+    local osub = assert(s2:subscribe({ filter_subject = P .. ".c.3" }, function() on = on + 1 end,
+        { ordered = true, idle_heartbeat = 1 }))
+    assert(pump(5, function() return on == 15 end), "ordered push " .. on)
+    osub:stop()
+end)
+
+test("JS: consumer pause/resume and pinned priority group (ADR-42)", function()
+    if not s2 then error("SKIP no stream", 0) end
+    local c = assert(s2:consumer({ name = "pausable", ack_policy = "explicit" }, "create"))
+    local r = assert(c:pause(os.time() + 120)); eq(r.paused, true)
+    eq(c:info().paused, true)
+    eq(assert(c:resume()).paused, false)
+    local pc, perr = s2:consumer({ name = "pinned", ack_policy = "explicit", priority_groups = { "g1" },
+        priority_policy = "pinned_client", priority_timeout = 30 * nats.jetstream.NS }, "create")
+    assert(pc, tostring(type(perr) == "table" and perr.data and perr.data.error and perr.data.error.description or perr))
+    local msgs = pc:fetch(2, nil, 2, nil, { group = "g1" })
+    eq(#msgs, 2)
+    assert(pc.pin_id, "pin id received")
+    for _, m in ipairs(msgs) do m:ack() end
+    assert(pc:unpin("g1"))
+end)
+
+test("JS: direct get batch / multi_last (ADR-31), per message TTL (ADR-43)", function()
+    if not s2 then error("SKIP no stream", 0) end
+    local msgs, eob = assert(s2:direct_get({ batch = 10, seq = 1, next_by_subj = P .. ".c.>" }))
+    eq(#msgs, 10); assert(eob.num_pending and eob.num_pending > 0, "EOB pending")
+    local last = assert(s2:direct_get({ multi_last = { P .. ".c.*" } }))
+    eq(#last, 5)
+    local T = STREAM .. "-ttl"
+    local ts = assert(nc:stream({ name = T, subjects = { P .. ".t.>" }, storage = "memory", allow_msg_ttl = true,
+        allow_direct = true }, "create"))
+    cleanup[#cleanup + 1] = function() nc:delete_stream(T) end
+    assert(nc:js_publish(P .. ".t.x", "gone soon", { ttl = 1 }))
+    assert(nc:js_publish(P .. ".t.y", "stays", { ttl = "never" }))
+    assert(pump(5, function() local m = ts:getmsg(P .. ".t.x") return m == nil end), "TTL expired")
+    assert(ts:getmsg(P .. ".t.y"), "never expires")
+end)
+
+test("JS: counters (ADR-49) and atomic batch publish (ADR-50)", function()
+    if not js_ok then error("SKIP " .. js_why, 0) end
+    local C = STREAM .. "-cnt"
+    local cs, cerr = nc:stream({ name = C, subjects = { P .. ".n.>" }, storage = "memory", allow_msg_counter = true,
+        allow_direct = true }, "create")
+    if not cs then error("SKIP counters unsupported: " .. tostring(type(cerr) == "table" and cerr.data and cerr.data.error and cerr.data.error.description or cerr), 0) end
+    cleanup[#cleanup + 1] = function() nc:delete_stream(C) end
+    eq(assert(nc:js_counter_add(P .. ".n.hits", 5)), 5)
+    eq(assert(nc:js_counter_add(P .. ".n.hits", -2)), 3)
+    eq(assert(cs:counter_get(P .. ".n.hits")), 3)
+    local A = STREAM .. "-atom"
+    local as, aerr = nc:stream({ name = A, subjects = { P .. ".b.>" }, storage = "memory", allow_atomic = true }, "create")
+    if not as then error("SKIP atomic batch unsupported: " .. tostring(type(aerr) == "table" and aerr.data and aerr.data.error and aerr.data.error.description or aerr), 0) end
+    cleanup[#cleanup + 1] = function() nc:delete_stream(A) end
+    local batch = {}
+    for i = 1, 5 do batch[i] = { subject = P .. ".b." .. i, data = "v" .. i } end
+    local ack = assert(nc:js_publish_batch(batch))
+    eq(ack.count, 5); eq(as:info().state.messages, 5)
+end)
+
+-- 0.3.0: core (ADR-40/47), services (ADR-32), object store watcher --------------
+test("core: request_many (ADR-47) and reconnect callbacks + buffering on forced reconnect", function()
+    -- request_many against a responder on the same connection
+    local r1 = nc:subscribe(P .. ".rm", function(m) m:respond("1") end)
+    local r2 = nc:subscribe(P .. ".rm", function(m) m:respond("2") end)
+    nc:flush()
+    local res = nc:request_many(P .. ".rm", "", { max_wait = 2, stall = 0.3 })
+    eq(#res, 2)
+    nc:unsubscribe(r1); nc:unsubscribe(r2)
+    local ev = {}
+    local c3 = connect({ reconnect = true, reconnect_wait = 0.05,
+        disconnected_cb = function() ev[#ev + 1] = "down" end, reconnected_cb = function() ev[#ev + 1] = "up" end })
+    local got = 0
+    c3:subscribe(P .. ".rc", function() got = got + 1 end)
+    c3:flush()
+    c3:reconnect()
+    for i = 1, 3 do c3:publish(P .. ".rc", tostring(i)) end
+    local t = socket.gettime() + 3
+    while got < 3 and socket.gettime() < t do c3:wait({ timeout = 0.1 }) end
+    eq(got, 3); eq(ev[1], "down"); eq(ev[2], "up")
+    c3:close()
+end)
+
+test("services (ADR-32): endpoints, discovery, stats, errors", function()
+    require("nats-micro")
+    local svc = assert(nc:add_service({ name = BUCKET .. "-svc", version = "1.0.0-rc.1+b5", description = "test",
+        metadata = { k = "v" }, stats_handler = function() return { custom = true } end }))
+    cleanup[#cleanup + 1] = function() svc:stop() end
+    local g = svc:add_group(P .. ".svc")
+    assert(g:add_endpoint("echo", function(req) req:respond("re:" .. req.data) end))
+    assert(g:add_endpoint("bad", function(req) req:respond_error(422, "nope") end))
+    assert(g:add_endpoint("boom", function() error("kaput") end))
+    assert(svc:add_endpoint("noq", function(req) req:respond("x") end, { subject = P .. ".svc.noq", queue_group = false }))
+    nc:flush()
+    eq(nc:get(P .. ".svc.echo", "hi").data, "re:hi")
+    local e = nc:get(P .. ".svc.bad", "")
+    local code, desc = nats.micro.response_error(e)
+    eq(code, 422); eq(desc, "nope")
+    eq(nats.micro.response_error(nc:get(P .. ".svc.boom", "")), 500)
+    local pings = nats.micro.ping(nc, svc.name)
+    eq(#pings, 1); eq(pings[1].id, svc.id); eq(pings[1].type, "io.nats.micro.v1.ping_response")
+    local info = nats.micro.info(nc, svc.name, svc.id)[1]
+    eq(#info.endpoints, 4); eq(info.metadata.k, "v")
+    local noq
+    for _, ep in ipairs(info.endpoints) do if ep.name == "noq" then noq = ep end end
+    eq(noq.queue_group, "")
+    local st = nats.micro.stats(nc, svc.name)[1]
+    local tot, errs = 0, 0
+    for _, ep in ipairs(st.endpoints) do
+        tot = tot + ep.num_requests; errs = errs + ep.num_errors
+        if ep.name == "echo" then eq(ep.data.custom, true) end
+    end
+    eq(tot, 3); eq(errs, 2)
+    assert(st.started:find("^%d+%-%d+%-%d+T"), "started timestamp")
+    svc:reset(); eq(svc:stats().endpoints[1].num_requests, 0)
+    svc:stop()
+    eq(#(nats.micro.ping(nc, svc.name) or {}), 0, "stopped service no longer answers")
+    table.remove(cleanup)
+end)
+
+test("OBJ: non blocking watcher on ordered consumers", function()
+    if not obs then error("SKIP no object store", 0) end
+    local names, marker = {}, false
+    local w = assert(obs:watcher(function(info) if info then names[#names + 1] = info.name else marker = true end end))
+    assert(w:wait_initial(5)); eq(marker, true)
+    local before = #names
+    obs:put("via-watcher", "1")
+    assert(pump(3, function() return #names > before end), "update via watcher")
+    eq(names[#names], "via-watcher")
+    w:stop()
 end)
 
 -- cleanup -------------------------------------------------------------------
