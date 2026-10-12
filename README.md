@@ -16,12 +16,18 @@ those calls.
 
 ## Install
 
-nats-lua is not on luarocks.org yet; install it from a clone:
+From [LuaRocks](https://luarocks.org/modules/samorlando/nats-lua):
+
+```sh
+luarocks install nats-lua      # pulls luasocket and nuid
+```
+
+From a clone:
 
 ```sh
 git clone https://github.com/SamOrlando/nats-lua.git
 cd nats-lua
-luarocks make rockspecs/nats-lua-0.4.0-1.rockspec   # pulls luasocket and nuid
+luarocks make rockspecs/nats-lua-0.4.1-1.rockspec
 ```
 
 Or copy the `nats*.lua` files onto your `package.path` and install the
@@ -367,6 +373,11 @@ lua tests/bench.lua 200000                                                # pars
 The unit tests (`tests/test_nats.lua`) drive the protocol through a fake
 socket (`tests/fakesock.lua`). The integration tests only use subjects under
 `nats-lua.test.<random>.>` and delete the streams and buckets they create.
+
+## Changes in 0.4.1
+
+- First release on LuaRocks (`luarocks install nats-lua`); documentation and
+  URLs updated (GitHub). No API changes from 0.4.0.
 
 ## Changes in 0.4.0 (breaking)
 

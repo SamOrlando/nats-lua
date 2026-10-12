@@ -1,5 +1,5 @@
 <!-- Copyright (c) 2023-2026 Sam Orlando. SPDX-License-Identifier: MIT -->
-# nats-lua API reference (v0.4.0)
+# nats-lua API reference (v0.4.1)
 
 Reference for the public API of every module, derived from the source. Start
 with [the pump model](nats.md#the-pump-model-threading): nothing happens in the
@@ -43,7 +43,7 @@ LUA_PATH="./?.lua;/path/to/lua-nuid/?.lua;;" lua tests/check_docs.lua
 | key pair | `nkeys.from_seed()`, `nkeys.create_pair()` | [nkeys](nats-nkeys.md#object-key-pair-kp) |
 | hasher | `sha256.new()` | [sha256](nats-sha256.md#object-hasher) |
 
-## API notes (known inconsistencies in 0.4.0)
+## API notes (known inconsistencies in 0.4.x)
 
 These are documented as the code behaves today; they are candidates for a
 future release. Fixed in 0.3.1: `stream:nextmsg` (now ADR-31 `next_by_subj`),
