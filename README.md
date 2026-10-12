@@ -110,7 +110,11 @@ local nc = nats.client({
     closed_cb = function(nc) end,
     lame_duck_cb = function(nc) end,          -- INFO with ldm=true (ADR-5)
 })
-nc:reconnect()                                -- on-demand reconnect (ADR-40)
+-- 0.3.0: reconnects run inside the pump loop; publishes made while
+-- reconnecting are buffered (reconnect_buf_size, default 8 MiB, <= 0 = old blocking reconnect)
+nc:status_string()                            -- "connected" | "reconnecting" | "closed" | "disconnected"
+nc:buffered()                                 -- bytes waiting in the reconnect buffer
+nc:reconnect()                                -- on-demand reconnect (ADR-40, blocking)
 nc:set_server_pool({ "nats://c:4222" })
 ```
 
@@ -123,9 +127,14 @@ nc:set_server_pool({ "nats://c:4222" })
   `tls = {...}` takes LuaSec parameters. The default is
   `{ mode="client", protocol="any", verify="none" }`, so set
   `verify = "peer", cafile = ...` for real verification.
-- nkey / creds: `nkey = "U..."` or `creds = "/path/user.creds"` (or the creds
-  text itself). Signing the server nonce needs ed25519, which is not bundled.
-  Provide `signature_cb = function(nonce, seed) return base64url_signature end`.
+- nkey / creds: `creds = "/path/user.creds"` (or the creds text), `nkey_seed = "SU..."`,
+  or `nkey_file = "/path/seed.nk"`. The server nonce is signed with the bundled
+  pure Lua ed25519 (`nats-nkeys`, checked against RFC 8032 and nats.go vectors);
+  luasodium / luatweetnacl are used when installed. `signature_cb` still overrides.
+  `nats-nkeys` can also create key pairs, parse/format creds and issue user JWTs.
+- Contexts: `nats.connect_context("name")` reads `~/.config/nats/context/name.json` (nats CLI).
+- WebSocket: `ws://host:port/path` and `wss://` URLs (binary frames over LuaSocket,
+  no permessage-deflate). `ws_headers` adds upgrade headers; `ws_mask = true` uses random masks.
 
 ### JetStream
 
@@ -156,7 +165,13 @@ local e = kv:get("app.level")             -- {value=, revision=, op=, created=} 
 kv:update("app.level", "4", e.revision)   -- compare-and-set
 kv:create("app.once", "x")                -- fails if the key exists
 kv:delete("app.level"); kv:purge("app.once")
-kv:watch_all(function(m) print(m.subject) end)   -- live updates only
+local w = kv:watch("app.*", function(e) if e then print(e.key, e.value, e.op) end end,
+    { include_history = false, ignore_deletes = false, meta_only = false, updates_only = false })
+w:wait_initial(5)                         -- pumps until the nil "initial values done" marker
+w:stop()
+kv:keys(), kv:history("app.level"), kv:purge_deletes({ older_than = 1800 })
+kv:create("tmp", "x", { ttl = 10 })       -- per key TTL (bucket created with limit_marker_ttl)
+nc:create_key_value({ bucket = "copy", mirror = { name = "config" } })   -- mirrors / sources
 kv:destroy()
 ```
 
@@ -184,6 +199,7 @@ obs:delete("b.txt")                                  -- deleted marker + chunk p
 obs:list(), obs:list({ show_deleted = true })
 obs:add_link("alias", obs:get_info("big.bin")); obs:add_bucket_link("other", other_obs)
 obs:watch(function(info) ... end, { timeout = 10 })  -- BLOCKING; nil marker after initial values
+local w = obs:watcher(function(info) ... end)       -- non blocking (ordered consumer), w:stop()
 obs:status(), obs:seal(), obs:destroy()
 ```
 
@@ -194,49 +210,78 @@ the `SHA-256=<base64url>` digest and the ObjectInfo JSON match nats.go: an
 interop test (`tests/interop/`) checks that Go reads Lua objects and links and
 that Lua reads Go objects and links.
 
+## Single-threaded model
+
+nats-lua has no threads. Everything that other clients do in the background
+(reconnects, PING/PONG, consume re-pulls, idle heartbeat checks, flow control
+replies, KV/object watchers, service endpoints) runs while the application
+pumps the connection: `nc:wait({ timeout = t })`, `nc:get()`, `flush()`,
+`request()` and the blocking JetStream calls. A long running app should loop
+on `nc:wait({ timeout = 0.1 })` (or call it from its own event loop).
+`nc:add_ticker(interval, fn)` runs timers inside the same loop.
+
+### JetStream consumers (0.3.0)
+
+```lua
+local ctx = consumer:consume(function(m) m:ack() end, { max_messages = 100, expires = 30, idle_heartbeat = 5 })
+ctx:stop() / ctx:drain()
+local it = consumer:messages(); local m = it:next(5); it:stop()
+local oc = stream:ordered_consumer({ filter_subjects = { "orders.>" } })   -- ADR-17
+oc:fetch(10), oc:next(5), oc:consume(cb), oc:messages()
+local sub = stream:subscribe({ deliver_subject = nc:new_inbox(), flow_control = true, idle_heartbeat = 5 }, cb)  -- push (ADR-9)
+consumer:pause(os.time() + 60); consumer:resume(); consumer:unpin()                       -- ADR-42
+consumer:fetch(10, nil, 5, nil, { group = "g1" })                                         -- priority groups
+stream:direct_get({ multi_last = { "a.>" }, batch = 10 })                                 -- ADR-31
+nc:js_publish(subj, data, { ttl = 60 })  ; nc:js_counter_add(subj, 5) ; nc:js_publish_batch(msgs)
+```
+
+### Services (ADR-32)
+
+```lua
+require("nats-micro")
+local svc = nc:add_service({ name = "calc", version = "1.0.0", description = "d" })
+svc:add_group("math"):add_endpoint("add", function(req) req:respond_json({ sum = 3 }) end)
+nats.micro.ping(nc, "calc"); nats.micro.info(nc, "calc"); nats.micro.stats(nc, "calc")
+svc:stop()
+```
+
 ## Feature matrix vs. the NATS ADRs
+
+The full per-ADR list is in [docs/ADR-COMPLIANCE.md](docs/ADR-COMPLIANCE.md).
 
 | Area | ADR | Status |
 |---|---|---|
-| INFO → CONNECT → PING/PONG handshake | ADR-40 | ✅ |
-| Async INFO updates, `connect_urls` discovery | ADR-40 | ✅ (`ignore_discovered_servers`) |
+| INFO → CONNECT → PING/PONG handshake, async INFO, discovery (+ `discovered_servers_cb`) | ADR-40 | ✅ |
 | Lame duck mode notification | ADR-5 | ✅ callback + `client.lame_duck` (no automatic migration) |
-| Server pool, randomization, `no_randomize` | ADR-40 | ✅ |
-| Reconnect: immediate retry, exponential backoff with jitter, max attempts | ADR-40 | ✅ (blocking) |
-| Resubscribe after reconnect (incl. remaining auto-unsub counts) | ADR-40 | ✅ |
-| On-demand reconnect, custom server pool, reconnect delay callback | ADR-40 | ✅ |
-| Reconnect-to-specific-server handler | ADR-40 | ❌ |
-| Disconnect buffer (queue publishes while disconnected) | ADR-40 | ❌ publishes trigger a reconnect, then are sent |
-| Retry on failed initial connect | ADR-40 | ✅ `retry_on_failed_connect` + `reconnect` |
-| PING interval / max pings out | ADR-40 | ✅ only while the client is pumping (`wait`, `get`, ...) |
-| Protocol `-ERR` surfaced to the app | ADR-40 | ✅ `error_cb`, `client.last_error` |
-| `max_payload` enforced client side | ADR-40 | ✅ header + payload |
-| Headers HPUB/HMSG, multi-value, status line | ADR-4 | ✅ case preserving, no case-insensitive helpers |
+| Server pool, randomization, DNS resolve-all + shuffle | ADR-40/11 | ✅ |
+| Reconnect with backoff, jitter, max attempts, non-blocking in the pump loop | ADR-40 | ✅ |
+| Reconnect buffer (publishes while disconnected) | ADR-40 | ✅ `reconnect_buf_size` |
+| Resubscribe, callbacks (disconnected/reconnected/closed/error/lame duck) | ADR-40 | ✅ |
+| Reconnect-to-specific-server handler | ADR-40 | ✅ `reconnect_delay_cb` + `set_server_pool` (no per-attempt server picker) |
+| Headers, status line, header/status constants (`nats.headers`, `nats.status`) | ADR-4 | ✅ |
 | No responders (503) | ADR-4/40 | ✅ |
-| Subject / queue / name validation | ADR-6 | ✅ subjects, queues, stream/consumer/bucket/key names |
-| TLS (explicit, `tls_first`) | ADR-40 | ✅ via LuaSec (not tested against a TLS server here) |
-| URL options | ADR-18 | ◐ scheme, user:pass, token, host:port only |
-| user/pass, token auth | — | ✅ |
-| nkey / JWT creds | — | ◐ parsing done, signing needs a user `signature_cb` |
-| Drain (connection and subscription) | — | ✅ `drain()`, `drain_sub()` |
-| Request many | ADR-47 | ◐ `poll()` (time and count limits, no sentinel) |
-| JetStream API, errors | ADR-1/7 | ✅ errors returned as `nil, msg` (msg.data.error) |
-| Streams: create/update/info/delete/purge/list/names, msg get/delete | ADR-1/10/31 | ✅ |
-| Direct get | ADR-31 | ✅ when `allow_direct` |
-| JetStream publish with pub ack, dedupe, expectations, retries on 503 | ADR-22 | ✅ |
-| Pull consumers: create/info/delete, fetch, next, no_wait, expires | ADR-13 | ✅ |
-| Pull status handling 100/404/408/409 | ADR-9/13 | ✅ in fetch |
-| Acks: ack, nak (delay), term, in progress, double ack | — | ✅ |
-| Consume/messages (continuous pull), ordered consumer, push subscribe | ADR-15/17/37 | ❌ |
-| Idle heartbeats for push consumers | ADR-9 | ❌ |
-| KV: put/get/create/update/delete/purge/status/destroy, get by revision | ADR-8 | ✅ |
-| KV: watch with initial values, keys, history, purge_deletes | ADR-8 | ❌ (`watch` is live updates only) |
-| KV TTL per message / counters / codecs | ADR-48/49/54 | ❌ |
-| Object store: bucket create/bind/update/delete, put (chunked, digest), get (verified, streaming), get_info (+deleted), update_meta (rename), delete, list, links, seal, status | ADR-20 | ✅ wire compatible with nats.go |
-| Object store watch | ADR-20 | ◐ blocking pull-based watch for a time window (no background push watcher) |
-| Object store get by individual chunk, compression of chunks, locking | ADR-20 (future) | ❌ |
-| Service API, tracing | ADR-32/41 | ❌ |
-| WebSocket transport | — | ❌ |
+| Subject / name validation | ADR-6 | ✅ |
+| TLS, `tls_first` | ADR-40 | ✅ via LuaSec |
+| nkey / JWT creds auth with bundled ed25519 | ADR-14 | ✅ |
+| Contexts (nats CLI context files) | ADR-21 | ✅ |
+| Request many (max messages, max wait, stall, sentinel) | ADR-47 | ✅ `request_many` |
+| WebSocket transport | — | ✅ ws:// wss:// (no compression) |
+| JetStream API, errors, paging, API prefix/domain | ADR-1/7/19 | ✅ |
+| Streams, msg get/delete, direct get, batch / multi-last direct get | ADR-1/10/31 | ✅ |
+| JetStream publish with expectations, per message TTL | ADR-22/43 | ✅ |
+| Pull consumers fetch/next, status 100/404/408/409/423 | ADR-13/9 | ✅ |
+| Consume / messages (simplified API), heartbeats, re-pull thresholds | ADR-37 | ✅ |
+| Ordered consumer (pull and push) | ADR-17 | ✅ |
+| Push consumers with flow control and idle heartbeats | ADR-9 | ✅ (application must pump) |
+| Consumer pause / resume, priority groups (pinned, overflow), unpin | ADR-42 | ✅ |
+| Counters (`Nats-Incr`) | ADR-49 | ✅ |
+| Atomic batch publish | ADR-50 | ✅ (fast-ingest batches ❌) |
+| Message scheduling | ADR-51 | ◐ header passthrough (`schedule`, `schedule_target`) |
+| KV full API: watch (history, meta only, ignore deletes, updates only, resume), keys, history, purge_deletes, create/update with revision | ADR-8 | ✅ |
+| KV limit markers / per key TTL, mirrors and sources | ADR-48/8 | ✅ |
+| Object store (create/bind/put/get/info/meta/delete/list/links/seal/status), watcher | ADR-20 | ✅ wire compatible with nats.go |
+| Service API (micro) with PING/INFO/STATS, groups, errors | ADR-32 | ✅ |
+| Backup/restore, codecs, tracing | ADR-63/54/41 | ❌ |
 
 ## Client options
 
@@ -261,7 +306,11 @@ globally in `nats.defaults`.
 | `validate_subjects` | true | |
 | `inbox_prefix` | `_INBOX` | |
 | `drain_timeout` | 30 | |
-| `error_cb`, `disconnected_cb`, `reconnected_cb`, `closed_cb`, `lame_duck_cb` | – | |
+| `error_cb`, `disconnected_cb`, `reconnected_cb`, `closed_cb`, `lame_duck_cb`, `discovered_servers_cb` | – | |
+| `reconnect_buf_size` | 8 MiB | `<= 0` disables buffering (blocking reconnect as in 0.2) |
+| `nkey_seed`, `nkey_file` | – | nkey auth with the bundled signer |
+| `resolve_all` | true | try every resolved address, shuffled (ADR-11) |
+| `ws_mask`, `ws_headers` | false, – | WebSocket options |
 
 ## Tests
 
@@ -270,12 +319,29 @@ NUID_DIR=/path/to/lua-nuid tests/run.sh                                   # unit
 (cd tests/interop && go build -o interop .) && NATS_URL=... lua tests/interop/objs_interop.lua  # nats.go interop
 NATS_URL=nats://127.0.0.1:4222 NUID_DIR=... tests/run.sh                  # + integration tests
 NATS_NO_CJSON=1 NATS_URL=... lua tests/test_integration.lua               # with the pure Lua JSON codec
+NATS_SERVER_BIN=/path/nats-server lua tests/test_local.lua                # nkey, creds, websocket, restart buffering
+lua tests/test_nkeys.lua                                                  # SHA-512, ed25519 RFC 8032, nkeys vectors
 lua tests/bench.lua 200000                                                # parser/publish benchmark
 ```
 
 The unit tests (`tests/test_nats.lua`) drive the protocol through a fake
 socket (`tests/fakesock.lua`). The integration tests only use subjects under
 `nats-lua.test.<random>.>` and delete the streams and buckets they create.
+
+## Changes in 0.3.0
+
+New modules `nats-nkeys` and `nats-micro`. Breaking changes:
+
+- `kv:get()` on a deleted or purged key now returns `nil, "key not found", entry`
+  (before: the entry with `op = "DEL"`/`"PURGE"`).
+- `kv:watch()` / `kv:watch_all()` now return a Watcher object and call the
+  callback with decoded entries plus a `nil` marker after the initial values.
+  Pass `{ raw = true }` to get the 0.2 behaviour (sid + raw messages, live only).
+- `consumer:consume()` / `messages()` were stubs and are now the ADR-37 API.
+- `list_streams()` / `consumer_list()` return all pages aggregated.
+- Publishes while reconnecting are buffered instead of blocking the caller in
+  a reconnect loop. Set `reconnect_buf_size = 0` for the old behaviour.
+- Creds files whose JWT contains `-` were cut at the first `-`; this is fixed.
 
 ## Changes in 0.2.0
 
