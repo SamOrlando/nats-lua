@@ -578,37 +578,70 @@ function om.list(obs, opts)
 	return out
 end
 
--- watch(callback(info|nil) [, opts]) - BLOCKING: runs for opts.timeout seconds (default 5)
--- or until callback returns false. A nil info is delivered once after the initial values
--- (like Go's nil marker). opts: include_history, ignore_deletes, updates_only.
-function om.watch(obs, callback, opts)
+-- watcher(callback(info|nil) [, opts]) -> watcher (non blocking, ADR-20 Watch)
+-- Built on an ordered consumer; updates arrive while the client pumps (client:wait()).
+-- A nil info is delivered once after the initial values (end of initial data).
+-- opts: include_history, ignore_deletes, updates_only
+local ObjWatcher = {}
+ObjWatcher.__index = ObjWatcher
+function om.watcher(obs, callback, opts)
 	if type(callback) ~= 'function' then return nil, 'callback required' end
 	opts = type(opts) == 'table' and opts or {}
 	local policy = opts.updates_only and 'new' or (opts.include_history and 'all' or 'last_per_subject')
+	local w = setmetatable({ obs = obs, init_done = false, client = unwrap(obs.client) }, ObjWatcher)
+	local function done()
+		if not w.init_done then
+			w.init_done = true
+			pcall(callback, nil)
+		end
+	end
+	local oc = js.ordered_consumer(obs.stream, { filter_subject = format(objAllMetaPreTmpl, obs.name),
+		deliver_policy = policy })
+	w.ordered = oc
+	local ctx, err = oc:consume(function(m)
+		local info = meta_from_msg(m)
+		if info and not (opts.ignore_deletes and info.deleted) then
+			local ok, cerr = pcall(callback, info)
+			if not ok then w.last_error = cerr end
+		end
+		if not w.init_done and (pending_of(m) or 0) == 0 then done() end
+	end, { max_messages = 256 })
+	if not ctx then return nil, err end
+	w.ctx = ctx
+	local c = oc.consumer
+	if opts.updates_only or (c and (tonumber(c.num_pending) or 0) == 0) then done() end
+	return w
+end
+function ObjWatcher:stop() if self.ctx then self.ctx.stop() self.ctx = nil end end
+ObjWatcher.unsubscribe = ObjWatcher.stop
+function ObjWatcher:wait_initial(timeout)
+	local deadline = gettime() + (timeout or 10)
+	while not self.init_done do
+		local left = deadline - gettime()
+		if left <= 0 then return false end
+		cm.wait(self.client, { timeout = min(left, 0.5), maxcount = 1 })
+	end
+	return true
+end
+
+-- watch(callback(info|nil) [, opts]) - BLOCKING convenience (0.2.0 API): runs a watcher
+-- for opts.timeout seconds (default 5) or until callback returns false.
+function om.watch(obs, callback, opts)
+	if type(callback) ~= 'function' then return nil, 'callback required' end
+	opts = type(opts) == 'table' and opts or {}
+	local stop = false
+	local w, err = om.watcher(obs, function(info)
+		if callback(info) == false then stop = true end
+	end, opts)
+	if not w then return nil, err end
 	local deadline = gettime() + (opts.timeout or 5)
-	return read_subject(obs, format(objAllMetaPreTmpl, obs.name), { deliver_policy = policy }, function(consumer)
-		local initial = tonumber(consumer.num_pending) or 0
-		local marked = opts.updates_only or false
-		if initial == 0 and not marked then
-			marked = true
-			if callback(nil) == false then return true end
-		end
-		while true do
-			local left = deadline - gettime()
-			if left <= 0 then return true end
-			local msgs = con.fetch(consumer, 64, nil, min(left, 1))
-			for _, m in ipairs(msgs) do
-				local info = meta_from_msg(m)
-				if info and not (opts.ignore_deletes and info.deleted) then
-					if callback(info) == false then return true end
-				end
-				if not marked and pending_of(m) == 0 then
-					marked = true
-					if callback(nil) == false then return true end
-				end
-			end
-		end
-	end)
+	while not stop do
+		local left = deadline - gettime()
+		if left <= 0 then break end
+		cm.wait(w.client, { timeout = min(left, 0.25), maxcount = 1 })
+	end
+	w:stop()
+	return true
 end
 
 -- ------------------------------------------------------------ bucket ops
