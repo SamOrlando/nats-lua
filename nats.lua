@@ -718,7 +718,7 @@ local function connect_once(client, srv)
 	if sub(line, 1, 5) ~= 'INFO ' then close_socket(client) return nil, 'unexpected greeting: ' .. line end
 	local ok, info = pcall(decode, sub(line, 6))
 	if not ok or type(info) ~= 'table' then close_socket(client) return nil, 'invalid INFO json' end
-	info.max_payload = tonumber(info.max_payload) or DEFAULT_MAX_PAYLOAD
+	info.max_payload = floor(tonumber(info.max_payload) or DEFAULT_MAX_PAYLOAD)
 
 	if not tls_done and (info.tls_required or cfg.tls_required or srv.tls) then
 		local tsock, terr = tls_wrap(sock, cfg, srv.host, ct)
@@ -1070,7 +1070,7 @@ function cm.get(client, subject, data, header, sid, timeout)
 		timeout = timeout or nc.config.timeout })
 	if msg.lid then nc.inbox_table[msg.lid] = nil end
 	if not r_msg then return nil, 'timeout' end
-	if rawget(r_msg, 'status') == '503' then return nil, 'no responders', r_msg end
+	if rawget(r_msg, 'status_code') == '503' then return nil, 'no responders', r_msg end
 	return r_msg
 end
 cm.request_sync = cm.get
@@ -1102,7 +1102,7 @@ local function handle_info(nc, data)
 	if not ok or type(info) ~= 'table' then return end
 	local si = nc.server_information
 	for k, v in pairs(info) do si[k] = v end
-	si.max_payload = tonumber(si.max_payload) or DEFAULT_MAX_PAYLOAD
+	si.max_payload = floor(tonumber(si.max_payload) or DEFAULT_MAX_PAYLOAD)
 	merge_discovered(nc, info.connect_urls)
 	if info.ldm then -- ADR-5 lame duck mode
 		rawset(nc, 'lame_duck', true)
@@ -1154,7 +1154,7 @@ local function process(nc, client, op)
 		stats.in_bytes = stats.in_bytes + op.size
 		local msg = setmetatable({
 			client = client, data = op.data, header = op.header, subject = op.subject,
-			reply = op.reply, sid = op.sid, status = op.status, description = op.description,
+			reply = op.reply, sid = op.sid, status_code = op.status, status_description = op.description,
 		}, msg_metatable)
 		local sid = op.sid
 		if sid == nc.inbox_sid then
@@ -1341,8 +1341,8 @@ end
 
 -- status code (number) and description of a status message (e.g. 503 no responders)
 function mm.status(m)
-	local st = rawget(m, 'status')
-	if st then return tonumber(st), rawget(m, 'description') end
+	local st = rawget(m, 'status_code')
+	if st then return tonumber(st), rawget(m, 'status_description') end
 	local h = rawget(m, 'header')
 	if type(h) == 'table' and h.Status then return tonumber(h.Status), h.Description end
 	return nil
