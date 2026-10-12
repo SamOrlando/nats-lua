@@ -207,6 +207,7 @@ else
 	M.backend = impl
 end
 M.new_lua = new_lua
+M._band, M._bxor, M._impl = band, bxor, impl -- shared 32-bit bit ops (used by nats-nkeys)
 
 function M.digest(s) return M.new():update(s):final() end
 function M.hex(s)
