@@ -1305,22 +1305,22 @@ local inbox_lid_nuid = nuid({ preLen = 8, seqLen = 0 }) -- letter ids are 8 char
 -- legacy module level inbox (not bound to a client's muxed subscription)
 function nats.create_inbox()
 	local lid = inbox_lid_nuid()
-	return inbox_prefix .. '.' .. inbox_nuid .. '.' .. lid, lid
+	return inbox_prefix .. '.' .. nuid({ preLen = 22, seqLen = 0 }) .. '.' .. lid, lid
 end
 
 -- fresh inbox under this client's muxed request subscription
 function cm.create_inbox(client)
 	client = unwrap(client)
-	local lid = nuid.next()
+	local lid = inbox_lid_nuid()
 	return client.inbox_prefix .. '.' .. lid, lid
 end
 local create_inbox = cm.create_inbox
 
--- unique inbox outside the muxed request subscription; honours the inbox_prefix option
-function cm.new_inbox(client)
-	local cfg = type(client) == 'table' and unwrap(client).config
-	return (cfg and cfg.inbox_prefix or inbox_prefix) .. '.' .. nuid.next()
-end
+-- REMOVE? unique inbox outside the muxed request subscription; honours the inbox_prefix option
+-- function cm.new_inbox(client)
+	-- local cfg = type(client) == 'table' and unwrap(client).config
+	-- return (cfg and cfg.inbox_prefix or inbox_prefix) .. '.' .. nuid.next()
+-- end
 
 local function inbox_req_cb(client, m) -- inbox request callback and handling for wait function
 	local lid = sub(m.subject, #client.inbox_prefix + 2)
