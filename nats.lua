@@ -18,7 +18,7 @@ local socket = require('socket')
 local nuid = require('nuid')
 
 local nats = {
-	_VERSION     = 'nats-lua 0.4.2',
+	_VERSION     = 'nats-lua 0.4.3',
 	_DESCRIPTION = 'Lua client for NATS w/ headers, tls, request/reply, JetStream - https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2023-2026 Sam Orlando - MIT',
 	--
@@ -41,6 +41,17 @@ local find, match, gmatch, sub, byte, gsub, format, char =
 	string.find, string.match, string.gmatch, string.sub, string.byte, string.gsub, string.format, string.char
 local unpack = table.unpack or unpack
 local gettime, sleep = socket.gettime, socket.sleep
+
+local layers = { jetstream = 'nats-jetstream', js = 'nats-jetstream', kvs = 'nats-kvs', objs = 'nats-objs', micro = 'nats-micro' }
+function nats.use(...)
+	for i = 1, select('#', ...) do
+		  local name = select(i, ...)
+		  local mod = layers[name]
+		  if not mod then error("nats.use: unknown layer '" .. tostring(name) .. "'", 2) end
+		  require(mod)
+	end
+	return nats
+end
 
 local CRLF = '\r\n'
 local HDR_LINE = 'NATS/1.0\r\n'
