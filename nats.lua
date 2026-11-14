@@ -386,6 +386,11 @@ local valid_config = {
 }
 nats.valid_config = valid_config
 
+local nats_inbox_prefix = "_INBOX"
+local nats_inbox_mbid_nuid = nuid({ preLen = 22, seqLen = 0 })
+local nats_inbox_lid_nuid = nuid({ preLen = 8, seqLen = 0 }) -- letter ids are 8 char random with no sequence
+local nats_inbox_sid_nuid = nuid({ preLen = 8, seqLen = 0 })
+
 local function create_client(config, n_opts)
 	local d = nats.defaults
 	local function dflt(k, v) if d[k] ~= nil then return d[k] end return v end
@@ -423,7 +428,6 @@ local function create_client(config, n_opts)
 	}
 	for k, v in pairs(config or {}) do cfg[k] = v end
 
-	local prefix = (cfg.inbox_prefix or '_INBOX') .. '.' .. nuid.next()
 	local client = setmetatable({
 		connected = false,
 		closed = false,
@@ -440,9 +444,10 @@ local function create_client(config, n_opts)
 		error = nats.error,
 		servers = false,       -- server pool (built on first connect)
 		current_server = false,
-		inbox_prefix = prefix,  -- muxed request inbox: <prefix>.<token>
-		inbox_sid = '1',
+		inbox_prefix = (cfg.inbox_prefix or nats_inbox_prefix),
+		inbox_muxed = (cfg.inbox_prefix or nats_inbox_prefix) .. '.' .. nats_inbox_mbid_nuid(),  -- muxed request inbox: <prefix>.<token>
 		inbox_table = {},
+		inbox_sid = nats_inbox_sid_nuid(),
 		ssid = 1,
 		pings_sent = 0,
 		pongs_received = 0,
@@ -1037,7 +1042,7 @@ local function connect_once(client, srv)
 	merge_discovered(client, info.connect_urls)
 
 	-- (re)subscribe: inbox mux + all live subscriptions
-	local buf = { 'SUB ', client.inbox_prefix, '.* ', client.inbox_sid, CRLF }
+	local buf = { 'SUB ', client.inbox_muxed, '.* ', client.inbox_sid, CRLF }
 	for sid, s in pairs(client.subscriptions) do
 		if sid ~= client.inbox_sid then
 			buf[#buf + 1] = sub_line(s.subject, s.queue, sid)
@@ -1306,35 +1311,35 @@ function cm.remove_ticker(client, t)
 	for i = #list, 1, -1 do if list[i] == t then table.remove(list, i) end end
 end
 
--- ---------------------------------------------------------------------------
--- Inbox / request-reply (new style muxed inbox)
--- ---------------------------------------------------------------------------
-local inbox_prefix = "_INBOX"
-local inbox_nuid = nuid({ preLen = 22, seqLen = 0 })()
-local inbox_lid_nuid = nuid({ preLen = 8, seqLen = 0 }) -- letter ids are 8 char random with no sequence
-
 -- legacy module level inbox (not bound to a client's muxed subscription)
-function nats.create_inbox()
-	local lid = inbox_lid_nuid()
-	return inbox_prefix .. '.' .. nuid({ preLen = 22, seqLen = 0 }) .. '.' .. lid, lid
+function nats.new_inbox(inbox_prefix, mid, lid)
+	lid = lid or nats_inbox_lid_nuid()
+	return concat({
+		inbox_prefix or nats_inbox_prefix,
+		mid or nats_inbox_mbid_nuid(),
+		lid
+	}, '.'), lid
 end
 
 -- fresh inbox under this client's muxed request subscription
-function cm.create_inbox(client)
+function cm.create_inbox(client, lid)
 	client = unwrap(client)
-	local lid = inbox_lid_nuid()
-	return client.inbox_prefix .. '.' .. lid, lid
+	lid = lid or nats_inbox_lid_nuid()
+	return client.inbox_muxed .. '.' .. lid, lid
 end
 local create_inbox = cm.create_inbox
 
--- REMOVE? unique inbox outside the muxed request subscription; honours the inbox_prefix option
--- function cm.new_inbox(client)
-	-- local cfg = type(client) == 'table' and unwrap(client).config
-	-- return (cfg and cfg.inbox_prefix or inbox_prefix) .. '.' .. nuid.next()
--- end
+function cm.new_inbox(client, prefix, mid, lid)
+	lid = lid or nats_inbox_lid_nuid()
+	return concat({
+		prefix or nats_inbox_prefix,
+		mid or nats_inbox_mbid_nuid(),
+		lid
+	}, '.'), lid
+end
 
 local function inbox_req_cb(client, m) -- inbox request callback and handling for wait function
-	local lid = sub(m.subject, #client.inbox_prefix + 2)
+	local lid = sub(m.subject, #client.inbox_muxed + 2)
 	local tbl = client.inbox_table
 	local ibt = tbl[lid]
 	if not ibt then return end
