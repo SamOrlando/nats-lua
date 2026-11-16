@@ -336,7 +336,7 @@ nats.client_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] end,
 	methods = {},
 	lang = 'lua',
-	version = '0.4.2',
+	version = '0.4.4',
 }
 local client_metatable = nats.client_metatable
 

@@ -718,7 +718,7 @@ Note: `msg.status_code` is a string (`'503'`); compare with
 
 ### Other module fields
 
-`nats._VERSION` (`'nats-lua 0.4.2'`), `nats._DESCRIPTION`, `nats._COPYRIGHT`,
+`nats._VERSION` (`'nats-lua 0.4.4'`), `nats._DESCRIPTION`, `nats._COPYRIGHT`,
 `nats.verbose` (bool, prints protocol traffic), `nats.defaults` (table),
 `nats.valid_config` (set of accepted option names), `nats.nuid` (the `nuid`
 module), `nats.client_metatable` (`lang`, `version`, `methods`),

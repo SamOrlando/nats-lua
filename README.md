@@ -29,7 +29,7 @@ From a clone:
 ```sh
 git clone https://github.com/SamOrlando/nats-lua.git
 cd nats-lua
-luarocks make rockspecs/nats-lua-0.4.2-1.rockspec
+luarocks make rockspecs/nats-lua-0.4.4-1.rockspec
 ```
 
 Or copy the `nats*.lua` files onto your `package.path` and install the
@@ -381,6 +381,18 @@ lua tests/bench.lua 200000                                                # pars
 buckets it creates. Integration tests use `nats-lua.test.<random>.>` and
 delete the streams and buckets they create. `tests/fakesock.lua` feeds the
 benchmarks.
+
+## Changes in 0.4.4
+
+- Inbox handling repaired: the muxed request inbox is `<inbox_prefix>.<22-char nuid>`,
+  letter ids are an 8-character sequence, and `client:create_inbox()` returns
+  `<inbox_muxed>.<lid>, lid`. `client:new_inbox()` is a standalone
+  `<prefix>.<token>` subject (honours `inbox_prefix`) and remains the inbox
+  helper used by JetStream.
+- `nats.use(...)` loads several optional layers in one call (`jetstream`/`js`,
+  `kvs`, `objs`, `micro`).
+- `nats._VERSION` and the CONNECT `version` field are `0.4.4`.
+- `tests/test_functions.lua` proves the client against a local nats-server.
 
 ## Changes in 0.4.2
 
