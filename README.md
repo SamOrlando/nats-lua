@@ -10,11 +10,6 @@ Object Store buckets and the Service API (micro).
 
 Source: <https://github.com/SamOrlando/nats-lua>
 
-`nats._VERSION` is `nats-lua 0.4.4`. The CONNECT `version` field and the
-LuaRocks rockspec (`nats-lua-0.4.2-1`) remain `0.4.2`. There is no `v0.4.3`
-or `v0.4.4` tag. `luarocks install nats-lua` installs the published 0.4.2
-rock. `luarocks make` from a clone installs the files in that clone.
-
 The I/O model is **blocking and single threaded**: nothing happens in the
 background. Messages are read and dispatched to callbacks while you call
 `client:wait()`, `client:get()` / `flush()` / `drain()` or a JetStream call that
@@ -34,7 +29,7 @@ From a clone:
 ```sh
 git clone https://github.com/SamOrlando/nats-lua.git
 cd nats-lua
-luarocks make rockspecs/nats-lua-0.4.4-1.rockspec
+luarocks make rockspecs/nats-lua-0.4.5-1.rockspec
 ```
 
 Or copy the `nats*.lua` files onto your `package.path` and install the
@@ -391,9 +386,13 @@ buckets it creates. Integration tests use `nats-lua.test.<random>.>` and
 delete the streams and buckets they create. `tests/fakesock.lua` feeds the
 benchmarks.
 
+## Changes in 0.4.5
+
+- `client.inbox_sid` is `"1"`. User subscription ids are short numeric strings
+  and start at `"2"`.
+
 ## Changes in 0.4.4
 
-<<<<<<< HEAD
 - Inbox handling repaired: the muxed request inbox is `<inbox_prefix>.<22-char nuid>`,
   letter ids are an 8-character sequence, and `client:create_inbox()` returns
   `<inbox_muxed>.<lid>, lid`. `client:new_inbox()` is a standalone
@@ -403,32 +402,6 @@ benchmarks.
   `kvs`, `objs`, `micro`).
 - `nats._VERSION` and the CONNECT `version` field are `0.4.4`.
 - `tests/test_functions.lua` proves the client against a local nats-server.
-=======
-`nats._VERSION` is `'nats-lua 0.4.4'`. The CONNECT `version` field is still
-`0.4.2`. The rockspec in this tree is still `rockspecs/nats-lua-0.4.2-1.rockspec`.
-
-- `nats.use(...)` loads layers by name and returns the `nats` table. Names:
-  `jetstream` (alias `js`), `kvs`, `objs`, `micro`. An unknown name raises.
-- `nats.create_inbox()` is removed. `nats.new_inbox(prefix, mid)` returns one
-  subject, `<prefix>.<22-character nuid>`. `prefix` defaults to `_INBOX`.
-  `mid`, when passed, is that token.
-- `client:new_inbox(prefix, mid)` returns the same shape. `prefix` defaults to
-  the client's `inbox_prefix` option.
-- `client.inbox_prefix` is that option (default `_INBOX`). `client.inbox_muxed`
-  is `<inbox_prefix>.<22-character nuid>`, and the connection subscribes to
-  `client.inbox_muxed` with a trailing `.*`. In 0.4.2, `client.inbox_prefix`
-  held the mux prefix.
-- `client.inbox_sid` is `"1"`. User subscription ids are short numeric strings
-  and start at `"2"`.
-- `client:create_inbox(lid)` returns `<inbox_muxed>.<lid>, lid`. The generated
-  `lid` is an 8-character sequence. In 0.4.2 it was a 22-character nuid.
-- Consumer info keeps `paused` and `pause_remaining` when the server sends
-  `false`.
-- `tests/test_nats.lua` uses a server on `127.0.0.1:4222` and a short-lived
-  `nats-server` for authentication and lame duck. `tests/test_functions.lua`
-  starts a single-node JetStream server on `127.0.0.1:14422`.
-  `tests/fakesock.lua` feeds the benchmarks.
->>>>>>> 3b39e7c (returned inbox_sid to 1 and not random string - user subs start at 2)
 
 ## Changes in 0.4.2
 

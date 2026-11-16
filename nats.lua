@@ -18,7 +18,7 @@ local socket = require('socket')
 local nuid = require('nuid')
 
 local nats = {
-	_VERSION     = 'nats-lua 0.4.4',
+	_VERSION     = 'nats-lua 0.4.5',
 	_DESCRIPTION = 'Lua client for NATS w/ headers, tls, request/reply, JetStream - https://nats.io',
 	_COPYRIGHT   = 'Copyright (C) 2023-2026 Sam Orlando - MIT',
 	--
@@ -336,7 +336,7 @@ nats.client_metatable = {
 	__index = function(self, key) return rawget(getmetatable(self), "methods")[key] end,
 	methods = {},
 	lang = 'lua',
-	version = '0.4.4',
+	version = '0.4.5',
 }
 local client_metatable = nats.client_metatable
 
