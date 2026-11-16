@@ -388,7 +388,7 @@ nats.valid_config = valid_config
 
 local nats_inbox_prefix = "_INBOX"
 local nats_inbox_mbid_nuid = nuid({ preLen = 22, seqLen = 0 })
-local nats_inbox_lid_nuid = nuid({ preLen = 8, seqLen = 0 }) -- letter ids are 8 char random with no sequence
+local nats_inbox_lid_nuid = nuid({ preLen = 0, seqLen = 8 }) -- letter ids are an 8-character sequence
 local nats_inbox_sid_nuid = nuid({ preLen = 8, seqLen = 0 })
 
 local function create_client(config, n_opts)
