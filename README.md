@@ -357,12 +357,16 @@ globally in `nats.defaults`.
 
 The test scripts need `nuid` on `LUA_PATH`: either `luarocks install nuid`, or a
 clone of [lua-nuid](https://github.com/SamOrlando/lua-nuid) passed as `NUID_DIR`.
-Integration tests run only against a server you point them at with `NATS_URL`
-(default `nats://127.0.0.1:4222`); `test_local.lua` starts its own `nats-server`
-on 127.0.0.1.
+`tests/test_nats.lua` talks to a NATS server on `127.0.0.1:4222` and starts a
+short-lived `nats-server` on `127.0.0.1` for authentication and lame duck.
+`tests/test_functions.lua` starts its own single-node JetStream `nats-server`
+on `127.0.0.1:14422` (monitor `18422`, WebSocket `18480`, TLS `14423`) and
+exercises the client against that server.
+Integration tests run when `NATS_URL` is set (default `nats://127.0.0.1:4222`).
+`test_local.lua` starts its own `nats-server` on `127.0.0.1`.
 
 ```sh
-NUID_DIR=/path/to/lua-nuid tests/run.sh                                   # unit tests + docs check on every Lua found
+NUID_DIR=/path/to/lua-nuid tests/run.sh                                   # tests + docs check on every Lua found
 (cd tests/interop && go build -o interop .) && NATS_URL=... lua tests/interop/objs_interop.lua  # nats.go interop
 NATS_URL=nats://127.0.0.1:4222 NUID_DIR=... tests/run.sh                  # + integration tests
 NATS_NO_CJSON=1 NATS_URL=... lua tests/test_integration.lua               # with the pure Lua JSON codec
@@ -372,9 +376,11 @@ LUA_PATH="./?.lua;$NUID_DIR/?.lua;;" lua tests/check_docs.lua             # ever
 lua tests/bench.lua 200000                                                # parser/publish benchmark
 ```
 
-The unit tests (`tests/test_nats.lua`) drive the protocol through a fake
-socket (`tests/fakesock.lua`). The integration tests only use subjects under
-`nats-lua.test.<random>.>` and delete the streams and buckets they create.
+`tests/test_nats.lua` uses subjects under `nats-lua.unit.<random>`.
+`tests/test_functions.lua` uses `fn.<random>` and deletes the streams and
+buckets it creates. Integration tests use `nats-lua.test.<random>.>` and
+delete the streams and buckets they create. `tests/fakesock.lua` feeds the
+benchmarks.
 
 ## Changes in 0.4.2
 

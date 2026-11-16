@@ -1,7 +1,11 @@
 #!/bin/sh
-# Run unit tests (and integration tests when NATS_URL is set) on every
-# available Lua interpreter. lua-nuid must be on LUA_PATH (or set NUID_DIR).
-# Exits non-zero when any suite fails (output is shown in full).
+# Run tests on every available Lua interpreter. lua-nuid must be on LUA_PATH
+# (or set NUID_DIR). test_nats.lua needs a NATS server on 127.0.0.1:4222 and
+# nats-server on PATH (or NATS_SERVER_BIN) for auth and lame duck.
+# test_functions.lua starts its own JetStream nats-server on 127.0.0.1:14422
+# (monitor 18422, websocket 18480, TLS 14423).
+# Integration tests run when NATS_URL is set. test_local runs when
+# NATS_SERVER_BIN is set. Exits non-zero when any suite fails.
 cd "$(dirname "$0")/.." || exit 1
 LUA_PATH="./?.lua;./tests/?.lua;${NUID_DIR:+$NUID_DIR/?.lua;};"
 export LUA_PATH
@@ -13,6 +17,7 @@ run() { # run <lua> <suite>
 for lua in ${LUAS:-lua5.1 lua5.2 lua5.3 lua5.4 luajit}; do
     command -v "$lua" >/dev/null 2>&1 || continue
     run "$lua" test_nats
+    run "$lua" test_functions
     run "$lua" test_objs
     run "$lua" test_nkeys
     run "$lua" check_docs

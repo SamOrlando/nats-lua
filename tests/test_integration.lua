@@ -601,7 +601,8 @@ test("JS: consumer pause/resume and pinned priority group (ADR-42)", function()
     if not s2 then error("SKIP no stream", 0) end
     local c = assert(s2:consumer({ name = "pausable", ack_policy = "explicit" }, "create"))
     local r = assert(c:pause(os.time() + 120)); eq(r.paused, true)
-    eq(c:info().paused, true)
+    -- consumer info is replicated; a follower can omit paused for a moment
+    assert(pump(5, function() return c:info().paused == true end), "consumer info reports paused")
     eq(assert(c:resume()).paused, false)
     local pc, perr = s2:consumer({ name = "pinned", ack_policy = "explicit", priority_groups = { "g1" },
         priority_policy = "pinned_client", priority_timeout = 30 * nats.jetstream.NS }, "create")
@@ -869,7 +870,13 @@ test("JS: consumer:stop()/drain() for pull consume, messages, push, ordered", fu
     eq(e, "stopped")
     local before = a; pump(1); eq(a, before, "no deliveries after stop")
     assert(c:info(), "consumer still exists on the server")
-    eq(#c:fetch(1, nil, 1), 1, "fetch re-subscribes after stop()")
+    -- the stopped pulls still hold interest until they expire, and they may
+    -- already have taken every published message. Wait them out, then fetch a new one.
+    assert(pump(4, function() return (c:info().num_waiting or 0) == 0 end), "outstanding pulls finished")
+    assert(nc:js_publish(P .. ".sd.x", "after-stop"))
+    local got, ferr = c:fetch(1, nil, 2)
+    eq(#got, 1, "fetch re-subscribes after stop() (" .. tostring(ferr) .. ")")
+    got[1]:ack()
     -- drain(): in-flight messages of outstanding pulls are delivered, then stop
     local c2 = assert(st:consumer({ name = "d1", ack_policy = "explicit" }, "create"))
     local d = 0
@@ -888,7 +895,7 @@ test("JS: consumer:stop()/drain() for pull consume, messages, push, ordered", fu
     -- push consumer: consumer:stop() stops the push subscription, PushSub:drain()
     local pn = 0
     local ps = assert(st:subscribe({ durable_name = "pd", ack_policy = "none" }, function() pn = pn + 1 end, { keep = true }))
-    pump(3, function() return pn == 40 end); eq(pn, 40)
+    pump(3, function() return pn == 41 end); eq(pn, 41)
     eq(ps.consumer:stop(), 1); eq(ps:closed(), true)
     local ps2 = assert(st:subscribe({ ack_policy = "none" }, function() pn = pn + 1 end))
     pump(0.5); eq(ps2:drain(2), true); eq(ps2:closed(), true)

@@ -1,13 +1,17 @@
 -- Copyright (c) 2023-2026 Sam Orlando
 -- SPDX-License-Identifier: MIT (see LICENSE)
--- Unit tests for nats.lua using a fake socket (no network needed).
+-- Tests for nats.lua against a NATS server on 127.0.0.1:4222.
+-- A short-lived nats-server on 127.0.0.1 covers auth and lame duck.
 -- usage: lua tests/test_nats.lua   (run from the repository root)
 package.path = "./?.lua;./tests/?.lua;" .. package.path
 
-local fakesock = require("fakesock")
 local nats = require("nats")
 local json = nats.json
+local socket = require("socket")
+local nuid = require("nuid")
 
+local URL = "nats://127.0.0.1:4222"
+local P = "nats-lua.unit." .. nuid.next():sub(1, 10)
 local passed, failed = 0, 0
 local function test(name, fn)
     local ok, err = pcall(fn)
@@ -17,45 +21,171 @@ local function eq(a, b, msg)
     if a ~= b then error((msg or "") .. " expected [" .. tostring(b) .. "] got [" .. tostring(a) .. "]", 2) end
 end
 
-local INFO = { server_id = "TEST", version = "2.10.23", proto = 1, headers = true, max_payload = 1048576 }
+local function dial(opts)
+    opts = opts or {}
+    if not opts.servers and not opts.host then opts.servers = { URL } end
+    if opts.timeout == nil then opts.timeout = 2 end
+    local c = nats.client(opts)
+    local ok, err = pcall(function() assert(c:connect()) end)
+    if not ok then error("connect " .. tostring(opts.servers and opts.servers[1] or URL) .. ": " .. tostring(err), 0) end
+    return c
+end
 
--- scripted fake server: answers PING with PONG, optional request responder
-local function fake_server(o)
-    o = o or {}
-    local st = { socks = {}, connects = {} }
-    nats.socket_factory = function(srv, cfg)
-        if o.refuse and o.refuse(srv, #st.socks) then return nil, "connection refused" end
-        local info = o.info or INFO
-        local s = fakesock.new(o.greeting or ("INFO " .. json.encode(info) .. "\r\n"))
-        s.srv = srv
-        s.on_send = function(sock, data)
-            local i = 1
-            while i <= #data do
-                local e = data:find("\r\n", i, true)
-                if not e then break end
-                local line = data:sub(i, e - 1)
-                i = e + 2
-                local verb = line:match("^(%S+)")
-                if verb == "PING" then
-                    if not st.no_pong then sock:feed("PONG\r\n") end
-                elseif verb == "CONNECT" then
-                    st.connects[#st.connects + 1] = json.decode(line:sub(9))
-                    if o.connect_err then sock:feed("-ERR '" .. o.connect_err .. "'\r\n") end
-                elseif verb == "PUB" or verb == "HPUB" then
-                    local args = {}
-                    for a in line:gmatch("%S+") do args[#args + 1] = a end
-                    local size = tonumber(args[#args])
-                    local payload = data:sub(i, i + size - 1)
-                    i = i + size + 2
-                    if o.on_pub then o.on_pub(sock, args, payload) end
-                end
-            end
-        end
-        st.socks[#st.socks + 1] = s
-        st.last = s
-        return s
+local function wait_port(port)
+    for _ = 1, 50 do
+        local s = socket.tcp(); s:settimeout(0.1)
+        if s:connect("127.0.0.1", port) then s:close() return true end
+        s:close(); socket.sleep(0.05)
     end
-    return st
+    return false
+end
+
+local function http_get(port, path)
+    local s = socket.tcp(); s:settimeout(2)
+    local ok = s:connect("127.0.0.1", port)
+    if not ok then s:close() return nil, "monitor down" end
+    s:send("GET " .. path .. " HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+    local parts = {}
+    while true do
+        local chunk, _, partial = s:receive(4096)
+        if chunk then parts[#parts + 1] = chunk
+        else
+            if partial and partial ~= "" then parts[#parts + 1] = partial end
+            break
+        end
+    end
+    s:close()
+    local body = table.concat(parts)
+    local i = body:find("\r\n\r\n", 1, true)
+    return i and body:sub(i + 4) or body
+end
+
+-- LuaSocket TCP objects are userdata, so the wrappers below replace client.socket
+-- with a table that forwards to the live socket.
+local function proxy_socket(sock, hooks)
+    hooks = hooks or {}
+    local proxy = {}
+    function proxy:receive(pat, prefix)
+        if hooks.receive then return hooks.receive(sock, pat, prefix) end
+        return sock:receive(pat, prefix)
+    end
+    function proxy:send(data, i, j)
+        if hooks.send then return hooks.send(sock, data, i, j) end
+        return sock:send(data, i, j)
+    end
+    function proxy:settimeout(t) return sock:settimeout(t) end
+    function proxy:close() return sock:close() end
+    function proxy:shutdown() if sock.shutdown then return sock:shutdown() end end
+    function proxy:dirty() return sock.dirty and sock:dirty() end
+    function proxy:getfd() return sock.getfd and sock:getfd() end
+    function proxy:setoption(opt, val) if sock.setoption then return sock:setoption(opt, val) end end
+    return proxy
+end
+
+-- One new byte per receive, so the partial-read path runs on frames from the real server.
+local function drip(client)
+    client.socket = proxy_socket(client.socket, { receive = function(raw, pat, prefix)
+        prefix = prefix or ""
+        if pat == "*l" then
+            local buf = prefix
+            if buf:sub(-1) == "\n" then
+                if buf:sub(-2, -2) == "\r" then return buf:sub(1, -3) end
+                return buf:sub(1, -2)
+            end
+            local b, err = raw:receive(1)
+            if not b then return nil, err, buf ~= "" and buf or nil end
+            buf = buf .. b
+            if b == "\n" then
+                if buf:sub(-2, -2) == "\r" then return buf:sub(1, -3) end
+                return buf:sub(1, -2)
+            end
+            return nil, "timeout", buf
+        elseif type(pat) == "number" then
+            if #prefix >= pat then return prefix:sub(1, pat) end
+            local b, err = raw:receive(1)
+            if not b then return nil, err, prefix ~= "" and prefix or nil end
+            local buf = prefix .. b
+            if #buf >= pat then return buf end
+            return nil, "timeout", buf
+        end
+        return raw:receive(pat, prefix ~= "" and prefix or nil)
+    end })
+end
+
+-- A conforming server answers PING. Dropping our own PING leaves pongs unmatched.
+local function drop_pings(client)
+    client.socket = proxy_socket(client.socket, { send = function(raw, data, i, j)
+        if data == "PING\r\n" then return #data end
+        return raw:send(data, i, j)
+    end })
+end
+
+local nsub = 0
+local function subj()
+    nsub = nsub + 1
+    return P .. "." .. nsub
+end
+
+local function bye(...)
+    for i = 1, select("#", ...) do
+        local c = select(i, ...)
+        if c then pcall(function() c:close() end) end
+    end
+end
+
+-- Auth, nkey, and lame duck need a server that enforces them. The broker on
+-- 4222 accepts any credentials and must not be put into lame duck.
+local auth_port, auth_mon, auth_user, auth_stop, auth_pid = 14321, 18321
+local function ensure_auth_server()
+    if auth_stop then return end
+    local nkeys = require("nats-nkeys")
+    auth_user = nkeys.create_pair("user")
+    local dir = os.tmpname(); os.remove(dir); assert(os.execute("mkdir -p " .. dir))
+    local conf = string.format([[
+listen: 127.0.0.1:%d
+http: 127.0.0.1:%d
+lame_duck_duration: "30s"
+lame_duck_grace_period: "10s"
+max_payload: 32
+authorization {
+  users = [
+    { user: "alice", password: "secret" }
+    { nkey: %q }
+  ]
+}
+]], auth_port, auth_mon, auth_user:public_key())
+    local f = assert(io.open(dir .. "/nats.conf", "w")); f:write(conf); f:close()
+    local bin = os.getenv("NATS_SERVER_BIN") or "nats-server"
+    auth_pid = dir .. "/nats.pid"
+    assert(os.execute(bin .. " -c " .. dir .. "/nats.conf -P " .. auth_pid .. " > " .. dir .. "/nats.log 2>&1 &"))
+    if not wait_port(auth_port) then
+        local log = io.open(dir .. "/nats.log")
+        error("auth server did not start: " .. (log and log:read("*a") or "no log"))
+    end
+    auth_stop = function()
+        local pf = io.open(auth_pid)
+        if pf then
+            local pid = pf:read("*l")
+            pf:close()
+            if pid and pid ~= "" then os.execute("kill -9 " .. pid .. " 2>/dev/null") end
+        end
+        for _ = 1, 50 do
+            local a, b = socket.tcp(), socket.tcp()
+            a:settimeout(0.05); b:settimeout(0.05)
+            local up = a:connect("127.0.0.1", auth_port) or b:connect("127.0.0.1", auth_mon)
+            a:close(); b:close()
+            if not up then break end
+            socket.sleep(0.05)
+        end
+        os.execute("rm -rf " .. dir)
+        auth_stop = nil
+    end
+end
+
+local function signal_ldm()
+    ensure_auth_server()
+    local bin = os.getenv("NATS_SERVER_BIN") or "nats-server"
+    assert(os.execute(bin .. " --signal ldm=" .. auth_pid .. " >/dev/null 2>&1"))
 end
 
 -- helpers ------------------------------------------------------------------
@@ -145,245 +275,297 @@ test("PUB/HPUB wire format (ADR-4 examples)", function()
 end)
 
 -- connection ---------------------------------------------------------------
-test("connect handshake: INFO before CONNECT, CONNECT fields, PING/PONG", function()
-    local st = fake_server()
-    local c = nats.client({ servers = { "nats://alice:secret@h1:4222" }, name = "t" })
-    assert(c:connect())
+test("new_inbox honours inbox_prefix; create_inbox stays on the mux", function()
+    local c = nats.client({ inbox_prefix = "lab.ibx" })
+    local a = c:new_inbox()
+    assert(a:sub(1, 8) == "lab.ibx.", a)
+    assert(not a:sub(9):find(".", 1, true), "new_inbox is prefix plus one token")
+    assert(#a:sub(9) == 22, "mailbox token is a 22-char nuid")
+    assert(a ~= c:new_inbox())
+    local ibx, lid = c:create_inbox()
+    assert(ibx == c.inbox_muxed .. "." .. lid, ibx)
+    assert(c.inbox_muxed:sub(1, 8) == "lab.ibx.")
+    assert(#lid == 8)
+    local mod = nats.new_inbox("lab.ibx")
+    assert(mod:sub(1, 8) == "lab.ibx." and not mod:sub(9):find(".", 1, true))
+    assert(select(2, nats.new_inbox()) == nil)
+end)
+
+test("connect handshake against 127.0.0.1:4222", function()
+    local name = P .. ".conn"
+    local c = dial({ name = name, ignore_discovered_servers = true })
     eq(c.connected, true)
-    local cn = st.connects[1]
-    eq(cn.user, "alice"); eq(cn.pass, "secret"); eq(cn.headers, true); eq(cn.no_responders, true)
-    eq(cn.protocol, 1); eq(cn.name, "t"); eq(cn.lang, "lua")
-    local w = st.last:written()
-    assert(w:find("^CONNECT {"), "CONNECT is the first thing written")
-    assert(w:find("PING\r\n", 1, true))
-    assert(w:find("SUB " .. c.inbox_prefix .. ".* 1\r\n", 1, true), "muxed inbox subscription")
-    eq(c.server_information.server_id, "TEST")
+    eq(c.current_server.host, "127.0.0.1")
+    eq(c.current_server.port, 4222)
+    local si = c.server_information
+    assert(type(si.server_id) == "string" and #si.server_id > 0)
+    eq(si.headers, true)
+    assert((si.proto or 0) >= 1)
+    eq(c.lame_duck, false)
+    assert(c:flush(2))
+    local got
+    local s = subj()
+    local sid = c:subscribe(s, function(m) got = m.data end)
+    c:flush(1)
+    c:publish(s, "ping")
+    c:wait({ sid = sid, timeout = 1 })
+    eq(got, "ping")
+    local body = http_get(8222, "/connz?limit=1024")
+    assert(body and body:find(name, 1, true), "connz did not list " .. name .. ": " .. tostring(body and body:sub(1, 180)))
+    assert(body:find('"lang": "lua"', 1, true) or body:find('"lang":"lua"', 1, true), "connz lang")
+    bye(c)
 end)
 
 test("connect: legacy host/port arguments and nats.connect returns client", function()
-    local st = fake_server()
-    local c = nats.connect("hostx", 4999)
-    eq(st.last.srv.host, "hostx"); eq(st.last.srv.port, 4999)
+    local c = nats.connect("127.0.0.1", 4222)
     eq(c.connected, true)
+    eq(c.current_server.host, "127.0.0.1")
+    eq(c.current_server.port, 4222)
+    bye(c)
 end)
 
-test("connect: -ERR (auth) raises", function()
-    fake_server({ connect_err = "Authorization Violation" })
-    local c = nats.client()
-    local ok, err = pcall(c.connect, c)
-    assert(not ok and tostring(err):find("Authorization Violation"), tostring(err))
-end)
-
-test("connect: tries next server in pool", function()
-    local st = fake_server({ refuse = function(srv) return srv.host == "bad" end })
-    local c = nats.client({ servers = "nats://bad:1,nats://good:2", no_randomize = true })
+test("connect: tries the next server in the pool", function()
+    local c = nats.client({
+        servers = "nats://127.0.0.1:1,nats://127.0.0.1:4222",
+        no_randomize = true, ignore_discovered_servers = true, timeout = 2,
+    })
     assert(c:connect())
-    eq(c.current_server.host, "good")
+    eq(c.current_server.host, "127.0.0.1")
+    eq(c.current_server.port, 4222)
+    bye(c)
 end)
 
--- parsing ------------------------------------------------------------------
 test("MSG with CRLF and binary inside payload, split reads", function()
-    local st = fake_server()
-    local c = nats.client(); c:connect()
+    local c = dial({ ignore_discovered_servers = true })
     local got = {}
-    local sid = c:subscribe("a.b", function(m) got[#got + 1] = m end)
+    local s = subj()
+    local sid = c:subscribe(s, function(m) got[#got + 1] = m end)
+    c:flush(1)
+    drip(c)
     local p1 = "line1\r\nline2\n\0\255end"
-    local frame = "MSG a.b " .. sid .. " r.1 " .. #p1 .. "\r\n" .. p1 .. "\r\n" ..
-        "MSG a.b " .. sid .. " 3\r\nxyz\r\n"
-    -- deliver one byte at a time to exercise partial-read carry-over
-    local pos = 0
-    st.last.on_empty = function()
-        pos = pos + 1
-        if pos <= #frame then return frame:sub(pos, pos) end
-    end
+    c:publish(s, p1, "r.1")
+    c:publish(s, "xyz")
     local m = c:wait({ maxcount = 2, timeout = 2 })
     eq(#got, 2)
     eq(got[1].data, p1); eq(got[1].reply, "r.1"); eq(got[1].sid, sid)
     eq(got[2].data, "xyz"); eq(got[2].reply, nil)
     eq(m.data, "xyz")
+    bye(c)
 end)
 
 test("HMSG headers and status, header passthrough", function()
-    local st = fake_server()
-    local c = nats.client(); c:connect()
+    local c = dial({ ignore_discovered_servers = true })
     local got
-    local sid = c:subscribe("h", function(m) got = m end)
-    local hdr = "NATS/1.0\r\nHeader1: X\r\nHeader1: Y\r\nHeader2: Z\r\n\r\n"
-    st.last:feed("HMSG h " .. sid .. " REPLY " .. #hdr .. " " .. (#hdr + 7) .. "\r\n" .. hdr .. "PAYLOAD\r\n")
+    local s = subj()
+    local sid = c:subscribe(s, function(m) got = m end)
+    c:flush(1)
+    c:publish(s, "PAYLOAD", "REPLY", { Header1 = { "X", "Y" }, Header2 = "Z" })
     c:wait({ sid = sid, timeout = 1 })
     eq(got.data, "PAYLOAD"); eq(got.reply, "REPLY")
-    eq(got.header, "Header1: X\r\nHeader1: Y\r\nHeader2: Z\r\n")
     local h = got:headers()
-    eq(h.Header1[2], "Y"); eq(h.Header2, "Z")
+    eq(h.Header1[1], "X"); eq(h.Header1[2], "Y"); eq(h.Header2, "Z")
     eq(got:status(), nil)
+    bye(c)
 end)
 
 test("request/get with muxed inbox", function()
-    local st = fake_server({ on_pub = function(sock, args, payload)
-        if args[2] == "svc.echo" then
-            sock:feed("MSG " .. args[3] .. " 1 " .. (#payload + 5) .. "\r\necho:" .. payload .. "\r\n")
-        end
-    end })
-    local c = nats.client(); c:connect()
-    local r = c:get("svc.echo", "hi")
+    local c = dial({ ignore_discovered_servers = true })
+    local s = subj()
+    c:subscribe(s, function(m) m:respond("echo:" .. m.data) end)
+    c:flush(1)
+    local r = c:get(s, "hi")
     eq(r.data, "echo:hi")
-    assert(r.subject:find(c.inbox_prefix, 1, true) == 1)
+    assert(r.subject:sub(1, #c.inbox_muxed + 1) == c.inbox_muxed .. ".")
     eq(next(c.inbox_table), nil, "inbox entry cleaned up")
-    -- async request with callback
     local cb
-    local m = c:request("svc.echo", function(x) cb = x.data end, "yo")
+    local m = c:request(s, function(x) cb = x.data end, "yo")
     c:wait({ lid = m.lid, timeout = 1 })
     eq(cb, "echo:yo")
+    bye(c)
 end)
 
-test("no responders (503) and timeout", function()
-    local st = fake_server({ on_pub = function(sock, args)
-        if args[2] == "nobody" then
-            local h = "NATS/1.0 503\r\n\r\n"
-            sock:feed("HMSG " .. args[3] .. " 1 " .. #h .. " " .. #h .. "\r\n" .. h .. "\r\n")
-        end
-    end })
-    local c = nats.client({ timeout = 0.2 }); c:connect()
-    local r, err = c:get("nobody", "x")
-    eq(r, nil); eq(err, "no responders")
-    local _, _, raw = c:get("nobody", "x")
-    eq(raw.status_code, "503"); eq(raw:status(), 503)
-    r, err = c:get("silent", "x")
-    eq(r, nil); eq(err, "timeout")
+test("empty request times out, or reports 503 when the server sends it", function()
+    local c = dial({ ignore_discovered_servers = true, timeout = 0.4 })
+    local r, err, raw = c:get(subj(), "x")
+    eq(r, nil)
+    if err == "no responders" then
+        eq(raw.status_code, "503")
+        eq(raw:status(), 503)
+    else
+        eq(err, "timeout")
+    end
     eq(next(c.inbox_table), nil)
+    bye(c)
 end)
 
-test("server PING answered with PONG, +OK ignored, -ERR reported", function()
-    local st = fake_server()
+test("flush answers server PING and ignores +OK", function()
     local errs = {}
-    local c = nats.client({ error_cb = function(_, e) errs[#errs + 1] = e end }); c:connect()
-    st.last:clear()
-    st.last:feed("PING\r\n+OK\r\n-ERR 'Permissions Violation for Publish to \"x\"'\r\n")
-    c:wait({ timeout = 0.05 })
-    assert(st.last:written():find("PONG\r\n", 1, true))
-    eq(errs[1], 'Permissions Violation for Publish to "x"')
+    local c = dial({
+        verbose = true, ignore_discovered_servers = true,
+        error_cb = function(_, e) errs[#errs + 1] = e end,
+    })
+    c:publish(subj(), "x")
+    assert(c:flush(2))
+    eq(#errs, 0)
+    bye(c)
+end)
+
+test("server -ERR maximum payload is reported", function()
+    ensure_auth_server()
+    local errs = {}
+    local c = dial({
+        servers = { "nats://alice:secret@127.0.0.1:" .. auth_port },
+        ignore_discovered_servers = true,
+        error_cb = function(_, e) errs[#errs + 1] = e end,
+    })
+    c.server_information.max_payload = 64
+    local ok, err = pcall(function()
+        c:publish(subj(), string.rep("x", 64))
+        c:wait({ timeout = 1 })
+    end)
+    local joined = (table.concat(errs, " ") .. " " .. tostring(err)):lower()
+    assert(joined:find("payload", 1, true), "expected payload -ERR, got [" .. joined .. "] ok=" .. tostring(ok))
+    bye(c)
 end)
 
 test("max_payload from INFO enforced locally", function()
-    local info = {}; for k, v in pairs(INFO) do info[k] = v end
-    info.max_payload = 10
-    fake_server({ info = info })
-    local c = nats.client(); c:connect()
-    c:publish("x", "0123456789")
-    local ok, err = pcall(c.publish, c, "x", "01234567890")
-    assert(not ok and err:find("maximum payload"), err)
+    local c = dial({ ignore_discovered_servers = true })
+    c.server_information.max_payload = 10
+    c:publish(subj(), "0123456789")
+    local ok, err = pcall(c.publish, c, subj(), "01234567890")
+    assert(not ok and tostring(err):find("maximum payload"), tostring(err))
+    bye(c)
 end)
 
 test("invalid subjects rejected before hitting the wire", function()
-    fake_server()
-    local c = nats.client(); c:connect()
+    local c = dial({ ignore_discovered_servers = true })
     assert(not pcall(c.publish, c, "bad subject", "x"))
     assert(not pcall(c.publish, c, "a..b", "x"))
     assert(not pcall(c.subscribe, c, "a.>.b"))
     assert(not pcall(c.subscribe, c, "a", nil, "bad queue"))
+    bye(c)
 end)
 
 test("unsubscribe with max auto-removes", function()
-    local st = fake_server()
-    local c = nats.client(); c:connect()
+    local c = dial({ ignore_discovered_servers = true })
     local n = 0
-    local sid = c:subscribe("m", function() n = n + 1 end)
+    local s = subj()
+    local sid = c:subscribe(s, function() n = n + 1 end)
     c:unsubscribe(sid, 2)
-    assert(st.last:written():find("UNSUB " .. sid .. " 2\r\n", 1, true))
-    st.last:feed(("MSG m " .. sid .. " 1\r\nx\r\n"):rep(2))
+    c:flush(1)
+    c:publish(s, "x"); c:publish(s, "x"); c:publish(s, "x")
     c:wait({ maxcount = 2, timeout = 1 })
     eq(n, 2); eq(c.subscriptions[sid], nil)
+    bye(c)
 end)
 
 test("wait maxcount processes exactly maxcount messages", function()
-    local st = fake_server()
-    local c = nats.client(); c:connect()
+    local c = dial({ ignore_discovered_servers = true })
     local n = 0
-    local sid = c:subscribe("m", function() n = n + 1 end)
-    st.last:feed(("MSG m " .. sid .. " 1\r\nx\r\n"):rep(3))
+    local s = subj()
+    local sid = c:subscribe(s, function() n = n + 1 end)
+    c:flush(1)
+    c:publish(s, "x"); c:publish(s, "x"); c:publish(s, "x")
     c:wait({ maxcount = 2, timeout = 1 })
     eq(n, 2)
+    bye(c)
 end)
 
-test("INFO update: connect_urls merged, lame duck callback", function()
-    local st = fake_server()
-    local ldm = false
-    local c = nats.client({ lame_duck_cb = function() ldm = true end }); c:connect()
-    st.last:feed('INFO {"connect_urls":["10.1.1.1:4222","10.1.1.2:4222"],"ldm":true}\r\n')
-    c:wait({ timeout = 0.05 })
-    eq(ldm, true); eq(c.lame_duck, true)
-    eq(#c.servers, 3)
+test("INFO connect_urls are merged and the connection is not lame duck", function()
+    local c = dial()
+    assert(#c.servers > 1, "expected discovered connect_urls, have " .. #c.servers)
+    eq(c.current_server.host, "127.0.0.1")
+    eq(c.current_server.port, 4222)
+    eq(c.lame_duck, false)
+    bye(c)
 end)
 
-test("keepalive: missed PONGs -> reconnect + resubscribe", function()
-    local st = fake_server()
+test("keepalive: missed PONGs reconnect and resubscribe", function()
     local events = {}
-    local c = nats.client({ reconnect = true, ping_interval = 0.02, max_pings_out = 2, reconnect_wait = 0.01,
+    local c = dial({
+        reconnect = true, ping_interval = 0.05, max_pings_out = 2,
+        reconnect_wait = 0.01, reconnect_jitter = 0, max_reconnect = -1,
+        no_randomize = true, ignore_discovered_servers = true,
         disconnected_cb = function() events[#events + 1] = "down" end,
-        reconnected_cb = function() events[#events + 1] = "up" end })
-    c:connect()
-    local sid = c:subscribe("keep.me", function() end, "q1")
-    st.no_pong = true
-    local first = st.last
-    -- after the stale detection, a new socket is created; let it answer PONG
-    local orig = nats.socket_factory
-    nats.socket_factory = function(...) st.no_pong = false return orig(...) end
-    c:wait({ timeout = 0.3 })
-    nats.socket_factory = orig
-    assert(st.last ~= first, "new connection created")
+        reconnected_cb = function() events[#events + 1] = "up" end,
+    })
+    local got
+    local s = subj()
+    local sid = c:subscribe(s, function(m) got = m.data end, "q1")
+    c:flush(1)
+    drop_pings(c)
+    local deadline = socket.gettime() + 2
+    while c.stats.reconnects < 1 and socket.gettime() < deadline do
+        pcall(function() c:wait({ timeout = 0.1 }) end)
+    end
+    assert(c.stats.reconnects >= 1, "reconnects " .. tostring(c.stats.reconnects))
+    eq(c:status_string(), "connected")
     eq(events[1], "down"); eq(events[2], "up")
-    assert(st.last:written():find("SUB keep.me q1 " .. sid .. "\r\n", 1, true), "resubscribed")
-    eq(c.stats.reconnects, 1)
+    local pub = dial({ ignore_discovered_servers = true })
+    pub:publish(s, "alive"); pub:flush(1)
+    c:wait({ sid = sid, timeout = 1 })
+    eq(got, "alive")
+    bye(c, pub)
 end)
 
 test("socket closed -> reconnect; without reconnect -> error", function()
-    local st = fake_server()
-    local c = nats.client({ reconnect = true, reconnect_wait = 0.01 }); c:connect()
-    st.last.eof = true
-    c:wait({ timeout = 0.1 })
-    eq(c.connected, true); eq(c.stats.reconnects, 1)
-    local c2 = nats.client(); c2:connect()
-    st.last.eof = true
-    assert(not pcall(c2.wait, c2, { timeout = 0.1 }))
+    local c = dial({
+        reconnect = true, reconnect_wait = 0.01, reconnect_jitter = 0,
+        no_randomize = true, ignore_discovered_servers = true,
+    })
+    c.socket:close()
+    c:wait({ timeout = 1 })
+    eq(c.connected, true)
+    assert(c.stats.reconnects >= 1)
+    bye(c)
+    local c2 = dial({ ignore_discovered_servers = true })
+    c2.socket:close()
+    local ok, err = pcall(c2.wait, c2, { timeout = 0.5 })
+    assert(not ok, tostring(err))
+    bye(c2)
 end)
 
 test("reconnect gives up after max_reconnect", function()
-    local st = fake_server({ refuse = function(_, n) return n >= 1 end })
     local closed = false
-    local c = nats.client({ reconnect = true, max_reconnect = 2, reconnect_wait = 0.001,
-        closed_cb = function() closed = true end })
-    c:connect()
-    st.last.eof = true
-    local ok, err = pcall(c.wait, c, { timeout = 1 })
+    local c = dial({
+        reconnect = true, max_reconnect = 2, reconnect_wait = 0.01, reconnect_jitter = 0,
+        no_randomize = true, ignore_discovered_servers = true,
+        closed_cb = function() closed = true end,
+    })
+    c:set_server_pool("nats://127.0.0.1:1")
+    c.current_server = c.servers[1]
+    c.socket:close()
+    local ok, err = pcall(function() c:wait({ timeout = 2 }) end)
     assert(not ok and tostring(err):find("reconnect failed"), tostring(err))
     eq(closed, true)
+    bye(c)
 end)
 
 test("flush and drain", function()
-    local st = fake_server()
-    local c = nats.client(); c:connect()
-    eq(c:flush(1), true)
+    local c = dial({ ignore_discovered_servers = true })
+    assert(c:flush(1))
     local n = 0
-    local sid = c:subscribe("d", function() n = n + 1 end)
-    st.last:feed("MSG d " .. sid .. " 1\r\nx\r\n")
-    eq(c:drain(1), true)
+    local s = subj()
+    c:subscribe(s, function() n = n + 1 end)
+    c:flush(1)
+    c:publish(s, "x")
+    eq(c:drain(2), true)
     eq(n, 1, "in-flight message delivered during drain")
-    assert(st.last:written():find("UNSUB " .. sid .. "\r\n", 1, true))
     eq(c.connected, false); eq(c.closed, true)
 end)
 
 test("encoded client JSON round trip", function()
-    local st = fake_server({ on_pub = function(sock, args, payload)
-        if args[2] == "json.svc" then
-            local t = nats.json.decode(payload)
-            local out = nats.json.encode({ sum = t.a + t.b })
-            sock:feed("MSG " .. args[3] .. " 1 " .. #out .. "\r\n" .. out .. "\r\n")
-        end
-    end })
-    local c = nats.client(); c:connect()
+    local c = dial({ ignore_discovered_servers = true })
+    local s = subj()
+    c:subscribe(s, function(m)
+        local t = nats.json.decode(m.data)
+        m:respond(nats.json.encode({ sum = t.a + t.b }))
+    end)
+    c:flush(1)
     local ec = c:encoded_client()
-    local r = ec:get("json.svc", { a = 2, b = 3 })
+    local r = ec:get(s, { a = 2, b = 3 })
     eq(r.data.sum, 5)
+    bye(c)
 end)
 
 test("creds parsing", function()
@@ -399,97 +581,183 @@ SUAEXAMPLESEED
     eq(jwt, "eyJhbGciOi.payload.sig"); eq(seed, "SUAEXAMPLESEED")
 end)
 
-test("nkey auth uses signature_cb with server nonce", function()
-    local info = {}; for k, v in pairs(INFO) do info[k] = v end
-    info.nonce = "NONCE123"
-    local st = fake_server({ info = info })
-    local c = nats.client({ nkey = "UPUBKEY", signature_cb = function(n) return "sig(" .. n .. ")" end })
-    c:connect()
-    eq(st.connects[1].nkey, "UPUBKEY"); eq(st.connects[1].sig, "sig(NONCE123)")
-end)
-
-
+-- The broker on 4222 stays up. Refusing the reconnect dial leaves a window
+-- where publishes buffer; the next attempt connects to 127.0.0.1:4222.
 test("publish buffering while reconnecting (ADR-40)", function()
-    local down = false
-    local st = fake_server({ refuse = function(_, n) return down and n >= 1 end })
+    local s = subj()
+    local got = {}
+    local sub = dial({ ignore_discovered_servers = true })
+    sub:subscribe(s, function(m) got[#got + 1] = m.data end)
+    sub:flush(1)
     local ev = {}
-    local c = nats.client({ reconnect = true, reconnect_wait = 0.05, reconnect_jitter = 0, max_reconnect = -1,
+    local c = dial({
+        reconnect = true, reconnect_wait = 0.4, reconnect_jitter = 0, max_reconnect = -1,
+        no_randomize = true, ignore_discovered_servers = true,
         disconnected_cb = function() ev[#ev + 1] = "down" end,
-        reconnected_cb = function() ev[#ev + 1] = "up" end })
-    c:connect()
-    local sid = c:subscribe("keep", function() end)
-    down = true
-    st.last.eof = true
-    c:wait({ timeout = 0.01 })
-    eq(c:status_string(), "reconnecting")
-    local t0 = require("socket").gettime()
-    c:publish("buf.a", "one")
-    c:publish("buf.b", "two")
-    assert(require("socket").gettime() - t0 < 0.02, "publish did not block")
-    eq(c:buffered() > 0, true)
-    down = false
-    c:wait({ timeout = 0.3 })
-    eq(c:status_string(), "connected")
-    eq(c:buffered(), 0)
-    local w = st.last:written()
-    local isub, ipub = w:find("SUB keep " .. sid, 1, true), w:find("PUB buf.a 3\r\none\r\nPUB buf.b 3\r\ntwo", 1, true)
-    assert(isub and ipub and isub < ipub, "resubscribed then flushed buffered publishes")
-    eq(ev[1], "down"); eq(ev[2], "up")
+        reconnected_cb = function() ev[#ev + 1] = "up" end,
+    })
+    local orig = nats.socket_factory
+    local held = true
+    nats.socket_factory = function(srv, cfg)
+        if held then return nil, "down" end
+        return orig(srv, cfg)
+    end
+    local ok, err = pcall(function()
+        c.socket:close()
+        c:wait({ timeout = 0.15 })
+        eq(c:status_string(), "reconnecting")
+        local t0 = socket.gettime()
+        c:publish(s, "one")
+        c:publish(s, "two")
+        assert(socket.gettime() - t0 < 0.2, "publish did not return while reconnecting")
+        assert(c:buffered() > 0, "buffered while down")
+        held = false
+        local deadline = socket.gettime() + 3
+        while #got < 2 and socket.gettime() < deadline do
+            c:wait({ timeout = 0.05 })
+            sub:wait({ timeout = 0.05 })
+        end
+        eq(c:status_string(), "connected")
+        eq(c:buffered(), 0)
+        eq(#got, 2); eq(got[1], "one"); eq(got[2], "two")
+        eq(ev[1], "down"); eq(ev[2], "up")
+    end)
+    nats.socket_factory = orig
+    bye(c, sub)
+    if not ok then error(err, 0) end
 end)
 
 test("reconnect buffer limit", function()
-    local st = fake_server({ refuse = function(_, n) return n >= 1 end })
-    local c = nats.client({ reconnect = true, reconnect_wait = 10, max_reconnect = -1, reconnect_buf_size = 10 })
-    c:connect()
-    st.last.eof = true
-    c:wait({ timeout = 0.01 })
-    assert(not pcall(c.publish, c, "x", string.rep("y", 20)))
+    local c = dial({
+        reconnect = true, reconnect_wait = 2, reconnect_jitter = 0, max_reconnect = -1,
+        reconnect_buf_size = 10, no_randomize = true, ignore_discovered_servers = true,
+    })
+    c:set_server_pool("nats://127.0.0.1:1")
+    c.current_server = c.servers[1]
+    c.socket:close()
+    c:wait({ timeout = 0.2 })
+    eq(c:status_string(), "reconnecting")
+    local ok, err = pcall(c.publish, c, subj(), string.rep("y", 20))
+    assert(not ok and tostring(err):find("reconnect buffer"), tostring(err))
+    bye(c)
 end)
 
 test("tickers fire from the pump loop", function()
-    fake_server()
-    local c = nats.client(); c:connect()
+    local c = dial({ ignore_discovered_servers = true })
     local n = 0
     c:add_ticker(0.01, function() n = n + 1; if n == 3 then return false end end)
-    c:wait({ timeout = 0.1 })
+    c:wait({ timeout = 0.2 })
     eq(n, 3)
+    bye(c)
 end)
 
-test("nkey seed auth signs nonce with built-in ed25519", function()
-    local nkeys = require("nats-nkeys")
-    local info = {}; for k, v in pairs(INFO) do info[k] = v end
-    info.nonce = "NONCE123"
-    local st = fake_server({ info = info })
-    local seed = "SUANU6Z2W3GZXAGW7HW542S7DV64FPWMCN3DXKNMJU5DLTONOQDP4UFKNY"
-    local c = nats.client({ nkey_seed = seed }); c:connect()
-    eq(st.connects[1].nkey, "UDHCE3WRB3YPXVFQR34XLEURROUWO22W377GUOHCY7SCO2DBLWH7QSJT")
-    eq(st.connects[1].sig, nkeys.from_seed(seed):sign_nonce("NONCE123"))
+test("connect: wrong password is rejected, the right password connects", function()
+    ensure_auth_server()
+    local bad = nats.client({
+        servers = { "nats://alice:wrong@127.0.0.1:" .. auth_port },
+        timeout = 2, ignore_discovered_servers = true,
+    })
+    local ok, err = pcall(bad.connect, bad)
+    assert(not ok and tostring(err):lower():find("authorization"), tostring(err))
+    bye(bad)
+    local c = dial({
+        servers = { "nats://alice:secret@127.0.0.1:" .. auth_port },
+        ignore_discovered_servers = true,
+    })
+    assert(c:flush(1))
+    local got
+    local s = subj()
+    local sid = c:subscribe(s, function(m) got = m.data end)
+    c:flush(1)
+    c:publish(s, "auth")
+    c:wait({ sid = sid, timeout = 1 })
+    eq(got, "auth")
+    bye(c)
 end)
 
-test("creds auth signs with the seed in the creds file", function()
-    local info = {}; for k, v in pairs(INFO) do info[k] = v end
-    info.nonce = "abc"
-    local st = fake_server({ info = info })
+test("nkey seed auth against 127.0.0.1", function()
+    ensure_auth_server()
+    local c = dial({
+        servers = { "nats://127.0.0.1:" .. auth_port },
+        nkey_seed = auth_user:seed(), ignore_discovered_servers = true,
+    })
+    assert(c:flush(1))
+    local got
+    local s = subj()
+    local sid = c:subscribe(s, function(m) got = m.data end)
+    c:publish(s, "ok"); c:wait({ sid = sid, timeout = 1 })
+    eq(got, "ok")
+    bye(c)
     local nkeys = require("nats-nkeys")
-    local creds = nkeys.format_creds("eyJ0.eyJ1.sig", "SUANU6Z2W3GZXAGW7HW542S7DV64FPWMCN3DXKNMJU5DLTONOQDP4UFKNY")
-    local c = nats.client({ creds = creds }); c:connect()
-    eq(st.connects[1].jwt, "eyJ0.eyJ1.sig")
-    eq(st.connects[1].sig, nkeys.from_seed("SUANU6Z2W3GZXAGW7HW542S7DV64FPWMCN3DXKNMJU5DLTONOQDP4UFKNY"):sign_nonce("abc"))
+    local bad = nats.client({
+        servers = { "nats://127.0.0.1:" .. auth_port },
+        nkey_seed = nkeys.create_pair("user"):seed(),
+        timeout = 2, ignore_discovered_servers = true,
+    })
+    local ok, err = pcall(bad.connect, bad)
+    assert(not ok and tostring(err):lower():find("authorization"), tostring(err))
+    bye(bad)
+end)
+
+test("nkey auth uses signature_cb with the server nonce", function()
+    ensure_auth_server()
+    local seen
+    local c = nats.client({
+        servers = { "nats://127.0.0.1:" .. auth_port },
+        nkey = auth_user:public_key(),
+        signature_cb = function(nonce)
+            seen = nonce
+            return auth_user:sign_nonce(nonce)
+        end,
+        timeout = 2, ignore_discovered_servers = true,
+    })
+    assert(c:connect())
+    assert(c:flush(1))
+    assert(type(seen) == "string" and #seen > 0, "nonce")
+    bye(c)
+    local bad = nats.client({
+        servers = { "nats://127.0.0.1:" .. auth_port },
+        nkey = auth_user:public_key(),
+        signature_cb = function() return "nope" end,
+        timeout = 2, ignore_discovered_servers = true,
+    })
+    local ok, err = pcall(bad.connect, bad)
+    assert(not ok, tostring(err))
+    bye(bad)
+end)
+
+test("lame duck callback from the private server", function()
+    ensure_auth_server()
+    local ldm = false
+    local c = dial({
+        servers = { "nats://alice:secret@127.0.0.1:" .. auth_port },
+        ignore_discovered_servers = true,
+        lame_duck_cb = function() ldm = true end,
+    })
+    signal_ldm()
+    local deadline = socket.gettime() + 3
+    while not ldm and socket.gettime() < deadline do
+        pcall(function() c:wait({ timeout = 0.2 }) end)
+    end
+    eq(ldm, true)
+    eq(c.lame_duck, true)
+    bye(c)
 end)
 
 test("request_many: max_messages, stall and sentinel (ADR-47)", function()
-    fake_server({ on_pub = function(sock, args)
-        if args[2] == "many" then
-            for i = 1, 5 do sock:feed("MSG " .. args[3] .. " 1 1\r\n" .. i .. "\r\n") end
-            sock:feed("MSG " .. args[3] .. " 1 0\r\n\r\n")
-        end
-    end })
-    local c = nats.client(); c:connect()
-    eq(#c:request_many("many", "", { max_messages = 3 }), 3)
-    eq(#c:request_many("many", "", { sentinel = true, max_wait = 1 }), 5)
-    local t0 = require("socket").gettime()
-    eq(#c:request_many("many", "", { stall = 0.05, max_wait = 2 }), 6)
-    assert(require("socket").gettime() - t0 < 1, "stall ended the request")
+    local c = dial({ ignore_discovered_servers = true })
+    local s = subj()
+    c:subscribe(s, function(m)
+        for i = 1, 5 do c:publish(m.reply, tostring(i)) end
+        c:publish(m.reply, "")
+    end)
+    c:flush(1)
+    eq(#c:request_many(s, "", { max_messages = 3 }), 3)
+    eq(#c:request_many(s, "", { sentinel = true, max_wait = 1 }), 5)
+    local t0 = socket.gettime()
+    eq(#c:request_many(s, "", { stall = 0.05, max_wait = 2 }), 6)
+    assert(socket.gettime() - t0 < 1, "stall ended the request")
+    bye(c)
 end)
 
 test("websocket framing round trip", function()
@@ -503,7 +771,7 @@ end)
 test("url parsing: ws/wss and paths", function()
     local s = nats.parse_url("wss://user:pw@example.com/nats")
     eq(s.ws, true); eq(s.tls, true); eq(s.port, 443); eq(s.ws_path, "/nats"); eq(s.user, "user")
-    local w = nats.parse_url("ws://h:8080")
+    local w = nats.parse_url("ws://127.0.0.1:8080")
     eq(w.port, 8080); eq(w.ws_path, "/")
 end)
 
@@ -511,17 +779,18 @@ test("contexts (ADR-21)", function()
     local dir = os.tmpname(); os.remove(dir)
     os.execute("mkdir -p " .. dir .. "/nats/context")
     local f = io.open(dir .. "/nats/context/t.json", "w")
-    f:write('{"url":"nats://a:1,nats://b:2","user":"u","password":"p","token":"","jetstream_domain":"hub"}')
+    f:write('{"url":"nats://127.0.0.1:4222,nats://127.0.0.1:4223","user":"u","password":"p","token":"","jetstream_domain":"hub"}')
     f:close()
     f = io.open(dir .. "/nats/context.txt", "w"); f:write("t\n"); f:close()
     local old = os.getenv("XDG_CONFIG_HOME")
     nats.context_dir = function() return dir .. "/nats" end
     local o = assert(nats.load_context())
-    eq(o.servers, "nats://a:1,nats://b:2"); eq(o.user, "u"); eq(o.pass, "p"); eq(o.auth_token, nil)
+    eq(o.servers, "nats://127.0.0.1:4222,nats://127.0.0.1:4223"); eq(o.user, "u"); eq(o.pass, "p"); eq(o.auth_token, nil)
     eq(o.jetstream.domain, "hub")
     os.execute("rm -rf " .. dir)
     _ = old
 end)
 
+if auth_stop then auth_stop() end
 print(string.format("%s: %d passed, %d failed", jit and jit.version or _VERSION, passed, failed))
 os.exit(failed == 0 and 0 or 1)

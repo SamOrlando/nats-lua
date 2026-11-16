@@ -1,7 +1,7 @@
 <!-- Copyright (c) 2023-2026 Sam Orlando. SPDX-License-Identifier: MIT -->
 # `nats` — core client
 
-`local nats = require('nats')` (file `nats.lua`, v0.4.2). Depends on LuaSocket and
+`local nats = require('nats')` (file `nats.lua`, v0.4.4). Depends on LuaSocket and
 `nuid`; LuaSec is loaded only for TLS, lua-cjson is used when installed.
 
 Conventions used in this reference:
@@ -140,14 +140,25 @@ Returns: `tonumber(v)`, as an integer on Lua 5.3+ when it has no fraction
 (`math.tointeger`); `nil` for non numbers. On Lua 5.3+ `nats.json.decode` with
 lua-cjson also returns integers for such numbers (0.4.0).
 
-### nats.create_inbox()
+### nats.use(...)
 
-Legacy module level inbox, not bound to a client's muxed request subscription.
-Returns: `subject, lid` (`_INBOX.<22 chars>.<8 chars>`, and the 8 char id).
-Prefer `client:create_inbox()` / `client:new_inbox()`.
+Loads optional layers by name and returns the `nats` table. Names: `jetstream`
+or `js` (`nats-jetstream`), `kvs` (`nats-kvs`), `objs` (`nats-objs`), `micro`
+(`nats-micro`). An unknown name **raises**.
 
 ```lua
-local inbox = nats.create_inbox()
+local nats = require('nats').use('jetstream', 'kvs')
+```
+
+### nats.new_inbox(prefix, mid)
+
+Subject for a private subscription, not bound to a client's muxed request inbox.
+Returns: `<prefix>.<22-char nuid>` (one value). `prefix` defaults to `_INBOX`.
+`mid`, when given, replaces the generated token. Same shape as
+`client:new_inbox()`.
+
+```lua
+local inbox = nats.new_inbox()
 ```
 
 ### nats.msg(subject, data, reply, header, client, sid)
@@ -293,7 +304,9 @@ Fields (read only unless noted):
 | `stats` | table | `in_msgs, out_msgs, in_bytes, out_bytes, reconnects` |
 | `lame_duck` | bool | ADR-5 |
 | `last_error` | string/false | last reported async error |
-| `inbox_prefix`, `inbox_sid` | string | muxed request subscription |
+| `inbox_prefix` | string | configured prefix (default `_INBOX`) |
+| `inbox_muxed` | string | `<inbox_prefix>.<22-char nuid>`, subject of the muxed request subscription |
+| `inbox_sid` | string | sid of that subscription (8 random characters) |
 | `error` | function | error raiser (writable) |
 | `streams` | table | JetStream stream object cache (after `require 'nats-jetstream'`) |
 
@@ -510,18 +523,19 @@ Close the socket, stop reconnecting, fire `closed_cb` (once). `shutdown` calls
 `socket:shutdown()` first. Returns: nothing. Subsequent I/O raises
 `'not connected'`.
 
-### client:create_inbox()
+### client:create_inbox(lid)
 
-Returns: `subject, lid` — a fresh subject under this client's muxed request
-subscription (`<inbox_prefix>.<nuid>`); replies to it are routed to
-`wait({lid=})` / request callbacks registered in `client.inbox_table`.
+Returns: `subject, lid`. `subject` is `<inbox_muxed>.<lid>`
+(`<inbox_prefix>.<22-char nuid>.<lid>`). `lid` is 8 base-62 characters unless
+one is passed. Replies on that subject are routed to `wait({lid=})` and to
+request callbacks in `client.inbox_table`.
 
-### client:new_inbox()
+### client:new_inbox(prefix, mid)
 
-Returns: `<inbox_prefix>.<nuid>` (`inbox_prefix` option, default `_INBOX`), a
-subject for your own `subscribe` (not routed through the muxed inbox). Used for
-JetStream pull, consume, ordered and push consumer inboxes. Changed in 0.3.1
-(previously always `_INBOX`).
+Returns: `<prefix>.<22-char nuid>` (one value). `prefix` defaults to the
+`inbox_prefix` option (`_INBOX`). A subject for your own `subscribe`, not routed
+through the muxed inbox. JetStream pull, consume, ordered and push consumer
+inboxes use it. Changed in 0.3.1 (previously always `_INBOX`).
 
 ```lua
 local inbox = nc:new_inbox(); nc:subscribe(inbox, print)
@@ -738,7 +752,7 @@ Exported for tests, transports and other modules; their signatures may change.
 Creates and connects the raw socket for a pool entry (`srv` from `parse_url`):
 UNIX socket, or TCP to every resolved address (ADR-11, shuffled unless
 `no_randomize`), wrapped in WebSocket for `ws`. Returns: socket-like object, or
-`nil, err`. Overridable (tests replace it with a fake socket).
+`nil, err`. Overridable.
 
 ### nats.websocket_wrap(sock, srv, cfg, timeout)
 

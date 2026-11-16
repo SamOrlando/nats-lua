@@ -387,7 +387,7 @@ local valid_config = {
 nats.valid_config = valid_config
 
 local nats_inbox_prefix = "_INBOX"
-local nats_inbox_mbid_nuid = nuid({ preLen = 22, seqLen = 0 })
+local nats_inbox_mbid_nuid = nuid({ preLen = 12, seqLen = 10 })
 local nats_inbox_lid_nuid = nuid({ preLen = 0, seqLen = 8 }) -- letter ids are an 8-character sequence
 local nats_inbox_sid_nuid = nuid({ preLen = 8, seqLen = 0 })
 
@@ -1312,13 +1312,11 @@ function cm.remove_ticker(client, t)
 end
 
 -- legacy module level inbox (not bound to a client's muxed subscription)
-function nats.new_inbox(inbox_prefix, mid, lid)
-	lid = lid or nats_inbox_lid_nuid()
+function nats.new_inbox(inbox_prefix, mid)
 	return concat({
 		inbox_prefix or nats_inbox_prefix,
-		mid or nats_inbox_mbid_nuid(),
-		lid
-	}, '.'), lid
+		mid or nats_inbox_mbid_nuid()
+	}, '.')
 end
 
 -- fresh inbox under this client's muxed request subscription
@@ -1329,13 +1327,12 @@ function cm.create_inbox(client, lid)
 end
 local create_inbox = cm.create_inbox
 
-function cm.new_inbox(client, prefix, mid, lid)
-	lid = lid or nats_inbox_lid_nuid()
+function cm.new_inbox(client, prefix, mid)
+	client = unwrap(client)
 	return concat({
-		prefix or nats_inbox_prefix,
-		mid or nats_inbox_mbid_nuid(),
-		lid
-	}, '.'), lid
+		prefix or client.inbox_prefix or nats_inbox_prefix,
+		mid or nats_inbox_mbid_nuid()
+	}, '.')
 end
 
 local function inbox_req_cb(client, m) -- inbox request callback and handling for wait function

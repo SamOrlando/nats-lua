@@ -423,8 +423,8 @@ local function consumer_update(consumer, data, stream)
 	consumer.num_redelivered = data.num_redelivered or consumer.num_redelivered
 	consumer.num_waiting = data.num_waiting or consumer.num_waiting
 	consumer.num_pending = data.num_pending or consumer.num_pending
-	consumer.paused = data.paused or consumer.paused
-	consumer.pause_remaining = data.pause_remaining or consumer.pause_remaining
+	if data.paused ~= nil then consumer.paused = data.paused end
+	if data.pause_remaining ~= nil then consumer.pause_remaining = data.pause_remaining end
 	consumer.cluster = data.cluster or consumer.cluster
 	consumer.ts = data.ts or consumer.ts
 	-- unique pull inbox for this consumer object (not shared across clients/processes)
