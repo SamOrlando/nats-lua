@@ -389,7 +389,6 @@ nats.valid_config = valid_config
 local nats_inbox_prefix = "_INBOX"
 local nats_inbox_mbid_nuid = nuid({ preLen = 12, seqLen = 10 })
 local nats_inbox_lid_nuid = nuid({ preLen = 0, seqLen = 8 }) -- letter ids are an 8-character sequence
-local nats_inbox_sid_nuid = nuid({ preLen = 8, seqLen = 0 })
 
 local function create_client(config, n_opts)
 	local d = nats.defaults
@@ -447,7 +446,7 @@ local function create_client(config, n_opts)
 		inbox_prefix = (cfg.inbox_prefix or nats_inbox_prefix),
 		inbox_muxed = (cfg.inbox_prefix or nats_inbox_prefix) .. '.' .. nats_inbox_mbid_nuid(),  -- muxed request inbox: <prefix>.<token>
 		inbox_table = {},
-		inbox_sid = nats_inbox_sid_nuid(),
+		inbox_sid = '1', -- reserved; subscribe() starts at "2"
 		ssid = 1,
 		pings_sent = 0,
 		pongs_received = 0,

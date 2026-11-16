@@ -306,7 +306,7 @@ Fields (read only unless noted):
 | `last_error` | string/false | last reported async error |
 | `inbox_prefix` | string | configured prefix (default `_INBOX`) |
 | `inbox_muxed` | string | `<inbox_prefix>.<22-char nuid>`, subject of the muxed request subscription |
-| `inbox_sid` | string | sid of that subscription (8 random characters) |
+| `inbox_sid` | string | sid of that subscription (`"1"`). User sids start at `"2"` |
 | `error` | function | error raiser (writable) |
 | `streams` | table | JetStream stream object cache (after `require 'nats-jetstream'`) |
 
@@ -543,7 +543,7 @@ local inbox = nc:new_inbox(); nc:subscribe(inbox, print)
 
 ### client:inbox_subscribe()
 
-Returns: the sid of the muxed request subscription (created on connect).
+Returns: the sid of the muxed request subscription (`"1"`), created on connect.
 
 ### client:auth(user, pass)
 
