@@ -10,11 +10,9 @@ Object Store buckets and the Service API (micro).
 
 Source: <https://github.com/SamOrlando/nats-lua>
 
-The I/O model is **blocking and single threaded**: nothing happens in the
-background. Messages are read and dispatched to callbacks while you call
-`client:wait()`, `client:get()` / `flush()` / `drain()` or a JetStream call that
-waits for a reply. Keepalive PINGs and reconnects are also handled from inside
-those calls.
+The default runtime is blocking LuaSocket. One coroutine owns the socket.
+[Connection owner](#connection-owner) is where `wait`, `step`, bounded queues
+and `start()` are described.
 
 ## Install
 
@@ -29,17 +27,17 @@ From a clone:
 ```sh
 git clone https://github.com/SamOrlando/nats-lua.git
 cd nats-lua
-luarocks make rockspecs/nats-lua-0.4.5-1.rockspec
+luarocks make rockspecs/nats-lua-0.4.6-1.rockspec
 ```
 
 Or copy the `nats*.lua` files onto your `package.path` and install the
 dependencies yourself (`luarocks install luasocket nuid`).
 
-Modules: `nats` (core client), `nats-jetstream`, `nats-kvs`, `nats-objs`,
-`nats-micro` (each extends and returns the `nats` module), `nats-nkeys` and
-`nats-sha256` (standalone). `nats.use("jetstream", "kvs", "objs", "micro")`
-loads those layers and returns `nats`. `js` is an alias for `jetstream`.
-An unknown name raises.
+`require("nats")` is the core client. `nats-jetstream`, `nats-kvs`, `nats-objs`
+and `nats-micro` each extend that module and return it.
+`nats.use("jetstream", "kvs", "objs", "micro")` loads several at once (`js` is
+an alias for `jetstream`). `nats-nkeys` and `nats-sha256` are standalone.
+An unknown name passed to `nats.use` raises.
 
 Requirements:
 
@@ -57,7 +55,7 @@ local nats = require("nats")
 local nc = nats.client({ servers = { "nats://127.0.0.1:4222" }, name = "demo" })
 nc:connect()
 
--- subscribe; the callback runs while wait()/get()/flush() pump the socket
+-- callback runs inside wait()
 local sid = nc:subscribe("greet.*", function(msg)
     print(msg.subject, msg.data)
     if msg.reply then msg:respond("hi " .. msg.data) end
@@ -67,7 +65,7 @@ nc:publish("greet.joe", "joe")
 nc:publish("greet.ann", "ann", nil, { ["X-Trace"] = "1" })   -- with headers (HPUB)
 nc:wait({ maxcount = 2, timeout = 1 })                       -- dispatch 2 messages
 
--- request/reply (muxed inbox); returns nil, "no responders" | "timeout" on failure
+-- nil, "no responders" or nil, "timeout" on failure
 local reply, err = nc:get("greet.bob", "bob")
 print(reply and reply.data or err)
 
@@ -75,37 +73,113 @@ nc:unsubscribe(sid)
 nc:drain()          -- unsubscribe all, deliver in-flight messages, close
 ```
 
-The legacy forms still work: `nats.client(nil, host, port)` and
-`nats.connect(host, port)`. `nats.connect` now returns the client.
+`nats.client` returns a client and does not connect. `nats.connect(opts)` and
+`nats.connect(host, port)` connect and return that client. The positional form
+`nats.client(nil, host, port)` still works.
 
-### Event loop
+## Connection owner
+
+One coroutine owns the socket. Subscription callbacks, keepalive PINGs,
+reconnects, tickers, JetStream heartbeats, KV and object watchers, and service
+handlers run on that coroutine, inside `wait`, `step`, `get`, `flush`, `drain`,
+or a JetStream call that waits for a reply. A program that connects, subscribes
+and calls `wait` is unchanged. The same coroutine may call back in: a handler
+may `publish` or `get`. Any other coroutine raises `'connection is in use'`,
+unless `start()` is running a background owner. Then the call is queued and
+`runtime.park` waits.
 
 ```lua
-nc:wait()                                  -- run forever, dispatching callbacks
-nc:wait({ timeout = 5 })                   -- run for 5 s
-nc:wait({ sid = sid, timeout = 2 })        -- until a message arrives on sid
-nc:wait({ maxcount = 10, timeout = 2 })    -- until exactly 10 messages were processed
+nc:wait()                               -- run forever, dispatching callbacks
+nc:wait({ timeout = 5 })                -- stop after 5 seconds
+nc:wait({ sid = sid, timeout = 2 })     -- until a message arrives on sid
+nc:wait({ maxcount = 10, timeout = 2 }) -- until 10 messages were processed
 ```
 
-`wait` returns the matching message (or whatever the callback returned), or
-`nil` on timeout.
+`wait` with `sid` or `lid` returns the matching message. If the callback returns
+a value, `wait` returns that value instead of the message. With `maxcount`, the
+result comes from the last message once that many were processed. A timeout
+returns `nil, "timeout"`. If the connection fails and reconnect is off, or
+reconnect gives up, `wait` and `step` raise `'connection error: ...'`.
 
-### Request / reply
+`step(timeout)` is one maintenance pass and at most one read. `wait`, `flush`,
+`get` and `drain` loop on it. Pass `0` to poll. Omit the timeout to block.
+It returns the callback result, the message and the op, or `nil, "timeout"`
+when nothing arrived. `nc:add_ticker(interval, fn)` runs on this same owner.
+
+```lua
+while true do
+    local res, msg, op = nc:step(0.1)   -- nil, "timeout" when the slice is idle
+end
+```
+
+`queue_subscribe` stores messages instead of calling a callback. The queue holds
+at most `max_chan_len` messages (default 65536). A full queue drops the newest
+message, increments `stats.dropped`, and calls `error_cb` with
+`'subscription queue full'`. `next` on the owner calls `step`. While `start()`
+is running, `next` from another coroutine waits on `runtime.sleep` and leaves
+the read to the owner.
+
+```lua
+local sub = nc:queue_subscribe("orders.>")
+local msg, err = sub:next(1)            -- nil, "timeout" or nil, "closed"
+sub:stop()
+```
+
+`start()` runs that owner in the background. It needs `runtime.spawn` and
+`runtime.park`. With the default runtime, `start()` raises
+`'runtime.spawn is required to start a background owner'`. `host` below is the
+embedder's scheduler. This repository does not include one.
+
+```lua
+local nc = nats.client({
+    servers = "nats://127.0.0.1:4222",
+    runtime = {
+        now = host.now,
+        sleep = host.yield,          -- must yield, or other coroutines never run
+        current = host.current,      -- default is coroutine.running()
+        read_file = host.read_file,  -- creds, nkey files, contexts
+        spawn = host.spawn,
+        park = host.park,            -- caller waits until the owner finishes the call
+        wakeup = host.wakeup,        -- optional; stop() uses it
+        poll_interval = 0.05,        -- read slice when no command is queued
+    },
+})
+nc:connect()
+nc:start()
+-- from another coroutine:
+nc:publish("greet.joe", "joe")       -- queued; park waits
+nc:stop()                            -- the owner exits on its next iteration
+```
+
+`runtime.resume` is optional. When it is set, the owner wakes the parked caller
+after each command so the next call can queue before the owner reads. Hosts
+that schedule coroutines themselves omit it. On Lua 5.1 a yield cannot cross
+`pcall`, so drive `step` from the owner there.
+
+`nats.feed(buf)` parses protocol bytes a host already has. It returns the
+operations and the unparsed suffix. Socket methods and the yield rule are under
+[Connection owner](docs/reference/nats.md#connection-owner).
+
+## Request / reply
 
 ```lua
 local m, err = nc:get(subject, data, header, nil, timeout)   -- synchronous
-nc:request(subject, function(reply) ... end, data, header)   -- async, delivered from wait()
-nc:poll(subject, function(reply) ... end, data, header, 2, 5)-- gather up to 5 replies within 2 s
+nc:request(subject, function(reply) ... end, data, header)   -- callback runs on the owner
+nc:poll(subject, function(reply) ... end, data, header, 2, 5)-- up to 5 replies, over 2 s, during wait()
 ```
 
-All requests share one wildcard subscription, `client.inbox_muxed .. ".*"`,
-which is `_INBOX.<22-character nuid>.*`. The 22 characters are 12 prefix
-characters and a 10-character sequence. `client.inbox_prefix` is the bare
-prefix (default `_INBOX`). When nobody is listening, the server answers with
-a 503 status (`no_responders`, on by default), and `get` returns
-`nil, "no responders"`.
+All requests share one wildcard subscription, `client.inbox_muxed .. ".*"`.
+That subject is `_INBOX.<nuid>.*`. The nuid is 22 characters: 12 of prefix and
+10 of sequence. `client.inbox_prefix` is the bare prefix (default `_INBOX`).
+The mux subscription id is `"1"`. Ids from `subscribe` start at `"2"`.
+When nobody is listening, the server answers with a 503 (`no_responders`, on
+by default) and `get` returns `nil, "no responders"`.
 
-### Headers
+`request` returns the published message. Its callback runs on the owner for the
+first reply. `poll` returns immediately; replies arrive while the owner is in
+`step` or `wait`. `request_many` blocks and gathers replies.
+
+## Headers
 
 Pass headers to `publish` either as a table (`{ Key = "v", Multi = { "a", "b" } }`)
 or as an already-encoded `"Key: v\r\n"` string. On received messages,
@@ -114,15 +188,15 @@ or as an already-encoded `"Key: v\r\n"` string. On received messages,
 `msg:status()` returns the status code and description (`503`, `404`, `408`, ...).
 The raw fields are `msg.status_code` and `msg.status_description`.
 
-### Encoded connection
+## Encoded connection
 
 ```lua
-local ec = nc:encoded_client()               -- JSON by default (cjson or built in codec)
+local ec = nc:encoded_client()               -- JSON by default (cjson or the built-in codec)
 ec:publish("cfg.update", { level = 3 })
 ec:subscribe("cfg.update", function(m) print(m.data.level) end)
 ```
 
-### Reconnect, keepalive, callbacks
+## Reconnect, keepalive, callbacks
 
 ```lua
 local nc = nats.client({
@@ -136,15 +210,18 @@ local nc = nats.client({
     closed_cb = function(nc) end,
     lame_duck_cb = function(nc) end,          -- INFO with ldm=true (ADR-5)
 })
--- 0.3.0: reconnects run inside the pump loop; publishes made while
--- reconnecting are buffered (reconnect_buf_size, default 8 MiB, <= 0 = old blocking reconnect)
 nc:status_string()                            -- "connected" | "reconnecting" | "closed" | "disconnected"
 nc:buffered()                                 -- bytes waiting in the reconnect buffer
 nc:reconnect()                                -- on-demand reconnect (ADR-40, blocking)
 nc:set_server_pool({ "nats://c:4222" })
 ```
 
-### Auth and TLS
+Reconnect attempts run on the connection owner, from `wait`, `step` and the
+other calls that read. While the client is reconnecting, publishes are held in
+the reconnect buffer (`reconnect_buf_size`, default 8 MiB). Keepalive PINGs run
+from those same calls.
+
+## Auth and TLS
 
 - user/password: set `user`/`pass`, or put them in the URL (`nats://u:p@host`).
 - token: set `auth_token`, or use `nats://token@host`.
@@ -162,7 +239,7 @@ nc:set_server_pool({ "nats://c:4222" })
 - WebSocket: `ws://host:port/path` and `wss://` URLs (binary frames over LuaSocket,
   no permessage-deflate). `ws_headers` adds upgrade headers; `ws_mask = true` uses random masks.
 
-### JetStream
+## JetStream
 
 ```lua
 local nats = require("nats-jetstream")       -- extends the client
@@ -181,7 +258,26 @@ end
 con:delete(); stream:delete()
 ```
 
-### Key-Value
+### More JetStream consumers
+
+`fetch` blocks on the owner until the batch fills, the timeout expires, or the server ends the pull.
+`consume`, ordered consumers and push subscriptions deliver while that owner
+is inside `wait` or `step`.
+
+```lua
+local ctx = consumer:consume(function(m) m:ack() end, { max_messages = 100, expires = 30, idle_heartbeat = 5 })
+ctx:stop()                                -- or ctx:drain()
+local it = consumer:messages(); local m = it:next(5); it:stop()
+local oc = stream:ordered_consumer({ filter_subjects = { "orders.>" } })   -- ADR-17
+oc:fetch(10); oc:next(5)                  -- also oc:consume(cb), oc:messages()
+local sub = stream:subscribe({ deliver_subject = nc:new_inbox(), flow_control = true, idle_heartbeat = 5 }, cb)  -- push (ADR-9)
+consumer:pause(os.time() + 60); consumer:resume(); consumer:unpin()                       -- ADR-42
+consumer:fetch(10, nil, 5, nil, { group = "g1" })                                         -- priority groups
+stream:direct_get({ multi_last = { "a.>" }, batch = 10 })                                 -- ADR-31
+nc:js_publish(subj, data, { ttl = 60 })  ; nc:js_counter_add(subj, 5) ; nc:js_publish_batch(msgs)
+```
+
+## Key-Value
 
 ```lua
 require("nats-kvs")
@@ -193,7 +289,7 @@ kv:create("app.once", "x")                -- revision, msg | nil, "key exists"
 kv:delete("app.level"); kv:purge("app.once")   -- true, msg | nil, err
 local w = kv:watch("app.*", function(e) if e then print(e.key, e.value, e.op) end end,
     { include_history = false, ignore_deletes = false, meta_only = false, updates_only = false })
-w:wait_initial(5)                         -- pumps until the nil "initial values done" marker
+w:wait_initial(5)                         -- runs the owner until the nil "initial values done" marker
 w:stop()
 local keys = kv:keys()                    -- list of key names
 local hist = kv:history("app.level")      -- list of entries
@@ -203,7 +299,7 @@ nc:create_key_value({ bucket = "copy", mirror = { name = "config" } })   -- mirr
 kv:destroy()
 ```
 
-### Object Store (ADR-20)
+## Object Store (ADR-20)
 
 ```lua
 require("nats-objs")
@@ -226,8 +322,8 @@ obs:update_meta("a.txt", { name = "b.txt", description = "renamed" })
 obs:delete("b.txt")                                  -- deleted marker + chunk purge
 obs:list(); obs:list({ show_deleted = true })
 obs:add_link("alias", obs:get_info("big.bin")); obs:add_bucket_link("other", other_obs)
-obs:watch(function(info) ... end, { timeout = 10 })  -- BLOCKING; nil marker after initial values
-local w = obs:watcher(function(info) ... end)       -- non blocking (ordered consumer), w:stop()
+obs:watch(function(info) ... end, { timeout = 10 })  -- blocks on the owner until timeout, or until the callback returns false; nil ends the initial values
+local w = obs:watcher(function(info) ... end)        -- delivers while the owner is in step or wait; w:stop()
 obs:status(); obs:seal(); obs:destroy()
 ```
 
@@ -238,40 +334,9 @@ the `SHA-256=<base64url>` digest and the ObjectInfo JSON match nats.go: an
 interop test (`tests/interop/`) checks that Go reads Lua objects and links and
 that Lua reads Go objects and links.
 
-## API reference
+## Services (ADR-32)
 
-Full reference for every public function, object and constant:
-[docs/reference/](docs/reference/README.md) ([nats](docs/reference/nats.md),
-[jetstream](docs/reference/nats-jetstream.md), [kvs](docs/reference/nats-kvs.md),
-[objs](docs/reference/nats-objs.md), [micro](docs/reference/nats-micro.md),
-[nkeys](docs/reference/nats-nkeys.md), [sha256](docs/reference/nats-sha256.md)).
-
-## Single-threaded model
-
-nats-lua has no threads. Everything that other clients do in the background
-(reconnects, PING/PONG, consume re-pulls, idle heartbeat checks, flow control
-replies, KV/object watchers, service endpoints) runs while the application
-pumps the connection: `nc:wait({ timeout = t })`, `nc:get()`, `flush()`,
-`request()` and the blocking JetStream calls. A long running app should loop
-on `nc:wait({ timeout = 0.1 })` (or call it from its own event loop).
-`nc:add_ticker(interval, fn)` runs timers inside the same loop.
-
-### More JetStream consumers
-
-```lua
-local ctx = consumer:consume(function(m) m:ack() end, { max_messages = 100, expires = 30, idle_heartbeat = 5 })
-ctx:stop()                                -- or ctx:drain()
-local it = consumer:messages(); local m = it:next(5); it:stop()
-local oc = stream:ordered_consumer({ filter_subjects = { "orders.>" } })   -- ADR-17
-oc:fetch(10); oc:next(5)                  -- also oc:consume(cb), oc:messages()
-local sub = stream:subscribe({ deliver_subject = nc:new_inbox(), flow_control = true, idle_heartbeat = 5 }, cb)  -- push (ADR-9)
-consumer:pause(os.time() + 60); consumer:resume(); consumer:unpin()                       -- ADR-42
-consumer:fetch(10, nil, 5, nil, { group = "g1" })                                         -- priority groups
-stream:direct_get({ multi_last = { "a.>" }, batch = 10 })                                 -- ADR-31
-nc:js_publish(subj, data, { ttl = 60 })  ; nc:js_counter_add(subj, 5) ; nc:js_publish_batch(msgs)
-```
-
-### Services (ADR-32)
+Handlers run on the connection owner, inside `wait` or `step`.
 
 ```lua
 require("nats-micro")
@@ -281,14 +346,23 @@ nats.micro.ping(nc, "calc"); nats.micro.info(nc, "calc"); nats.micro.stats(nc, "
 svc:stop()
 ```
 
+## API reference
+
+Full reference for every public function, object and constant:
+[docs/reference/](docs/reference/README.md) ([nats](docs/reference/nats.md),
+[jetstream](docs/reference/nats-jetstream.md), [kvs](docs/reference/nats-kvs.md),
+[objs](docs/reference/nats-objs.md), [micro](docs/reference/nats-micro.md),
+[nkeys](docs/reference/nats-nkeys.md), [sha256](docs/reference/nats-sha256.md)).
+
 ## Known gaps
 
-- No threads: push flow control, heartbeats, watchers and service endpoints only
-  run while the application pumps the connection (see above).
+- With the default runtime, push flow control, heartbeats, watchers and service
+  endpoints run while the owner is inside `step` or `wait`. `start()` needs a
+  host `runtime.spawn`. See [Connection owner](#connection-owner).
 - ADR-50 fast-ingest batch publishing, ADR-51 scheduler helpers (headers only),
   ADR-63 backup/restore, codecs and tracing are not implemented.
-- WebSocket without permessage-deflate compression.
-- TLS defaults to `verify = "none"`; configure `tls` for certificate checks.
+- WebSocket has no permessage-deflate compression.
+- TLS defaults to `verify = "none"`. Set `tls` for certificate checks.
 
 ## Feature matrix vs. the NATS ADRs
 
@@ -299,7 +373,7 @@ The full per-ADR list is in [docs/ADR-COMPLIANCE.md](docs/ADR-COMPLIANCE.md).
 | INFO → CONNECT → PING/PONG handshake, async INFO, discovery (+ `discovered_servers_cb`) | ADR-40 | ✅ |
 | Lame duck mode notification | ADR-5 | ✅ callback + `client.lame_duck` (no automatic migration) |
 | Server pool, randomization, DNS resolve-all + shuffle | ADR-40/11 | ✅ |
-| Reconnect with backoff, jitter, max attempts, non-blocking in the pump loop | ADR-40 | ✅ |
+| Reconnect with backoff, jitter and max attempts, on the connection owner | ADR-40 | ✅ |
 | Reconnect buffer (publishes while disconnected) | ADR-40 | ✅ `reconnect_buf_size` |
 | Resubscribe, callbacks (disconnected/reconnected/closed/error/lame duck) | ADR-40 | ✅ |
 | Reconnect-to-specific-server handler | ADR-40 | ✅ `reconnect_delay_cb` + `set_server_pool` (no per-attempt server picker) |
@@ -317,7 +391,7 @@ The full per-ADR list is in [docs/ADR-COMPLIANCE.md](docs/ADR-COMPLIANCE.md).
 | Pull consumers fetch/next, status 100/404/408/409/423 | ADR-13/9 | ✅ |
 | Consume / messages (simplified API), heartbeats, re-pull thresholds | ADR-37 | ✅ |
 | Ordered consumer (pull and push) | ADR-17 | ✅ |
-| Push consumers with flow control and idle heartbeats | ADR-9 | ✅ (application must pump) |
+| Push consumers with flow control and idle heartbeats | ADR-9 | ✅ (owner must `step` or `wait`) |
 | Consumer pause / resume, priority groups (pinned, overflow), unpin | ADR-42 | ✅ |
 | Counters (`Nats-Incr`) | ADR-49 | ✅ |
 | Atomic batch publish | ADR-50 | ✅ (fast-ingest batches ❌) |
@@ -342,9 +416,11 @@ globally in `nats.defaults`.
 | `echo` | `true` | receive own publishes |
 | `headers`, `no_responders` | `true` | |
 | `verbose`, `pedantic` | `false` | CONNECT flags |
+| `protocol` | 1 | CONNECT protocol |
 | `timeout` | 5 | seconds; request timeout and socket write timeout |
+| `tcp_nodelay` | true | |
 | `connect_timeout` | `timeout` | |
-| `ping_interval`, `max_pings_out` | 120, 2 | |
+| `ping_interval`, `max_pings_out` | 120, 2 | keepalive while the owner is in `step` or `wait` |
 | `reconnect`, `max_reconnect`, `reconnect_wait`, `reconnect_wait_max`, `reconnect_jitter`, `reconnect_jitter_tls`, `reconnect_delay_cb` | false, 60, 2, 30, 0.1, 1, – | |
 | `no_randomize`, `ignore_discovered_servers`, `retry_on_failed_connect` | false | |
 | `tls_required`, `tls_first`, `tls` | false, false, – | |
@@ -353,19 +429,23 @@ globally in `nats.defaults`.
 | `drain_timeout` | 30 | |
 | `error_cb`, `disconnected_cb`, `reconnected_cb`, `closed_cb`, `lame_duck_cb`, `discovered_servers_cb` | – | |
 | `reconnect_buf_size` | 8 MiB | `<= 0` disables buffering (blocking reconnect as in 0.2) |
+| `max_chan_len` | 65536 | message count for `queue_subscribe`; a full queue drops the newest |
+| `runtime` | LuaSocket | `now`, `sleep`, `current`, `read_file`. Optional: `spawn`, `park`, `resume`, `wakeup`, `poll_interval` (0.05) |
 | `nkey_seed`, `nkey_file` | – | nkey auth with the bundled signer |
 | `resolve_all` | true | try every resolved address, shuffled (ADR-11) |
 | `ws_mask`, `ws_headers` | false, – | WebSocket options |
 
 ## Tests
 
-The test scripts need `nuid` on `LUA_PATH`: either `luarocks install nuid`, or a
-clone of [lua-nuid](https://github.com/SamOrlando/lua-nuid) passed as `NUID_DIR`.
-`tests/test_nats.lua` talks to a NATS server on `127.0.0.1:4222` and starts a
-short-lived `nats-server` on `127.0.0.1` for authentication and lame duck.
-`tests/test_functions.lua` starts its own single-node JetStream `nats-server`
-on `127.0.0.1:14422` (monitor `18422`, WebSocket `18480`, TLS `14423`) and
-exercises the client against that server.
+The test scripts need `nuid` on `LUA_PATH`: `luarocks install nuid`, or a clone
+of [lua-nuid](https://github.com/SamOrlando/lua-nuid) passed as `NUID_DIR`.
+
+`tests/test_runtime.lua` needs no server. It covers the parser, ownership,
+bounded queues and `start()`. `tests/test_nats.lua` talks to a NATS server on
+`127.0.0.1:4222` and starts a short-lived `nats-server` on `127.0.0.1` for
+authentication and lame duck. `tests/test_functions.lua` starts its own
+single-node JetStream `nats-server` on `127.0.0.1:14422` (monitor `18422`,
+WebSocket `18480`, TLS `14423`) and exercises the client against that server.
 Integration tests run when `NATS_URL` is set (default `nats://127.0.0.1:4222`).
 `test_local.lua` starts its own `nats-server` on `127.0.0.1`.
 
@@ -385,6 +465,28 @@ lua tests/bench.lua 200000                                                # pars
 buckets it creates. Integration tests use `nats-lua.test.<random>.>` and
 delete the streams and buckets they create. `tests/fakesock.lua` feeds the
 benchmarks.
+
+## Changes in 0.4.6
+
+- `nats._VERSION` and the CONNECT `version` field are `0.4.6`.
+- One coroutine owns the socket. `client:step(timeout)` is one maintenance pass
+  and at most one read. `wait`, `flush`, `get`, and `drain` loop on it.
+- `client.runtime` (`now`, `sleep`, `current`, `read_file`) is the clock, the
+  wait, and file reads for creds, nkeys, and contexts. LuaSocket loads when the
+  default runtime is first used. `nats.now`, `nats.sleep`, and `nats.feed`
+  are public. `nats.feed(buf)` parses protocol bytes with no socket.
+- A second coroutine raises `'connection is in use'`. `client:start()` and
+  `client:stop()` run a background owner when the host sets `runtime.spawn`
+  and `runtime.park`.
+- `client:queue_subscribe` bounds the inbound queue at `max_chan_len` messages
+  (default 65536). A full queue drops the newest message and increments
+  `stats.dropped`.
+- A failed write inside a subscription callback is a connection error, reported
+  through `error_cb`. It is not labeled `'subscription callback error'`. Once
+  the callback returns, a later read on that owner raises if reconnect is off
+  or has given up.
+- `tests/test_runtime.lua` covers the parser, ownership, bounded queues, and
+  `start()` without a NATS server.
 
 ## Changes in 0.4.5
 

@@ -1,8 +1,9 @@
 <!-- Copyright (c) 2023-2026 Sam Orlando. SPDX-License-Identifier: MIT -->
 # `nats` — core client
 
-`local nats = require('nats')` (file `nats.lua`, v0.4.5). Depends on LuaSocket and
+`local nats = require('nats')` (file `nats.lua`, v0.4.6). Depends on LuaSocket and
 `nuid`; LuaSec is loaded only for TLS, lua-cjson is used when installed.
+LuaSocket itself loads when the default runtime is first used.
 
 Conventions used in this reference:
 
@@ -10,11 +11,11 @@ Conventions used in this reference:
   `nats.error` by default). Wrap in `pcall` if you need to recover.
 - **Returns `nil, err`** means a soft failure; `err` is a string unless noted.
 - Times are **seconds** (numbers, fractions allowed) unless noted.
-- Every blocking call pumps the connection; see [the pump model](#the-pump-model-threading).
+- Blocking calls read the socket on the connection owner; see [Connection owner](#connection-owner).
 
 ## Contents
 
-- [The pump model (threading)](#the-pump-model-threading)
+- [Connection owner](#connection-owner)
 - [Module functions](#module-functions)
 - [Client options](#client-options)
 - [Object: client](#object-client)
@@ -24,26 +25,38 @@ Conventions used in this reference:
 - [JSON codec `nats.json`](#json-codec)
 - [Low level / internal helpers](#low-level--internal-helpers)
 
-## The pump model (threading)
+## Connection owner
 
-nats-lua is single threaded and uses blocking LuaSocket I/O. Nothing runs in the
-background: incoming messages, subscription callbacks, PING/PONG keepalive,
-reconnect attempts, flushing the reconnect buffer, tickers
-(`client:add_ticker`), JetStream re-pulls and heartbeat checks, flow control
-replies, KV/object watchers and service endpoints all run **only while the
-application is inside a pumping call**:
+One coroutine owns the socket. The default runtime is blocking LuaSocket, and
+`require('nats')` does not load it until that runtime is used. Incoming
+messages, subscription callbacks, PING/PONG keepalive, reconnect attempts,
+flushing the reconnect buffer, tickers (`client:add_ticker`), JetStream
+re-pulls and heartbeat checks, flow control replies, KV/object watchers and
+service endpoints all run **on the owner**:
 
-| Pumping call | Pumps until |
+| Call | What it does |
 |---|---|
-| `client:wait(opts)` | timeout, a matching sid/lid, or `maxcount` messages |
-| `client:get()`, `request_many()`, `flush()`, `drain()` | reply / PONG / deadline |
-| JetStream / KV / object store blocking calls (`fetch`, `put`, `get`, `keys`, ...) | their reply |
+| `client:step(timeout)` | one maintenance pass and at most one read |
+| `client:wait(opts)` | loops `step` until timeout, a matching sid/lid, or `maxcount` |
+| `client:get()`, `request_many()`, `flush()`, `drain()` | loop until reply / PONG / deadline |
+| `client:start()` | background owner, only when `runtime.spawn` is set |
+| JetStream / KV / object store blocking calls | their reply, on the same owner |
 | `iter:next()`, `watcher:wait_initial()`, `obs:watch()` | data / deadline |
 
-A long running program loops on `nc:wait({ timeout = 0.1 })` (or calls it from its
-own event loop). Callbacks run inside that call, on the same stack: a callback
-that blocks stalls everything else on the connection. Errors raised by callbacks
-are caught and reported to `error_cb` (and `client.last_error`).
+`step` is the primitive. `wait`, `flush`, `get` and `drain` are loops of it.
+An event loop calls `step` from the owner coroutine. The same coroutine may
+re-enter (a subscription callback may `publish` or `get`). Any other coroutine
+raises `'connection is in use'` before it touches the socket, unless
+`client:start()` is running: then the call is queued and `runtime.park` waits
+until the owner runs it.
+
+A failed write inside a user callback updates connection state and goes through
+`error_cb` and the reconnect path. It is not reported as `'subscription callback
+error'`. Once the callback returns, a later read on that owner raises
+`'connection error: ...'` if reconnect is off or has given up. Callbacks stay
+on the owner. They cannot move to another OS thread, because a Lua state
+cannot be shared. Another thread uses
+`queue_subscribe`.
 
 ```lua
 local nats = require('nats')
@@ -53,15 +66,98 @@ nc:add_ticker(5, function() print('stats', nc.stats.in_msgs) end)
 while true do nc:wait({ timeout = 0.1 }) end
 ```
 
-**Reconnect while not pumping**: a network failure is noticed by the next read or
-write. With `reconnect = true` and `reconnect_buf_size > 0` (default 8 MiB) the
-client enters the *reconnecting* state, publishes are buffered, and attempts are
-made from the pump loop (non blocking for the caller). With
+That loop is unchanged. `wait` calls `step` until the timeout, a matching
+message, or `maxcount`. The same program can take one read per turn:
+
+```lua
+while true do
+    local res, msg, op = nc:step(0.1) -- nil, 'timeout' when the slice is idle
+end
+```
+
+A subscription with no callback queues messages (`max_chan_len`, default
+65536). A full queue drops the newest, increments `stats.dropped`, and calls
+`error_cb` with `'subscription queue full'`.
+
+```lua
+local sub = nc:queue_subscribe('orders.>')
+local msg, err = sub:next(1) -- nil, 'timeout' or nil, 'closed'
+sub:stop()
+```
+
+`client:start()` needs `runtime.spawn`. The default runtime has none, so
+`start()` raises and `wait` stays the loop. With a host runtime, other
+coroutines call `publish` / `get` and `runtime.park` waits:
+
+```lua
+local nc = nats.connect({
+    servers = 'nats://127.0.0.1:4222',
+    runtime = {
+        now = host.now, sleep = host.yield, current = host.current,
+        read_file = host.read_file, spawn = host.spawn, park = host.park,
+        wakeup = host.wakeup, poll_interval = 0.05,
+    },
+})
+nc:start()
+-- another coroutine: nc:publish('greet.joe', 'joe')
+nc:stop()
+```
+
+**Runtime.** `client.runtime` (option `runtime`, default `nats.runtime`) is
+`now()`, `sleep(seconds)`, `current()` and `read_file(path)`. `current` defaults
+to `coroutine.running()` (`false` on the Lua 5.1 main thread). `read_file` is
+used for creds files, nkey files and `nats.load_context`. A host that cannot
+read `/dev/urandom` passes 32 bytes to `nkeys.create_pair(kind, raw)`.
+`nats.socket_factory` is still the dial override. The socket needs `send`
+(LuaSocket's index return), `receive(max)` or `read_some(max, timeout)`,
+`settimeout` and `close`. The NATS parser reads some bytes and parses them
+with `nats.feed`. It does not call `receive("*l")`, the receive prefix, or
+`dirty()`. The WebSocket HTTP upgrade still reads lines from the underlying
+socket.
+
+`runtime.sleep` is what the default runtime blocks on. A cooperative host
+replaces `sleep` and the socket read with a yield. The owner calls whichever
+`sleep` is installed. On Lua 5.1 a yield cannot cross `pcall`. Inline `step` /
+`wait` / `flush` / `get` run inside `pcall`, and so does a command the
+background owner runs for another coroutine. A `runtime.sleep` that yields
+works from the owner loop itself, and fails inside those calls (reconnect
+backoff during a queued publish). Drive `step` from the owner on Lua 5.1, or
+supply a yield-safe `pcall`. Lua 5.2+, LuaJIT, and a host `pcall` that allows
+yields do not have this limit.
+
+**Reconnect.** A network failure is noticed by the next read or write. With
+`reconnect = true` and `reconnect_buf_size > 0` (default 8 MiB) the client
+enters the *reconnecting* state, publishes return, and the bytes sit in the
+reconnect buffer. Attempts then run on the owner from `step` and `wait`. With
 `reconnect_buf_size <= 0` the failing call blocks in the reconnect loop (0.2
 behaviour). Control lines (SUB/UNSUB/PING) are not buffered; subscriptions are
 restored from the client's subscription table after reconnecting.
 
 ## Module functions
+
+### nats.now(client)
+
+Seconds from the client's `runtime.now`, or from `nats.runtime` when `client`
+is omitted. An encoded client is unwrapped. JetStream, KV, object store and
+micro use this clock.
+
+### nats.sleep(client, seconds)
+
+Sleeps through the client's `runtime.sleep`. A non-positive `seconds` returns
+immediately. The default runtime calls LuaSocket `sleep`.
+
+### nats.feed(buf)
+
+Parses complete protocol operations out of a byte string. Returns: an array of
+ops, and the unparsed suffix. An empty or partial buffer returns no ops. PING,
+PONG and `+OK` are shared singleton tables. MSG/HMSG ops carry `subject`, `sid`,
+`reply`, `size`, `data` and, for HMSG, `header`, `status`, `description`. A bad
+line is an op `{op='-ERR', data='parser error: ...'}`. No socket.
+
+```lua
+local ops, rest = nats.feed('MSG greet 2 4\r\npi')
+ops, rest = nats.feed(rest .. 'ng\r\n')
+```
 
 ### nats.client(opts) / nats.client(host, port, timeout)
 
@@ -258,7 +354,7 @@ can also be given a process wide default in `nats.defaults` (e.g.
 | `timeout` | number | 5 | request timeout and socket write timeout |
 | `connect_timeout` | number | `timeout` | |
 | `tcp_nodelay` | bool | true | |
-| `ping_interval`, `max_pings_out` | number | 120, 2 | keepalive, only while pumping |
+| `ping_interval`, `max_pings_out` | number | 120, 2 | keepalive, only while the owner is in `step` or `wait` |
 | `reconnect` | bool | false | enable automatic reconnect |
 | `max_reconnect` | number | 60 | attempts per server; -1 = forever |
 | `reconnect_wait`, `reconnect_wait_max` | number | 2, 30 | exponential backoff base/cap |
@@ -276,7 +372,8 @@ can also be given a process wide default in `nats.defaults` (e.g.
 | `validate_subjects` | bool | true | ADR-6 checks on publish/subscribe |
 | `inbox_prefix` | string | `_INBOX` | prefix of the muxed request inbox |
 | `drain_timeout` | number | 30 | |
-| `max_chan_len` | number | 65536 | stored, currently unused |
+| `runtime` | table | `nats.runtime` | `now`, `sleep`, `current`, `read_file`; optional `spawn`, `park`, `resume`, `wakeup`, `poll_interval` |
+| `max_chan_len` | number | 65536 | max messages queued by `queue_subscribe` (a count). A full queue drops the newest |
 | `error_cb` | function(client, err) | – | async `-ERR`, callback errors, disconnects |
 | `disconnected_cb` | function(client, reason) | – | entering reconnect |
 | `reconnected_cb` | function(client) | – | after subscriptions + buffer were restored |
@@ -296,12 +393,13 @@ Fields (read only unless noted):
 |---|---|---|
 | `connected`, `closed`, `reconnecting` | bool | |
 | `config` | table | effective options |
+| `runtime` | table | clock, sleep, and file reads in use (`nats.runtime` or the `runtime` option) |
 | `network` | table | host/port/path/timeout used when no URL is configured |
 | `server_information` | table | last INFO (`server_id`, `version`, `max_payload`, `jetstream`, `nonce`, ...) |
 | `servers` | array | server pool entries (`parse_url` tables) |
 | `current_server` | table | |
 | `subscriptions` | table sid → `{subject, queue, callback, delivered, max}` | |
-| `stats` | table | `in_msgs, out_msgs, in_bytes, out_bytes, reconnects` |
+| `stats` | table | `in_msgs, out_msgs, in_bytes, out_bytes, reconnects, dropped` |
 | `lame_duck` | bool | ADR-5 |
 | `last_error` | string/false | last reported async error |
 | `inbox_prefix` | string | configured prefix (default `_INBOX`) |
@@ -386,13 +484,34 @@ nc:publish('orders.new', '{"id":1}', nil, { ['Nats-Msg-Id'] = '1' })
 | Param | Type | Default | Req | Notes |
 |---|---|---|---|---|
 | `subject` | string | – | yes | wildcards allowed |
-| `callback` | function(msg) → any | passthrough | no | runs while pumping; a non-nil return value ends a matching `wait` and is returned by it |
+| `callback` | function(msg) → any | passthrough | no | runs on the owner; a non-nil return value ends a matching `wait` and is returned by it |
 | `queue` | string | – | no | queue group |
 
 Returns: `sid` (string). **Raises** on invalid subject/queue.
 
 ```lua
 local sid = nc:subscribe('orders.>', function(m) print(m.subject, m.data) end, 'workers')
+```
+
+### client:queue_subscribe(subject, queue)
+
+Subscribes without a callback. The owner pushes messages onto the subscription,
+up to `config.max_chan_len` (default 65536 messages). Returns: a subscription
+object. **Raises** on an invalid subject or queue group.
+
+| Method | Returns | Notes |
+|---|---|---|
+| `sub:next(timeout)` | msg, or `nil, err` | `err` is `'timeout'` or `'closed'`. With a background owner, a different coroutine waits on `runtime.sleep` and does not call `step` |
+| `sub:stop()` | nothing | UNSUB and `next` then returns `nil, 'closed'` |
+
+When the queue is full the newest message is dropped, `stats.dropped` increments
+and `error_cb` is called with `'subscription queue full'`. Callback subscriptions
+stay unbounded and run on the owner.
+
+```lua
+local sub = nc:queue_subscribe('orders.>', 'workers')
+local msg = sub:next(1)
+sub:stop()
 ```
 
 ### client:unsubscribe(sid, max)
@@ -409,7 +528,7 @@ nc:unsubscribe(sid, 10)
 
 Asynchronous request. Publishes with a reply subject on the client's muxed inbox
 (or on the subject of subscription `sid` when given). The `callback(msg)` runs
-for the first reply while pumping.
+for the first reply on the owner.
 Returns: the published msg with `msg.sid` and `msg.lid` (inbox token) set, which
 can be passed to `wait({lid = ...})`. Raises like `publish`.
 
@@ -440,8 +559,8 @@ local m, err = nc:get('svc.echo', 'hi', nil, nil, 2)
 ### client:poll(subject, callback, data, header, wait, count)
 
 Scatter request: `callback(msg)` runs for every reply within `wait` seconds
-(default 2) or until `count` replies. Non blocking; replies arrive while
-pumping. Returns: published msg (`lid` set). Prefer `request_many`. ADR-47.
+(default 2) or until `count` replies. Non blocking; replies arrive while the
+owner is in `step` or `wait`. Returns: published msg (`lid` set). Prefer `request_many`. ADR-47.
 
 ```lua
 nc:poll('$SRV.PING', function(m) print(m.data) end, '', nil, 1)
@@ -468,9 +587,54 @@ reply was a 503. Raises like `publish`.
 local replies = nc:request_many('$SRV.PING', '', { max_wait = 1, stall = 0.2 })
 ```
 
+### client:step(timeout)
+
+One maintenance pass (keepalive, tickers, reconnect) and at most one socket
+read, on the owner. `timeout` is seconds; `0` polls; omit it (or pass a negative
+number) to block. An operation already parsed from an earlier read is delivered
+without another read and without maintenance, so a burst is not held behind the
+clock.
+
+Returns: the callback result, the message, and the op when an operation was
+processed, or `nil, err` (`'timeout'`, `'not connected'`, ...). **Raises**
+`'connection is in use'` from a different coroutine when no background owner is
+running, and `'connection error: ...'` when the connection fails and reconnect
+is off, or when reconnect gives up. Inside a callback that failure is reported
+through `error_cb` instead; see [Connection owner](#connection-owner).
+
+```lua
+local res, msg, op = nc:step(0)
+```
+
+### client:start()
+
+Runs the owner on `runtime.spawn(fn)`. Returns: `true`. **Raises**
+`'runtime.spawn is required to start a background owner'` when `spawn` is
+missing, and `'connection is in use'` when another coroutine already owns the
+connection. Calling `start` again while the loop flag is set returns `true`.
+
+The spawned function sets the owner token, then alternates queued commands and
+`step(runtime.poll_interval)` (default `0.05`). `runtime.sleep` must yield, or
+other coroutines never run. After each command the owner calls `runtime.sleep(0)`
+and, when set, `runtime.resume(co)` on the parked caller. `client:stop()` or
+`close()` ends the loop. The core does not ship a spawn. Callbacks passed to
+`subscribe` run on this owner. Another thread uses `queue_subscribe`.
+
+```lua
+nc:start()
+-- other coroutines: nc:publish(...)  -> queued, runtime.park waits
+nc:stop()
+```
+
+### client:stop()
+
+Clears the background loop flag and calls `runtime.wakeup(client)` when that
+function exists. Returns: `true`. The owner exits on its next iteration.
+`close()` stops the loop as well.
+
 ### client:wait(opts)
 
-The event loop: reads and dispatches protocol operations.
+The event loop: reads and dispatches protocol operations. Loops `step`.
 
 | `opts` field | Type | Default | Notes |
 |---|---|---|---|
@@ -480,9 +644,11 @@ The event loop: reads and dispatches protocol operations.
 | `maxcount` | number | – | return after this many messages |
 
 Returns: the matching msg (or the callback's non-nil return value), the last msg
-once `maxcount` messages were processed, or `nil` on timeout. **Raises**
+once `maxcount` messages were processed, or `nil, err` (`'timeout'`, and a
+connection error that was already reported from inside a callback). **Raises**
 `'connection error: ...'` when the connection fails and reconnect is off, or
-when reconnect gives up.
+when reconnect gives up, and `'connection is in use'` from another coroutine
+while this one is inside `wait`.
 
 ```lua
 while running do nc:wait({ timeout = 0.25 }) end
@@ -490,9 +656,9 @@ while running do nc:wait({ timeout = 0.25 }) end
 
 ### client:flush(timeout)
 
-Sends PING and pumps until the PONG. While reconnecting, first waits (pumping
-reconnect attempts) for the connection. Returns: `true`, or `false` on timeout
-(default `config.timeout`).
+Sends PING and reads on the owner until the matching PONG. While reconnecting,
+first waits for the connection and runs reconnect attempts from that same loop.
+Returns: `true`, or `false` on timeout (default `config.timeout`).
 
 ```lua
 assert(nc:flush(2))
@@ -555,7 +721,7 @@ Returns: a new msg bound to this client (no I/O).
 
 ### client:add_ticker(interval, fn)
 
-Registers a timer run from the pump loop. `fn(client, now)`; returning `false`
+Registers a timer run on the owner (`step` / `wait`). `fn(client, now)`; returning `false`
 removes it; errors are reported to `error_cb`. Tickers also cap the read timeout
 so they fire on time while `wait` blocks. Returns: the ticker handle (table).
 
@@ -718,10 +884,10 @@ Note: `msg.status_code` is a string (`'503'`); compare with
 
 ### Other module fields
 
-`nats._VERSION` (`'nats-lua 0.4.5'`), `nats._DESCRIPTION`, `nats._COPYRIGHT`,
+`nats._VERSION` (`'nats-lua 0.4.6'`), `nats._DESCRIPTION`, `nats._COPYRIGHT`,
 `nats.verbose` (bool, prints protocol traffic), `nats.defaults` (table),
 `nats.valid_config` (set of accepted option names), `nats.nuid` (the `nuid`
-module), `nats.client_metatable` (`lang`, `version`, `methods`),
+module), `nats.client_metatable` (`lang`, `version`, `methods`; `version` is the CONNECT field, `'0.4.6'`),
 `nats.encoded_client_metatable`, `nats.msg_metatable`.
 
 ## JSON codec
@@ -757,8 +923,10 @@ UNIX socket, or TCP to every resolved address (ADR-11, shuffled unless
 ### nats.websocket_wrap(sock, srv, cfg, timeout)
 
 Performs the WebSocket upgrade on a connected socket (TLS first for `wss`) and
-returns an object with `send/receive/settimeout/close/dirty` (binary frames), or
-`nil, err` (`'websocket upgrade refused: ...'`, ...). Ping frames are answered.
+returns an object with `send` / `read_some(max, timeout)` / `receive(max)` /
+`settimeout` / `close` (binary frames), or `nil, err` (`'websocket upgrade
+refused: ...'`, ...). Payload bytes go to the same parser as TCP. Ping frames
+are answered. The HTTP upgrade still reads lines from the underlying socket.
 
 ### nats.ws_frame(op, data, mask)
 
@@ -784,6 +952,9 @@ Splits a received header block. Returns: `header_lines|nil, status|nil, descript
 
 ### nats.response_read(client, timeout)
 
-Reads one protocol operation. Returns: op table (`{op='MSG'|'HMSG', subject, sid,
+Reads one protocol operation: pop an op already parsed, otherwise read some
+bytes and `nats.feed` them. Returns: op table (`{op='MSG'|'HMSG', subject, sid,
 reply, data, header, status, description}`, `{op='INFO', data}`, `{op='-ERR',
-data}`, PING/PONG/+OK singletons) or `nil, 'timeout' | err`.
+data}`, PING/PONG/+OK singletons) or `nil, 'timeout' | err`. A buffer past
+`max_payload + 8192` bytes with no newline returns `nil, 'protocol buffer
+exceeded'`.

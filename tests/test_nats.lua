@@ -645,7 +645,7 @@ test("reconnect buffer limit", function()
     bye(c)
 end)
 
-test("tickers fire from the pump loop", function()
+test("tickers fire from wait", function()
     local c = dial({ ignore_discovered_servers = true })
     local n = 0
     c:add_ticker(0.01, function() n = n + 1; if n == 3 then return false end end)

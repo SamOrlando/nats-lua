@@ -83,7 +83,7 @@ test("websocket transport (ws://) pub/sub/request with TCP peer", function()
     tcp:flush()
     ws:wait({ sid = sid, timeout = 2 })
     eq(got, big, "large payload over websocket")
-    -- both clients live in this process: alternate pumping requester and responder
+    -- both clients live in this process: alternate wait() on requester and responder
     local msg, r = ws:request("svc.up", nil, "hello"), nil
     for _ = 1, 100 do
         tcp:wait({ timeout = 0.02 })

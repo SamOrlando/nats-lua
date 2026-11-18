@@ -16,6 +16,7 @@ run() { # run <lua> <suite>
 }
 for lua in ${LUAS:-lua5.1 lua5.2 lua5.3 lua5.4 luajit}; do
     command -v "$lua" >/dev/null 2>&1 || continue
+    run "$lua" test_runtime
     run "$lua" test_nats
     run "$lua" test_functions
     run "$lua" test_objs

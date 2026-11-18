@@ -568,6 +568,9 @@ tls { cert_file: %q, key_file: %q }
         assert(c:reconnect())
         eq(c.stats.reconnects, 2)
         eq(hooks, 1)
+        -- SUB is written before reconnect returns. Flush so the server has it
+        -- before another connection publishes (LuaJIT otherwise wins that race).
+        assert(c:flush())
         nc:publish(subject, "after")
         nc:flush()
         local deadline = socket.gettime() + 2

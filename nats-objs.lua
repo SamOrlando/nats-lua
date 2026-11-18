@@ -22,7 +22,6 @@ local rawget, rawset, setmetatable, getmetatable = rawget, rawset, setmetatable,
 local type, pairs, ipairs, pcall, tostring, tonumber, error = type, pairs, ipairs, pcall, tostring, tonumber, error
 local floor, min = math.floor, math.min
 local byte, char, sub, format, find, concat = string.byte, string.char, string.sub, string.format, string.find, table.concat
-local gettime = require('socket').gettime
 
 local NS = nats.jetstream.NS
 local cm = nats.client_metatable.methods
@@ -314,9 +313,9 @@ function om.put(obs, meta, data, opts)
 		elseif ack.error then failure = failure or (ack.error.description or 'chunk publish error') end
 	end
 	local function wait_until(limit)
-		local deadline = gettime() + timeout
+		local deadline = nats.now(client) + timeout
 		while pending > limit do
-			local left = deadline - gettime()
+			local left = deadline - nats.now(client)
 			if left <= 0 then failure = failure or 'timeout waiting for chunk acks' return end
 			cm.wait(client, { maxcount = 1, timeout = left })
 		end
@@ -579,7 +578,7 @@ function om.list(obs, opts)
 end
 
 -- watcher(callback(info|nil) [, opts]) -> watcher (non blocking, ADR-20 Watch)
--- Built on an ordered consumer; updates arrive while the client pumps (client:wait()).
+-- Built on an ordered consumer; updates arrive while the owner is in client:step()/wait().
 -- A nil info is delivered once after the initial values (end of initial data).
 -- opts: include_history, ignore_deletes, updates_only
 local ObjWatcher = {}
@@ -615,9 +614,9 @@ end
 function ObjWatcher:stop() if self.ctx then self.ctx.stop() self.ctx = nil end end
 ObjWatcher.unsubscribe = ObjWatcher.stop
 function ObjWatcher:wait_initial(timeout)
-	local deadline = gettime() + (timeout or 10)
+	local deadline = nats.now(self.client) + (timeout or 10)
 	while not self.init_done do
-		local left = deadline - gettime()
+		local left = deadline - nats.now(self.client)
 		if left <= 0 then return false end
 		cm.wait(self.client, { timeout = min(left, 0.5), maxcount = 1 })
 	end
@@ -634,9 +633,9 @@ function om.watch(obs, callback, opts)
 		if callback(info) == false then stop = true end
 	end, opts)
 	if not w then return nil, err end
-	local deadline = gettime() + (opts.timeout or 5)
+	local deadline = nats.now(w.client) + (opts.timeout or 5)
 	while not stop do
-		local left = deadline - gettime()
+		local left = deadline - nats.now(w.client)
 		if left <= 0 then break end
 		cm.wait(w.client, { timeout = min(left, 0.25), maxcount = 1 })
 	end

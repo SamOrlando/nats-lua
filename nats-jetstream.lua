@@ -9,9 +9,9 @@
 -- (ADR-42), direct get incl. batch/multi_last (ADR-31), per message TTL (ADR-43),
 -- counters (ADR-49) and atomic batch publish (ADR-50).
 --
--- Continuous consumers are driven by the client's pump loop: messages are
--- delivered, pull requests re-issued and heartbeats checked while the
--- application is in client:wait() (or any other blocking call).
+-- Continuous consumers run on the connection owner: messages are delivered,
+-- pull requests re-issued and heartbeats checked while the application is in
+-- client:step()/wait() (or any other blocking call).
 
 -- ### NATS-LUA Table
 local nats = require('nats')
@@ -28,7 +28,6 @@ local format, gmatch, find = string.format, string.gmatch, string.find
 local insert, concat = table.insert, table.concat
 local encode, decode = nats.json.encode, nats.json.decode
 local encode_header, decode_header = nats.encode_header, nats.decode_header
-local gettime, sleep = require('socket').gettime, require('socket').sleep
 
 local NS = 1000000000 -- JetStream durations are nanoseconds
 nats.jetstream.NS = NS
@@ -373,7 +372,7 @@ local function js_publish(client, subject, data, opts)
 	for i = 0, attempts do
 		m, err = cm.get(unwrap(client), subject, data, hdr, nil, opts.timeout)
 		if m or err ~= 'no responders' then break end
-		if i < attempts then sleep(opts.retry_wait or 0.25) end
+		if i < attempts then nats.sleep(unwrap(client), opts.retry_wait or 0.25) end
 	end
 	if not m then return nil, err end
 	local ok, ack = pcall(decode, m.data)
@@ -593,9 +592,9 @@ function con.fetch(consumer, n, b, to, hb, popts)
 	local s = client.subscriptions[consumer.sid]
 	if not s then return {}, 'consumer inbox not subscribed' end
 	cm.publish(client, stream.api .. 'CONSUMER.MSG.NEXT.' .. stream.name .. '.' .. consumer.name, encode(req), s.subject)
-	local msgs, deadline = {}, gettime() + wait_t
+	local msgs, deadline = {}, nats.now(client) + wait_t
 	while #msgs < n do
-		local rem = deadline - gettime()
+		local rem = deadline - nats.now(client)
 		if rem <= 0 then break end
 		local m = cm.wait(client, { sid = consumer.sid, timeout = rem })
 		if not m then break end
@@ -624,7 +623,7 @@ end
 -- opts: max_messages (500), max_bytes, expires (30 s), idle_heartbeat (min(expires/2, 30) s),
 --       threshold_messages (50%), threshold_bytes (50%), error_cb(ctx, err, status),
 --       group, min_pending, min_ack_pending, priority (ADR-42 priority groups)
--- Messages are delivered while the application pumps the connection (client:wait()).
+-- Messages are delivered while the owner is in client:step()/wait().
 -- ---------------------------------------------------------------------------
 local ConsumeCtx = {}
 ConsumeCtx.__index = ConsumeCtx
@@ -675,7 +674,7 @@ local function below_threshold(ctx)
 end
 
 function ConsumeCtx:on_msg(m)
-	self.last_activity = gettime()
+	self.last_activity = nats.now(self.client)
 	local st = rawget(m, 'status_code')
 	if not st then
 		self.pending_msgs = self.pending_msgs - 1
@@ -763,17 +762,17 @@ function ConsumeCtx:drain(timeout, idle)
 	self.running = false
 	self.draining = true
 	idle = tonumber(idle) or 0.5
-	local deadline = gettime() + (tonumber(timeout) or 5)
-	self.last_activity = gettime()
+	local deadline = nats.now(self.client) + (tonumber(timeout) or 5)
+	self.last_activity = nats.now(self.client)
 	local client = self.client
 	while self.sid and self.pending_msgs > 0 and client.connected do
-		local now = gettime()
+		local now = nats.now(client)
 		if now >= deadline or now - self.last_activity >= idle then break end
 		cm.wait(client, { timeout = min(0.1, deadline - now, idle), maxcount = 1 })
 	end
-	local ok = gettime() < deadline
+	local ok = nats.now(client) < deadline
 	if self.sid and client.connected then
-		ok = cm.drain_sub(client, self.sid, max(0.1, deadline - gettime())) and ok
+		ok = cm.drain_sub(client, self.sid, max(0.1, deadline - nats.now(client))) and ok
 	end
 	self.draining = false
 	self:stop()
@@ -797,14 +796,14 @@ local function consume(consumer, callback, opts)
 		thr_msgs = tonumber(opts.threshold_messages) or floor(max_msgs / 2),
 		thr_bytes = tonumber(opts.threshold_bytes) or (max_bytes and floor(max_bytes / 2)),
 		pending_msgs = 0, pending_bytes = 0, delivered = 0, pulls = 0, missed = 0,
-		last_activity = gettime(), running = true,
+		last_activity = nats.now(client), running = true,
 		inbox = cm.new_inbox(client),
 	}, ConsumeCtx)
 	ctx.sid = cm.subscribe(client, ctx.inbox, function(m) ctx:on_msg(m) return nil end)
 	ctx.ticker = cm.add_ticker(client, min(hb, 1), function(_, now) return ctx:check(now) end)
 	ctx.rc_hook = cm.on_reconnect(client, function() -- pull requests do not survive a reconnect
 		ctx:reset_pending()
-		ctx.last_activity = gettime()
+		ctx.last_activity = nats.now(client)
 		ctx:pull()
 	end)
 	local reg = rawget(consumer, '_ctxs')
@@ -821,9 +820,9 @@ MsgIter.__index = MsgIter
 function MsgIter:next(timeout)
 	local q = self.queue
 	if #q == 0 then
-		local deadline = gettime() + (timeout or 30)
+		local deadline = nats.now(self.ctx.client) + (timeout or 30)
 		while #q == 0 do
-			local left = deadline - gettime()
+			local left = deadline - nats.now(self.ctx.client)
 			if left <= 0 or not self.ctx.running then break end
 			cm.wait(self.ctx.client, { timeout = left, maxcount = 1 })
 		end
@@ -872,13 +871,13 @@ end
 -- (see ConsumeCtx:drain / PushSub:drain). Returns true when all drains completed in time,
 -- plus the number of contexts drained.
 function con.drain(consumer, timeout, idle)
-	local deadline = gettime() + (tonumber(timeout) or 5)
+	local deadline = nats.now(consumer.stream.client) + (tonumber(timeout) or 5)
 	local l, ok = active_ctxs(consumer), true
 	for _, c in ipairs(l) do
-		ok = c:drain(max(0.1, deadline - gettime()), idle) and ok
+		ok = c:drain(max(0.1, deadline - nats.now(consumer.stream.client)), idle) and ok
 	end
 	rawset(consumer, '_ctxs', nil)
-	ok = release_fetch_inbox(consumer, true, max(0.1, deadline - gettime())) and ok
+	ok = release_fetch_inbox(consumer, true, max(0.1, deadline - nats.now(consumer.stream.client))) and ok
 	return ok, #l
 end
 
@@ -1078,7 +1077,7 @@ function js.subscribe(stream, cfg, callback, opts)
 	opts = type(opts) == 'table' and opts or {}
 	local client = unwrap(stream.client)
 	local sub = setmetatable({ stream = stream, client = client, opts = opts, running = true,
-		last_activity = gettime(), missed = 0, fc_replies = 0, stalls = 0 }, PushSub)
+		last_activity = nats.now(client), missed = 0, fc_replies = 0, stalls = 0 }, PushSub)
 	local hb = tonumber(opts.idle_heartbeat) or ((opts.ordered or opts.flow_control or cfg.flow_control) and 5)
 	sub.hb = hb
 	local ccfg = {}
@@ -1101,7 +1100,7 @@ function js.subscribe(stream, cfg, callback, opts)
 		end
 	end
 	local function on_msg(m)
-		sub.last_activity = gettime()
+		sub.last_activity = nats.now(client)
 		local st = rawget(m, 'status_code')
 		if st == '100' then
 			local desc = rawget(m, 'status_description') or ''
@@ -1359,150 +1358,3 @@ function mm.metafields(m)
 end
 
 return nats
-
--- type ConsumerConfig struct {
-	-- // Durable is deprecated. All consumers should have names, picked by clients.
-	-- Durable         string          `json:"durable_name,omitempty"`
-	-- Name            string          `json:"name,omitempty"`
-	-- Description     string          `json:"description,omitempty"`
-	-- DeliverPolicy   DeliverPolicy   `json:"deliver_policy"`
-	-- OptStartSeq     uint64          `json:"opt_start_seq,omitempty"`
-	-- OptStartTime    *time.Time      `json:"opt_start_time,omitempty"`
-	-- ack_policy       ack_policy       `json:"ack_policy"`
-	-- ack_wait         time.Duration   `json:"ack_wait,omitempty"`
-	-- max_deliver      int             `json:"max_deliver,omitempty"`
-	-- BackOff         []time.Duration `json:"backoff,omitempty"`
-	-- FilterSubject   string          `json:"filter_subject,omitempty"`
-	-- FilterSubjects  []string        `json:"filter_subjects,omitempty"`
-	-- ReplayPolicy    ReplayPolicy    `json:"replay_policy"`
-	-- RateLimit       uint64          `json:"rate_limit_bps,omitempty"` // Bits per sec
-	-- SampleFrequency string          `json:"sample_freq,omitempty"`
-	-- MaxWaiting      int             `json:"max_waiting,omitempty"`
-	-- MaxAckPending   int             `json:"max_ack_pending,omitempty"`
-	-- Heartbeat       time.Duration   `json:"idle_heartbeat,omitempty"`
-	-- FlowControl     bool            `json:"flow_control,omitempty"`
-	-- HeadersOnly     bool            `json:"headers_only,omitempty"`
-
-	-- // Pull based options.
-	-- MaxRequestBatch    int           `json:"max_batch,omitempty"`
-	-- MaxRequestExpires  time.Duration `json:"max_expires,omitempty"`
-	-- MaxRequestMaxBytes int           `json:"max_bytes,omitempty"`
-
-	-- // Push based consumers.
-	-- deliver_subject string `json:"deliver_subject,omitempty"`
-	-- DeliverGroup   string `json:"deliver_group,omitempty"`
-
-	-- // Ephemeral inactivity threshold.
-	-- InactiveThreshold time.Duration `json:"inactive_threshold,omitempty"`
-
-	-- // Generally inherited by parent stream and other markers, now can be configured directly.
-	-- num_replicas int `json:"num_replicas"`
-	-- // Force memory storage.
-	-- MemoryStorage bool `json:"mem_storage,omitempty"`
-
-	-- // Don't add to general clients.
-	-- Direct bool `json:"direct,omitempty"`
-
-	-- // Metadata is additional metadata for the Consumer.
-	-- Metadata map[string]string `json:"metadata,omitempty"`
-
-	-- // PauseUntil is for suspending the consumer until_t the deadline.
-	-- PauseUntil *time.Time `json:"pause_until,omitempty"`
--- }
-
--- pullRequest struct {
-	-- Expires   time.Duration `json:"expires,omitempty"`
-	-- Batch     int           `json:"batch,omitempty"`
-	-- MaxBytes  int           `json:"max_bytes,omitempty"`
-	-- NoWait    bool          `json:"no_wait,omitempty"`
-	-- Heartbeat time.Duration `json:"idle_heartbeat,omitempty"`
--- }
-
--- // Headers used when publishing messages.
--- const (
-	-- // MsgIdHeader is used to specify a user-defined message ID. It can be used
-	-- // e.g. for deduplication in conjunction with the Duplicates duration on
-	-- // ConsumerConfig or to provide optimistic concurrency safety together with
-	-- // [ExpectedLastMsgIDHeader].
-	-- //
-	-- // This can be set when publishing messages using [WithMsgID] option.
-	-- MsgIDHeader = "Nats-Msg-Id"
-
-	-- // ExpectedStreamHeader contains stream name and is used to assure that the
-	-- // published message is received by expected stream. Server will reject the
-	-- // message if it is not the case.
-	-- //
-	-- // This can be set when publishing messages using [WithExpectStream] option.
-	-- ExpectedStreamHeader = "Nats-Expected-Stream"
-
-	-- // ExpectedLastSeqHeader contains the expected last sequence number of the
-	-- // stream and can be used to apply optimistic concurrency control at stream
-	-- // level. Server will reject the message if it is not the case.
-	-- //
-	-- // This can be set when publishing messages using [WithExpectLastSequence]
-	-- // option. option.
-	-- ExpectedLastSeqHeader = "Nats-Expected-Last-Sequence"
-
-	-- // ExpectedLastSubjSeqHeader contains the expected last sequence number on
-	-- // the subject and can be used to apply optimistic concurrency control at
-	-- // subject level. Server will reject the message if it is not the case.
-	-- //
-	-- // This can be set when publishing messages using
-	-- // [WithExpectLastSequencePerSubject] option.
-	-- ExpectedLastSubjSeqHeader = "Nats-Expected-Last-Subject-Sequence"
-
-	-- // ExpectedLastMsgIDHeader contains the expected last message ID on the
-	-- // subject and can be used to apply optimistic concurrency control at
-	-- // stream level. Server will reject the message if it is not the case.
-	-- //
-	-- // This can be set when publishing messages using [WithExpectLastMsgID]
-	-- // option.
-	-- ExpectedLastMsgIDHeader = "Nats-Expected-Last-Msg-Id"
-
-	-- // MsgRollup is used to apply a purge of all prior messages in the stream
-	-- // ("all") or at the subject ("sub") before this message.
-	-- MsgRollup = "Nats-Rollup"
--- )
-
--- // Headers for republished messages and direct gets. Those headers are set by
--- // the server and should not be set by the client.
--- const (
-	-- // StreamHeader contains the stream name the message was republished from or
-	-- // the stream name the message was retrieved from using direct get.
-	-- StreamHeader = "Nats-Stream"
-
-	-- // SequenceHeader contains the original sequence number of the message.
-	-- SequenceHeader = "Nats-Sequence"
-
-	-- // TimeStampHeader contains the original timestamp of the message.
-	-- TimeStampHeaer = "Nats-Time-Stamp"
-
-	-- // SubjectHeader contains the original subject the message was published to.
-	-- SubjectHeader = "Nats-Subject"
-
-	-- // LastSequenceHeader contains the last sequence of the message having the
-	-- // same subject, otherwise zero if this is the first message for the
-	-- // subject.
-	-- LastSequenceHeader = "Nats-Last-Sequence"
--- )
-
--- // Rollups, can be subject only or all messages.
--- const (
-	-- // MsgRollupSubject is used to purge all messages before this message on the
-	-- // message subject.
-	-- MsgRollupSubject = "sub"
-
-	-- // MsgRollupAll is used to purge all messages before this message on the
-	-- // stream.
-	-- MsgRollupAll = "all"
--- )
-
--- var (
-	-- ackAck      ackType = []byte("+ACK")
-	-- ackNak      ackType = []byte("-NAK")
-	-- ackProgress ackType = []byte("+WPI")
-	-- ackTerm     ackType = []byte("+TERM")
--- )
-
-
-

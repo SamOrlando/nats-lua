@@ -4,8 +4,8 @@
 `local nats = require('nats-kvs')` (loads `nats-jetstream`; returns `nats`).
 Buckets are streams `KV_<bucket>` on `$KV.<bucket>.>` (ADR-8). Reads use direct
 get (`allow_direct`, falling back to `STREAM.MSG.GET` on buckets without it); watchers, `keys`, `history` and `purge_deletes` use
-ordered consumers (ADR-17) driven by the pump loop — see
-[the pump model](nats.md#the-pump-model-threading).
+ordered consumers (ADR-17) driven by the connection owner (`step` / `wait`) — see
+[Connection owner](nats.md#connection-owner).
 
 ## Client methods
 
@@ -167,7 +167,7 @@ Live watcher (ADR-8). `watch(callback, opts)` watches all keys.
 
 Returns: [watcher](#object-watcher) (or a sid with `raw`), or
 `nil, 'callback required' | 'invalid key' | err`. Entries arrive while the
-client pumps.
+owner is inside `step` or `wait`.
 
 ```lua
 local w = assert(kv:watch('app.*', function(e) if e then print(e.key, e.op, e.value) end end))
@@ -184,7 +184,7 @@ w:stop()
 
 Returns: array of current keys (deleted excluded), or `nil, 'timeout' | err`.
 `filters`: string or array (default all). `opts.timeout` (default 10). Blocks
-(pumps) until the initial data is complete. `keys(opts)` is accepted.
+on the owner until the initial data is complete. `keys(opts)` is accepted.
 
 ```lua
 for _, k in ipairs(assert(kv:keys())) do print(k) end

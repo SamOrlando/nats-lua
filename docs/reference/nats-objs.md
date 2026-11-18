@@ -153,7 +153,7 @@ Returns: array of ObjectInfo (`opts.show_deleted`, `opts.timeout` default 5) or
 Non blocking watcher on an ordered consumer. `callback(info | nil)`: `nil` once
 after the initial values. `opts`: `include_history`, `ignore_deletes`,
 `updates_only`. Returns: [obj_watcher](#object-obj_watcher) or `nil, err`.
-Updates arrive while pumping.
+Updates arrive while the owner is inside `step` or `wait`.
 
 ```lua
 local w = assert(obs:watcher(function(i) if i then print(i.name, i.deleted) end end))

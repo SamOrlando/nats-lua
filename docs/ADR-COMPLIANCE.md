@@ -2,13 +2,13 @@
 # nats-lua ADR compliance
 
 Source: [nats-io/nats-architecture-and-design](https://github.com/nats-io/nats-architecture-and-design),
-checked 2026-10-12. Included: client-relevant ADRs with status Approved,
+checked 2026-11-18. Included: client-relevant ADRs with status Approved,
 Implemented or Partially Implemented. Excluded: Proposed/Draft (53, 54, 57, 58),
 Deprecated (15, 18, 52) and server-only ADRs (3, 12, 26, 28, 30, 38, 39, 41, 44,
 55, 56, 59, 61, 62).
 
 Legend: ✅ done, ◐ partial, ❌ missing, n/a = nothing for a client to do.
-The 0.3.0+ column also applies to 0.3.1 and 0.4.x (0.4.0 changed KV write return values, see the README).
+The 0.3.0+ column also applies to 0.3.1 and 0.4.x (0.4.0 changed KV write return values; 0.4.6 runs that work on the connection owner — see the README).
 
 | ADR | Title | Status | 0.2.0 | 0.3.0+ | Notes |
 |---|---|---|---|---|---|
@@ -19,7 +19,7 @@ The 0.3.0+ column also applies to 0.3.1 and 0.4.x (0.4.0 changed KV write return
 | 6 | Naming Rules | Approved | ✅ | ✅ | |
 | 7 | NATS Server Error Codes | Partially Impl. | ✅ | ✅ | `msg.data.error.err_code` |
 | 8 | JetStream Key-Value Stores | Implemented | ◐ | ✅ | watch options, keys, history, purge_deletes, create over delete marker, mirrors/sources, bind to mirrors |
-| 9 | Consumer Idle Heartbeats | Approved | ◐ (fetch only) | ✅ | push FC replies, missed-heartbeat detection in consume/push/ordered |
+| 9 | Consumer Idle Heartbeats | Approved | ◐ (fetch only) | ✅ | push FC replies and missed-heartbeat detection run on the connection owner (`step` / `wait`) |
 | 10 | JetStream Extended Purge | Implemented | ✅ | ✅ | |
 | 11 | Hostname resolution | Approved | ❌ | ✅ | resolve all addresses, shuffle, IPv6 |
 | 13 | Pull Subscribe internals | Partially Impl. | ✅ | ✅ | + 423 handling |
@@ -52,4 +52,4 @@ The 0.3.0+ column also applies to 0.3.1 and 0.4.x (0.4.0 changed KV write return
 - ADR-50 fast-ingest batch publishing (flow-controlled), ADR-51 scheduler helpers.
 - ADR-63 backup/restore.
 - WebSocket permessage-deflate compression.
-- No background threads: push flow control, heartbeats and watchers need the application to pump (`nc:wait`).
+- The library starts no OS thread. Push flow control, heartbeats and watchers run on the connection owner (`nc:step` / `nc:wait`, or `nc:start` when the host supplies `runtime.spawn`).

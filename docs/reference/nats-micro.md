@@ -4,8 +4,8 @@
 `local nats = require('nats-micro')` returns `nats` with `nats.micro` and the
 client methods below. Services answer `$SRV.PING|INFO|STATS[.<name>[.<id>]]`
 with `io.nats.micro.v1.*_response` payloads (compatible with nats.go `micro`
-and `nats micro`). Requests are handled while the client pumps
-(`nc:wait()`), see [the pump model](nats.md#the-pump-model-threading).
+and `nats micro`). Requests are handled on the connection owner (`nc:step()`
+or `nc:wait()`), see [Connection owner](nats.md#connection-owner).
 
 ## Client methods
 
@@ -49,7 +49,7 @@ Fields: `name`, `version`, `description`, `metadata`, `id` (nuid), `queue_group`
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `name` | string `[%w-_]+` | – | |
-| `handler` | function(req) | – | runs while pumping; an error responds `500` and counts as an error |
+| `handler` | function(req) | – | runs on the owner; an error responds `500` and counts as an error |
 | `opts.subject` | string | `name` | |
 | `opts.metadata` | table | `{}` | |
 | `opts.queue_group` | string / false | service queue group | |

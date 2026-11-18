@@ -12,10 +12,10 @@ function). Durations given to this module are **seconds**; JetStream config
 tables you pass through (stream/consumer config) use the server's native units
 (nanoseconds) — `nats.jetstream.NS` (1e9) helps convert.
 
-All waiting happens through the client's pump loop; continuous consumers
-(`consume`, `messages`, ordered and push consumers) only make progress while the
-application calls `nc:wait()` or another blocking call. See
-[the pump model](nats.md#the-pump-model-threading).
+All waiting happens on the connection owner. Continuous consumers (`consume`,
+`messages`, ordered and push consumers) make progress while that owner is
+inside `nc:step()`, `nc:wait()`, or another blocking call. See
+[Connection owner](nats.md#connection-owner).
 
 ## Contents
 
@@ -418,7 +418,7 @@ or `nil, 'callback required'`.
 | `group`, `min_pending`, `min_ack_pending`, `priority` | | ADR-42 priority groups |
 | `pinned_cb` | function(ctx, pin_id) | the server pinned this client |
 
-`callback(msg)` runs while pumping. Pull requests are reissued when the pending
+`callback(msg)` runs on the owner. Pull requests are reissued when the pending
 count drops to the threshold, after 404/408/409, after 2 missed heartbeats, and
 after a reconnect. 409 "consumer deleted" / "consumer is push based" stop the
 context.

@@ -7,14 +7,12 @@
 --   local svc = nc:add_service({ name = 'calc', version = '1.0.0', description = 'adds' })
 --   svc:add_endpoint('add', function(req) req:respond(tostring(a + b)) end)
 --   local g = svc:add_group('math'); g:add_endpoint('mul', handler, { metadata = { x = 'y' } })
---   nc:wait()   -- requests are dispatched while the client pumps
+--   nc:wait()   -- requests are dispatched on the owner (step/wait)
 --
 -- Discovery: $SRV.PING|INFO|STATS[.<name>[.<id>]] with io.nats.micro.v1.*_response
 -- payloads, compatible with nats.go/micro and `nats micro`.
 
 local nats = require('nats')
-local socket = require('socket')
-local gettime = socket.gettime
 local encode, decode = nats.json.encode, nats.json.decode
 local type, pairs, ipairs, pcall, tostring, tonumber, setmetatable = type, pairs, ipairs, pcall, tostring, tonumber,
 	setmetatable
@@ -37,8 +35,8 @@ local micro = {
 }
 nats.micro = micro
 
-local function iso_now()
-	local t = gettime()
+local function iso_now(client)
+	local t = nats.now(client)
 	local s = floor(t)
 	return os.date('!%Y-%m-%dT%H:%M:%S', s) .. format('.%03dZ', floor((t - s) * 1000))
 end
@@ -141,7 +139,7 @@ function cm.add_service(client, cfg)
 		client = nc, name = cfg.name, version = cfg.version, description = cfg.description or '',
 		metadata = copy(cfg.metadata) or {}, id = nats.nuid.next(), queue_group = resolve_queue(cfg.queue_group, 'q'),
 		stats_handler = cfg.stats_handler, done_cb = cfg.done_cb, error_cb = cfg.error_cb,
-		endpoints = {}, subs = {}, started = iso_now(), stopped = false,
+		endpoints = {}, subs = {}, started = iso_now(nc), stopped = false,
 	}, Service)
 	for _, verb in ipairs({ 'PING', 'INFO', 'STATS' }) do
 		local handler = function(m)
@@ -182,10 +180,10 @@ function Service:add_endpoint(name, handler, opts, prefix, parent_queue)
 	local svc = self
 	ep.sid = cm.subscribe(self.client, subject, function(m)
 		local req = setmetatable({ msg = m, client = svc.client, endpoint = ep }, Request)
-		local t0 = gettime()
+		local t0 = nats.now(svc.client)
 		local ok, err = pcall(handler, req)
 		ep.num_requests = ep.num_requests + 1
-		ep.processing_time = ep.processing_time + floor((gettime() - t0) * 1e9)
+		ep.processing_time = ep.processing_time + floor((nats.now(svc.client) - t0) * 1e9)
 		if not ok then
 			req.error = '500:' .. tostring(err)
 			if not req.responded then req:respond_error(500, tostring(err)) end
@@ -258,7 +256,7 @@ end
 
 function Service:reset()
 	for _, ep in ipairs(self.endpoints) do new_stats(ep) end
-	self.started = iso_now()
+	self.started = iso_now(self.client)
 end
 
 -- stop([err]): drains the service subscriptions and calls done_cb(service, err)

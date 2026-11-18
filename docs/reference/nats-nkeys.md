@@ -25,7 +25,8 @@ print(kp:public_key())
 
 `kind`: `'user'` (default), `'account'`, `'operator'`, `'server'`, `'cluster'`
 or `'curve'` (x25519 xkey, see [curve key pair](#object-curve-key-pair-xkp)). `raw`: 32 random bytes, read from
-`/dev/urandom` when omitted. Returns: kp or `nil, 'invalid key type' | 'no
+`/dev/urandom` when omitted. Pass `raw` when the host has another entropy source and cannot read that file.
+Returns: kp or `nil, 'invalid key type' | 'no
 entropy source: pass a 32 byte seed' | 'seed must be 32 bytes'`.
 
 ```lua

@@ -4,8 +4,8 @@
 -- SPDX-License-Identifier: MIT (see LICENSE)
 --
 -- Buckets are streams KV_<bucket> on $KV.<bucket>.>. Gets use direct get,
--- watchers/keys/history use ordered consumers (ADR-17) that are driven by the
--- client's pump loop (client:wait()); keys()/history()/purge_deletes() pump
+-- watchers/keys/history use ordered consumers (ADR-17) driven by the connection
+-- owner (client:step()/wait()); keys()/history()/purge_deletes() run that loop
 -- internally until the end of the initial data.
 
 -- ### NATS-LUA Table
@@ -19,7 +19,6 @@ local tonumber, tostring, pcall, pairs, ipairs = tonumber, tostring, pcall, pair
 local type = type
 local floor = math.floor
 local match, format, find, sub = string.match, string.format, string.find, string.sub
-local gettime = require('socket').gettime
 
 local NS = nats.jetstream.NS
 local js = nats.jetstream.stream_metatable.methods
@@ -370,7 +369,7 @@ nats.kvs.watcher_metatable = Watcher
 --   callback receives entries, and nil once at the end of the initial data
 --   opts: include_history, ignore_deletes, meta_only, updates_only, resume_from_revision,
 --         raw (legacy: plain core subscription with raw msgs, returns sid)
--- Updates are delivered while the client pumps (client:wait()).
+-- Updates are delivered while the owner is in client:step()/wait().
 function kvsm.watch(kv, keys, callback, opts)
 	if type(keys) == 'function' then keys, callback, opts = '>', keys, callback end
 	if type(callback) ~= 'function' then return nil, 'callback required' end
@@ -432,12 +431,12 @@ function Watcher:stop()
 end
 Watcher.unsubscribe = Watcher.stop
 
--- pumps the client until the initial data was delivered (or timeout seconds)
+-- runs the owner until the initial data was delivered (or timeout seconds)
 function Watcher:wait_initial(timeout)
 	local client = unwrap(self.kv.stream.client)
-	local deadline = gettime() + (timeout or 10)
+	local deadline = nats.now(client) + (timeout or 10)
 	while not self.init_done do
-		local left = deadline - gettime()
+		local left = deadline - nats.now(client)
 		if left <= 0 then return false end
 		cm.wait(client, { timeout = math.min(left, 0.5), maxcount = 1 })
 	end

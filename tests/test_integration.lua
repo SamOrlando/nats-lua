@@ -99,7 +99,7 @@ test("request/reply across connections", function()
     local svc = connect()
     svc:subscribe(P .. ".svc.echo", function(m) m:respond("re:" .. m.data) end)
     svc:flush()
-    -- the requester pumps its own socket, the service needs pumping too:
+    -- the requester and the service each own a socket; alternate wait() on both:
     local co = coroutine.wrap(function() end)
     local r
     local m = nc:request(P .. ".svc.echo", function(x) r = x.data end, "hello")

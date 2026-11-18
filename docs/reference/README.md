@@ -1,14 +1,15 @@
 <!-- Copyright (c) 2023-2026 Sam Orlando. SPDX-License-Identifier: MIT -->
-# nats-lua API reference (v0.4.5)
+# nats-lua API reference (v0.4.6)
 
 Reference for the public API of every module, derived from the source. Start
-with [the pump model](nats.md#the-pump-model-threading): nothing happens in the
-background; callbacks, reconnects, keepalive, consumers, watchers and services
-run only while the application is inside `nc:wait()` or another blocking call.
+with [Connection owner](nats.md#connection-owner): one coroutine owns the
+socket. Callbacks, reconnects, keepalive, consumers, watchers and services run
+on that owner, inside `nc:step()`, `nc:wait()`, or another blocking call.
+`nc:start()` runs the owner only when `runtime.spawn` is set.
 
 | Module | `require` returns | Reference | Contents | Functions |
 |---|---|---|---|---|
-| `nats` | `nats` | [nats.md](nats.md) | client, options, msg, encoded client, headers/status constants, JSON, contexts, WebSocket | 78 |
+| `nats` | `nats` | [nats.md](nats.md) | client, options, msg, encoded client, headers/status constants, JSON, contexts, WebSocket, `step` / `start` / queues | 86 |
 | `nats-jetstream` | `nats` | [nats-jetstream.md](nats-jetstream.md) | streams, consumers, fetch/consume/messages, ordered and push consumers, acks, direct get, counters, batches | 92 |
 | `nats-kvs` | `nats` | [nats-kvs.md](nats-kvs.md) | Key-Value buckets, entries, watchers | 29 |
 | `nats-objs` | `nats` | [nats-objs.md](nats-objs.md) | Object store, ObjectInfo, watchers | 36 |
@@ -67,11 +68,10 @@ KV/object store/counter reads on streams without `allow_direct`. Fixed in
 6. `sha256.hex(s)` hashes `s`; `nkeys.hex(s)` only hex-encodes `s`.
 7. `nats.micro.ping/info/stats` return `nil, 'no responders'` (not `{}`) when no
    service answers.
-8. `client:add_ticker()` returns the ticker table (the source comment says
-    "id"); `on_reconnect`/`off_reconnect` are exported although meant for
-    internal use.
-9. `nats.jetstream.objs` is an alias of `nats.objs`; `max_chan_len` is accepted
-    but unused.
+8. `on_reconnect` / `off_reconnect` are exported although meant for internal
+    use. `client:add_ticker()` returns the ticker table.
+9. `nats.jetstream.objs` is an alias of `nats.objs`. `max_chan_len` bounds
+    `client:queue_subscribe` (a message count). Callback subscriptions stay unbounded.
 10. `stream:getmsg/nextmsg/lastmsg` on a stream without `allow_direct` return the
     raw `STREAM.MSG.GET` API reply (base64 payload); use `stream:get_stored` for
     a uniform message.
