@@ -232,9 +232,11 @@ from those same calls.
   `verify = "peer", cafile = ...` for real verification.
 - nkey / creds: `creds = "/path/user.creds"` (or the creds text), `nkey_seed = "SU..."`,
   or `nkey_file = "/path/seed.nk"`. The server nonce is signed with the bundled
-  pure Lua ed25519 (`nats-nkeys`, checked against RFC 8032 and nats.go vectors);
-  luasodium / luatweetnacl are used when installed. `signature_cb` still overrides.
-  `nats-nkeys` can also create key pairs, parse/format creds and issue user JWTs.
+  ed25519 (`nats-nkeys`, checked against RFC 8032 and nats.go vectors);
+  luasodium / luatweetnacl are used for sign and verify when installed.
+  `signature_cb` still overrides. `nats-nkeys` can also create key pairs,
+  verify with `from_public` or `verify` (raw 64-byte signatures), parse/format
+  creds and issue user JWTs. `decode_jwt` does not check the signature.
 - Contexts: `nats.connect_context("name")` reads `~/.config/nats/context/name.json` (nats CLI).
 - WebSocket: `ws://host:port/path` and `wss://` URLs (binary frames over LuaSocket,
   no permessage-deflate). `ws_headers` adds upgrade headers; `ws_mask = true` uses random masks.
@@ -455,7 +457,8 @@ NUID_DIR=/path/to/lua-nuid tests/run.sh                                   # test
 NATS_URL=nats://127.0.0.1:4222 NUID_DIR=... tests/run.sh                  # + integration tests
 NATS_NO_CJSON=1 NATS_URL=... lua tests/test_integration.lua               # with the pure Lua JSON codec
 NATS_SERVER_BIN=/path/nats-server lua tests/test_local.lua                # nkey, creds, websocket, restart buffering
-lua tests/test_nkeys.lua                                                  # SHA-512, ed25519 RFC 8032, nkeys vectors
+lua tests/test_nkeys.lua                                                  # SHA-512, ed25519 sign/verify, nkeys vectors
+lua tests/bench_nkeys.lua [path/to/nkeys.so]                              # optional compare with lua-nkeys
 LUA_PATH="./?.lua;$NUID_DIR/?.lua;;" lua tests/check_docs.lua             # every exported function is in docs/reference
 lua tests/bench.lua 200000                                                # parser/publish benchmark
 ```

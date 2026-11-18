@@ -5,18 +5,21 @@
 --
 -- Pure Lua (5.1 - 5.4, LuaJIT) implementation of:
 --   * SHA-512 and SHA-512/256
---   * ed25519 key derivation and signing (port of the TweetNaCl reference)
+--   * ed25519 key derivation, signing and verify (port of the TweetNaCl reference)
 --   * NKEY seed/public key encoding (base32 + crc16) used by NATS auth
 --   * x25519 curve keys (xkeys) with xsalsa20-poly1305 seal/open ('xkv1', nkeys compatible)
 --   * ADR-14 user JWT issuing (sign a user JWT with an account seed) and creds files
 -- A native backend is used for ed25519 when available: luasodium
--- (crypto_sign_seed_keypair / crypto_sign_detached) or luatweetnacl.
+-- (crypto_sign_seed_keypair / crypto_sign_detached / crypto_sign_verify_detached)
+-- or luatweetnacl.
 --
 --   local nkeys = require('nats-nkeys')
 --   local kp = nkeys.from_seed('SUA...')
 --   kp:public_key()           -- 'UA...'
 --   kp:sign(nonce)            -- 64 byte raw signature
 --   kp:sign_nonce(nonce)      -- base64url (no padding) signature for CONNECT
+--   kp:verify(nonce, sig)     -- true, or nil, err
+--   nkeys.from_public('UA...') -- public key only: verify, no seed, no sign
 
 local floor, char, byte, format, concat, rep = math.floor, string.char, string.byte, string.format, table.concat,
 	string.rep
@@ -166,8 +169,12 @@ local function gf(init)
 end
 local gf0 = gf()
 local gf1 = gf({ 1 })
+local D = gf({ 0x78a3, 0x1359, 0x4dca, 0x75eb, 0xd8ab, 0x4141, 0x0a4d, 0x0070,
+	0xe898, 0x7779, 0x4079, 0x8cc7, 0xfe73, 0x2b6f, 0x6cee, 0x5203 })
 local D2 = gf({ 0xf159, 0x26b2, 0x9b94, 0xebd6, 0xb156, 0x8283, 0x149a, 0x00e0,
 	0xd130, 0xeef3, 0x80f2, 0x198e, 0xfce7, 0x56df, 0xd9dc, 0x2406 })
+local I = gf({ 0xa0b0, 0x4a0e, 0x1b27, 0xc4ee, 0xe478, 0xad2f, 0x1806, 0x2f43,
+	0xd7a7, 0x3dfb, 0x0099, 0x2b4d, 0xdf0b, 0x4fc1, 0x2480, 0x2b83 })
 local GX = gf({ 0xd51a, 0x8f25, 0x2d60, 0xc956, 0xa7b2, 0x9525, 0xc760, 0x692c,
 	0xdc5c, 0xfdd6, 0xe231, 0xc0a4, 0x53fe, 0xcd6e, 0x36d3, 0x2169 })
 local GY = gf({ 0x6658, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666, 0x6666,
@@ -350,10 +357,89 @@ local function lua_sign(seed, msg, pk)
 	return R .. modL(x)
 end
 
-M.ed25519_public_lua, M.ed25519_sign_lua = lua_public, lua_sign
-local ed_public, ed_sign = lua_public, lua_sign
+-- TweetNaCl unpackneg / scalarmult. Verify checks [S]B = R + [h]A.
+local function neq25519(a, b) return pack25519(a) ~= pack25519(b) end
 
--- optional native backends
+local function pow2523(o, i)
+	local c = gf()
+	set(c, i)
+	for a = 250, 0, -1 do
+		S(c, c)
+		if a ~= 1 then Mul(c, c, i) end
+	end
+	set(o, c)
+end
+
+local function unpack25519(n)
+	local o = gf()
+	for i = 0, 15 do o[i] = byte(n, 2 * i + 1) + byte(n, 2 * i + 2) * 256 end
+	o[15] = o[15] % 32768
+	return o
+end
+
+local function scalarmult(p, q, s) -- p = [s]q; q is consumed by the ladder
+	set(p[0], gf0); set(p[1], gf1); set(p[2], gf1); set(p[3], gf0)
+	for i = 255, 0, -1 do
+		local b = floor(byte(s, floor(i / 8) + 1) / 2 ^ (i % 8)) % 2
+		cswap(p, q, b)
+		add(q, p)
+		add(p, p)
+		cswap(p, q, b)
+	end
+end
+
+local function unpackneg(pub) -- 32 byte point -> extended (X:Y:Z:T) of -A, or nil
+	local r = { [0] = gf(), [1] = gf(), [2] = gf(), [3] = gf() }
+	local t, chk, num, den, den2, den4, den6 = gf(), gf(), gf(), gf(), gf(), gf(), gf()
+	set(r[2], gf1)
+	set(r[1], unpack25519(pub))
+	S(num, r[1])
+	Mul(den, num, D)
+	Z(num, num, r[2])
+	A(den, r[2], den)
+	S(den2, den)
+	S(den4, den2)
+	Mul(den6, den4, den2)
+	Mul(t, den6, num)
+	Mul(t, t, den)
+	pow2523(t, t)
+	Mul(t, t, num)
+	Mul(t, t, den)
+	Mul(t, t, den)
+	Mul(r[0], t, den)
+	S(chk, r[0])
+	Mul(chk, chk, den)
+	if neq25519(chk, num) then Mul(r[0], r[0], I) end
+	S(chk, r[0])
+	Mul(chk, chk, den)
+	if neq25519(chk, num) then return nil end
+	if par25519(r[0]) == floor(byte(pub, 32) / 128) then Z(r[0], gf0, r[0]) end
+	Mul(r[3], r[0], r[1])
+	return r
+end
+
+local BAD_SIG = 'signature verification failed'
+
+local function lua_verify(pk, msg, sig)
+	if type(pk) ~= 'string' or #pk ~= 32 or type(msg) ~= 'string' or type(sig) ~= 'string' or #sig ~= 64 then
+		return nil, BAD_SIG
+	end
+	if byte(sig, 64) >= 32 then return nil, BAD_SIG end -- sig[63] & 224, non-canonical S
+	local q = unpackneg(pk)
+	if not q then return nil, BAD_SIG end
+	local R, S = sig:sub(1, 32), sig:sub(33)
+	local h = reduce(M.sha512(R .. pk .. msg))
+	local p = { [0] = gf(), [1] = gf(), [2] = gf(), [3] = gf() }
+	scalarmult(p, q, h)
+	add(p, scalarbase(S))
+	if pack(p) ~= R then return nil, BAD_SIG end
+	return true
+end
+
+M.ed25519_public_lua, M.ed25519_sign_lua, M.ed25519_verify_lua = lua_public, lua_sign, lua_verify
+local ed_public, ed_sign, ed_verify = lua_public, lua_sign, lua_verify
+
+-- optional native backends. Verify stays on the Lua port when the module can sign but not verify.
 do
 	local ok, sodium = pcall(require, 'luasodium')
 	if ok and type(sodium) == 'table' and sodium.crypto_sign_seed_keypair and sodium.crypto_sign_detached then
@@ -361,6 +447,17 @@ do
 		ed_sign = function(seed, msg)
 			local _, sk = sodium.crypto_sign_seed_keypair(seed)
 			return sodium.crypto_sign_detached(msg, sk)
+		end
+		if sodium.crypto_sign_verify_detached then
+			ed_verify = function(pk, msg, sig)
+				if type(pk) ~= 'string' or #pk ~= 32 or type(msg) ~= 'string' or type(sig) ~= 'string' or #sig ~= 64 then
+					return nil, BAD_SIG
+				end
+				if byte(sig, 64) >= 32 then return nil, BAD_SIG end
+				local okv, res = pcall(sodium.crypto_sign_verify_detached, sig, msg, pk)
+				if okv and res == true then return true end
+				return nil, BAD_SIG
+			end
 		end
 		M.backend = 'luasodium'
 	else
@@ -371,21 +468,26 @@ do
 				local _, sk = nacl.sign_keypair(seed)
 				return nacl.sign(msg, sk):sub(1, 64)
 			end
+			if nacl.sign_open then
+				ed_verify = function(pk, msg, sig)
+					if type(pk) ~= 'string' or #pk ~= 32 or type(msg) ~= 'string' or type(sig) ~= 'string' or #sig ~= 64 then
+						return nil, BAD_SIG
+					end
+					if byte(sig, 64) >= 32 then return nil, BAD_SIG end
+					if nacl.sign_open(sig .. msg, pk) == msg then return true end
+					return nil, BAD_SIG
+				end
+			end
 			M.backend = 'luatweetnacl'
 		end
 	end
 end
 function M.ed25519_public(seed) return ed_public(seed) end
 function M.ed25519_sign(seed, msg, pk) return ed_sign(seed, msg, pk) end
+function M.ed25519_verify(pk, msg, sig) return ed_verify(pk, msg, sig) end
 
 -- ------------------------------------------------------------------ x25519 / xsalsa20-poly1305 (xkeys)
 -- TweetNaCl crypto_scalarmult, crypto_box (xsalsa20 + poly1305), pure Lua.
-local function unpack25519(n)
-	local o = gf()
-	for i = 0, 15 do o[i] = byte(n, 2 * i + 1) + byte(n, 2 * i + 2) * 256 end
-	o[15] = o[15] % 32768
-	return o
-end
 local G121665 = gf({ 0xDB41, 1 })
 local BASE9 = char(9) .. rep('\0', 31)
 
@@ -684,6 +786,14 @@ KP.__index = KP
 
 local CKP = {} -- curve (x25519) key pair, ADR / nkeys xkeys
 CKP.__index = CKP
+
+-- Public-only pair (Go nkeys.FromPublicKey). No seed. Curve keys cannot verify.
+local PK = {}
+PK.__index = PK
+local NO_SEED = 'no seed or private key available'
+local NO_SIGN = 'can not sign, no private key available'
+local CURVE_OP = 'invalid curve key operation'
+
 M.XKEY_VERSION = 'xkv1'
 
 function M.from_seed(seed)
@@ -716,6 +826,15 @@ function M.create_pair(kind, raw)
 	return M.from_seed(M.encode_seed(prefix, raw))
 end
 
+function M.from_public(public)
+	if type(public) ~= 'string' then return nil, 'public key must be a string' end
+	public = public:match('^%s*(.-)%s*$')
+	local raw, prefix = M.decode_public(public)
+	if not raw then return nil, prefix end
+	if #raw ~= 32 then return nil, 'invalid public key' end
+	return setmetatable({ _pk = raw, _prefix = prefix, _encoded = public }, PK)
+end
+
 function KP:seed() return self._encoded end
 function KP:type() return PNAME[self._prefix] end
 function KP:raw_public()
@@ -728,6 +847,10 @@ function KP:public_key()
 end
 function KP:sign(data) return ed_sign(self._seed, data, self:raw_public()) end
 function KP:sign_nonce(nonce) return M.base64url(self:sign(nonce)) end
+function KP:verify(data, sig)
+	if type(data) ~= 'string' or type(sig) ~= 'string' then return nil, BAD_SIG end
+	return ed_verify(self:raw_public(), data, sig)
+end
 
 -- curve key pairs: seed/public_key/type like KP, plus seal/open; no signing
 function CKP:seed() return self._encoded end
@@ -741,8 +864,9 @@ function CKP:public_key()
 	return self._pub
 end
 function CKP:private_key() return M.encode_public(P.private, self._seed) end -- 'P...' (nkeys PrivateKey)
-function CKP:sign() return nil, 'invalid curve key operation' end
-function CKP:sign_nonce() return nil, 'invalid curve key operation' end
+function CKP:sign() return nil, CURVE_OP end
+function CKP:sign_nonce() return nil, CURVE_OP end
+function CKP:verify() return nil, CURVE_OP end
 
 local function curve_public(s)
 	local raw, prefix = M.decode_public(s or '')
@@ -789,6 +913,33 @@ function M.format_creds(jwt, seed)
 end
 
 -- signer(seed) -> function(nonce) returning the base64url signature (for CONNECT sig)
+function PK:seed() return nil, NO_SEED end
+function PK:private_key() return nil, NO_SEED end
+function PK:type() return PNAME[self._prefix] end
+function PK:raw_public() return self._pk end
+function PK:public_key() return self._encoded end
+function PK:sign()
+	if self._prefix == P.curve then return nil, CURVE_OP end
+	return nil, NO_SIGN
+end
+function PK:sign_nonce()
+	if self._prefix == P.curve then return nil, CURVE_OP end
+	return nil, NO_SIGN
+end
+function PK:verify(data, sig)
+	if self._prefix == P.curve then return nil, CURVE_OP end
+	if type(data) ~= 'string' or type(sig) ~= 'string' then return nil, BAD_SIG end
+	return ed_verify(self._pk, data, sig)
+end
+function PK:seal() return nil, CURVE_OP end
+function PK:open() return nil, CURVE_OP end
+
+function M.verify(public, data, sig)
+	local pk, err = M.from_public(public)
+	if not pk then return nil, err end
+	return pk:verify(data, sig)
+end
+
 function M.signer(seed)
 	local kp, err = M.from_seed(seed)
 	if not kp then return nil, err end

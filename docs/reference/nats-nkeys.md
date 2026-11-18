@@ -3,10 +3,11 @@
 
 `local nkeys = require('nats-nkeys')` returns its own table (not `nats`). Pure
 Lua SHA-512 and ed25519 (TweetNaCl port) for Lua 5.1–5.4 and LuaJIT; uses
-`luasodium` or `luatweetnacl` for ed25519 when installed (`nkeys.backend`).
-The core client uses it automatically for `creds`, `nkey_seed`, `nkey_file`.
-ADR-14. Strings are raw bytes unless noted. Pure Lua signing takes ~0.2–0.4 s
-per signature on PUC Lua (once per connect).
+`luasodium` or `luatweetnacl` for sign and verify when installed
+(`nkeys.backend`). A seed pair signs. `from_public` holds only an encoded
+public key and can verify. The core client uses a seed automatically for
+`creds`, `nkey_seed`, and `nkey_file`. ADR-14. Strings are raw bytes unless
+noted. On PUC Lua a pure Lua sign or verify takes about 0.2–0.4 s.
 
 ## Key pairs
 
@@ -33,6 +34,28 @@ entropy source: pass a 32 byte seed' | 'seed must be 32 bytes'`.
 local acct = assert(nkeys.create_pair('account'))
 ```
 
+### nkeys.from_public(public)
+
+Returns: a [public key pair](#object-public-key-pair-pk) for an encoded public
+key (`U...`, `A...`, `O...`, `N...`, `C...`, `X...`). Surrounding whitespace is
+ignored. There is no seed. An `X...` key can be held and printed, and `verify`,
+`sign`, `seal`, and `open` return `'invalid curve key operation'`.
+
+Returns `nil, err` for a seed or a bad key (`'public key must be a string'`,
+`'invalid base32'`, `'invalid nkey checksum'`, `'invalid public key prefix'`,
+`'invalid public key'`).
+
+```lua
+local pub = assert(nkeys.from_public('U...'))
+assert(pub:verify(nonce, sig))
+```
+
+### nkeys.verify(public, data, sig)
+
+`from_public(public)` then `verify`. `sig` is the raw 64-byte signature from
+`kp:sign`, not the base64url CONNECT form. Returns: `true`, or `nil, err`
+(`'signature verification failed'` when the signature does not match).
+
 ### Object: key pair (`kp`)
 
 #### kp:seed()
@@ -58,6 +81,39 @@ Returns: 64 byte raw ed25519 signature.
 #### kp:sign_nonce(nonce)
 
 Returns: base64url (no padding) signature, as sent in CONNECT `sig`.
+
+#### kp:verify(data, sig)
+
+Checks `sig` (64 raw bytes) against this pair's public key. Returns: `true`, or
+`nil, 'signature verification failed'`.
+
+### Object: public key pair (`pk`)
+
+Returned by `from_public`. Same readable fields as a seed pair, with no secret.
+
+#### pk:public_key() / pk:raw_public() / pk:type()
+
+Encoded public key, 32 raw bytes stored from that key (not derived), and the
+prefix name (`'user'`, `'account'`, `'operator'`, `'server'`, `'cluster'`,
+`'curve'`).
+
+#### pk:seed() / pk:private_key()
+
+Returns: `nil, 'no seed or private key available'`.
+
+#### pk:sign() / pk:sign_nonce()
+
+Returns: `nil, 'can not sign, no private key available'`. A curve public key
+returns `nil, 'invalid curve key operation'`.
+
+#### pk:verify(data, sig)
+
+Same as `kp:verify` for an ed25519 public key. A curve public key returns
+`nil, 'invalid curve key operation'`.
+
+#### pk:seal() / pk:open()
+
+Returns: `nil, 'invalid curve key operation'`. Sealing needs the private scalar.
 
 ### Object: curve key pair (`xkp`)
 
@@ -98,7 +154,7 @@ Decrypts a message sealed by `sender` (`X...`). Returns: plaintext or `nil,
 'invalid encrypted data' | 'invalid encryption version' | 'invalid sender' |
 'could not decrypt'`.
 
-#### xkp:sign() / xkp:sign_nonce()
+#### xkp:sign() / xkp:sign_nonce() / xkp:verify()
 
 Returns: `nil, 'invalid curve key operation'` (as Go nkeys).
 
@@ -142,8 +198,10 @@ io.open('svc.creds', 'w'):write(nkeys.format_creds(jwt, user:seed()))
 
 ### nkeys.decode_jwt(jwt)
 
-Decodes without verifying. Returns: `header, claims` or `nil, 'invalid jwt' |
-'invalid jwt json'`.
+Decodes without checking the signature. Returns: `header, claims` or `nil,
+'invalid jwt' | 'invalid jwt json'`. The account signature is raw ed25519 over
+the `header.claims` text, then base64url. `kp:verify` checks the raw 64 bytes,
+not the JWT string.
 
 ## Encoding
 
@@ -193,9 +251,20 @@ print(nkeys.hex(nkeys.sha512_256('abc')))
 Active backend. `pk` (optional) avoids recomputing the public key (pure Lua
 backend only). Returns: 32 byte public key / 64 byte signature.
 
+### nkeys.ed25519_verify(pk32, msg, sig64)
+
+Active backend. `sig64` is the raw signature. Returns: `true`, or `nil,
+'signature verification failed'`. A native module that can sign but cannot
+verify stays on `'luasodium'` or `'luatweetnacl'` for sign, and this function
+uses the pure Lua port.
+
 ### nkeys.ed25519_public_lua(seed32) / nkeys.ed25519_sign_lua(seed32, msg, pk)
 
 Always the pure Lua implementation.
+
+### nkeys.ed25519_verify_lua(pk32, msg, sig64)
+
+Always the pure Lua verify. Same return as `nkeys.ed25519_verify`.
 
 Fields: `nkeys.backend` (`'lua' | 'luasodium' | 'luatweetnacl'`), `nkeys.prefix`.
 

@@ -14,7 +14,7 @@ on that owner, inside `nc:step()`, `nc:wait()`, or another blocking call.
 | `nats-kvs` | `nats` | [nats-kvs.md](nats-kvs.md) | Key-Value buckets, entries, watchers | 29 |
 | `nats-objs` | `nats` | [nats-objs.md](nats-objs.md) | Object store, ObjectInfo, watchers | 36 |
 | `nats-micro` | `nats` | [nats-micro.md](nats-micro.md) | Service API: services, groups, requests, discovery | 27 |
-| `nats-nkeys` | own table | [nats-nkeys.md](nats-nkeys.md) | key pairs, ed25519, x25519 xkeys, SHA-512, creds, user JWTs | 47 |
+| `nats-nkeys` | own table | [nats-nkeys.md](nats-nkeys.md) | key pairs, public keys, ed25519 sign/verify, x25519 xkeys, SHA-512, creds, user JWTs | 63 |
 | `nats-sha256` | own table | [nats-sha256.md](nats-sha256.md) | SHA-256 | 6 |
 
 Function counts are exported functions (metatable methods and module
@@ -42,6 +42,7 @@ LUA_PATH="./?.lua;/path/to/lua-nuid/?.lua;;" lua tests/check_docs.lua
 | obs, ObjectInfo, watcher | `client:create_object_store()`, `obs:get_info()`, `obs:watcher()` | [objs](nats-objs.md) |
 | service, group, request | `client:add_service()`, `svc:add_group()`, handlers | [micro](nats-micro.md) |
 | key pair | `nkeys.from_seed()`, `nkeys.create_pair()` | [nkeys](nats-nkeys.md#object-key-pair-kp) |
+| public key pair | `nkeys.from_public()` | [nkeys](nats-nkeys.md#object-public-key-pair-pk) |
 | hasher | `sha256.new()` | [sha256](nats-sha256.md#object-hasher) |
 
 ## API notes (known inconsistencies in 0.4.x)
